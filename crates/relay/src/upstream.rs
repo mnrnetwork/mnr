@@ -42,6 +42,13 @@ const FAULT_LIMIT: usize = 3;
 const EJECT_FOR: Duration = Duration::from_secs(24 * 3600);
 /// Newest fault events kept for the public log.
 const FAULT_LOG_MAX: usize = 1000;
+/// Rule 3: how long a read queues for a light token on the best-ranked
+/// public upstream before falling through to the next.
+pub const PUBLIC_QUEUE_WAIT: Duration = Duration::from_millis(250);
+/// The owned node is ours to load: reads queue longer on it.
+pub const OWNED_QUEUE_WAIT: Duration = Duration::from_secs(1);
+/// Poll interval while queuing.
+const LIGHT_POLL: Duration = Duration::from_millis(10);
 /// Largest *buffered* upstream response (light calls). Streams are not
 /// buffered; they are paced by the bandwidth cap and bounded by
 /// `stream::MAX_STREAM_BYTES`.
@@ -518,6 +525,31 @@ impl Upstream {
         self.light.lock().try_take(Instant::now())
     }
 
+    /// Queue for a light-call token for up to `max_wait` (rule 3: above the
+    /// cap, requests queue). Polls every 10 ms and never holds the bucket
+    /// lock across a wait. The cap itself is never exceeded.
+    pub async fn take_light_within(&self, max_wait: Duration) -> bool {
+        let deadline = Instant::now() + max_wait;
+        loop {
+            if self.try_take_light() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(LIGHT_POLL).await;
+        }
+    }
+
+    /// How long a read may queue on this upstream before trying the next:
+    /// a moment on a public node, longer on our own.
+    pub fn queue_wait(&self) -> Duration {
+        match self.cfg.kind {
+            Kind::Owned => OWNED_QUEUE_WAIT,
+            Kind::Public => PUBLIC_QUEUE_WAIT,
+        }
+    }
+
     /// Reserve a stream slot, if one is free right now.
     pub fn try_take_stream(&self) -> Option<OwnedSemaphorePermit> {
         Arc::clone(&self.streams).try_acquire_owned().ok()
@@ -898,6 +930,22 @@ transport = "onion"
             assert!(b.try_take(t1));
         }
         assert!(!b.try_take(t1));
+    }
+
+    #[tokio::test]
+    async fn queuing_for_a_light_token_waits_for_the_refill_but_not_longer() {
+        let p = pool();
+        let u = p.upstream(1); // public, 5 rps
+        while u.try_take_light() {}
+        let t0 = Instant::now();
+        assert!(u.take_light_within(Duration::from_millis(250)).await);
+        let waited = t0.elapsed();
+        assert!(waited >= Duration::from_millis(150), "{waited:?}");
+        assert!(waited <= Duration::from_millis(250), "{waited:?}");
+        while u.try_take_light() {}
+        assert!(!u.take_light_within(Duration::from_millis(50)).await);
+        assert_eq!(p.upstream(0).queue_wait(), OWNED_QUEUE_WAIT);
+        assert_eq!(u.queue_wait(), PUBLIC_QUEUE_WAIT);
     }
 
     #[test]

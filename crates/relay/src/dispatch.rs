@@ -157,6 +157,17 @@ pub async fn dispatch(ctx: Ctx, policy: &'static Policy, req: Request) -> Outcom
     }
 }
 
+/// A light token for a read: the best-ranked upstream is worth a short
+/// queue (rule 3: above the cap, requests queue or go to our own node);
+/// the fall-through candidates are tried without waiting.
+async fn take_light(u: &crate::upstream::Upstream, rank: usize) -> bool {
+    if rank == 0 {
+        u.take_light_within(u.queue_wait()).await
+    } else {
+        u.try_take_light()
+    }
+}
+
 /// The tip safety line: the highest height that may be cached, or `None`
 /// in degraded mode (no quorum → no cache writes).
 pub(crate) fn safety_line(pool: &Pool) -> Option<u64> {
@@ -225,9 +236,9 @@ async fn fetch_verified<T>(
     let mut last = ForwardError::Cap;
     let mut faults = 0usize;
     let mut attempts = 0usize;
-    for id in ranked.into_iter().take(MAX_ATTEMPTS) {
+    for (rank, id) in ranked.into_iter().take(MAX_ATTEMPTS).enumerate() {
         let u = pool.upstream(id);
-        if !u.try_take_light() {
+        if !take_light(u, rank).await {
             last = ForwardError::Cap;
             continue;
         }
@@ -547,9 +558,9 @@ pub(crate) async fn read(
         return Outcome::json_error(503, "no healthy upstream", Verify::None);
     }
     let mut last = ForwardError::Cap;
-    for id in ranked.into_iter().take(MAX_ATTEMPTS) {
+    for (rank, id) in ranked.into_iter().take(MAX_ATTEMPTS).enumerate() {
         let u = pool.upstream(id);
-        if !u.try_take_light() {
+        if !take_light(u, rank).await {
             last = ForwardError::Cap;
             continue;
         }
@@ -1219,6 +1230,7 @@ mod tests {
         let hits = Arc::new(AtomicUsize::new(0));
         let only = mock(200, r#"{"height":101,"status":"OK"}"#, Arc::clone(&hits)).await;
         let env = Env::new(pool_over(&[only]));
+        let t0 = std::time::Instant::now();
         let mut statuses = Vec::new();
         for _ in 0..7 {
             statuses.push(
@@ -1227,10 +1239,25 @@ mod tests {
                     .status,
             );
         }
-        // Default cap is 5 rps: the sixth and seventh calls within the same
-        // second are refused by us, never sent to the public node.
-        assert_eq!(statuses, vec![200, 200, 200, 200, 200, 503, 503]);
-        assert_eq!(hits.load(Ordering::SeqCst), 5);
+        // Default cap is 5 rps: the sixth and seventh calls queue for the
+        // refill (200 ms per token) instead of being refused, and the
+        // public node never sees more than the cap.
+        assert_eq!(statuses, vec![200; 7]);
+        assert_eq!(hits.load(Ordering::SeqCst), 7);
+        assert!(
+            t0.elapsed() >= Duration::from_millis(350),
+            "{:?}",
+            t0.elapsed()
+        );
+        // A wait longer than the queue allowance falls through: with the
+        // bucket drained and no other upstream, that is a 503.
+        let u = env.pool.upstream(0);
+        while u.try_take_light() {}
+        for _ in 0..2 {
+            let o = env.legacy("/get_transaction_pool_stats", json!({})).await;
+            assert_eq!(o.status, 200, "one token refills within 250 ms");
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 9);
     }
 
     #[test]
