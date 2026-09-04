@@ -13,15 +13,18 @@
 //! No client identity ever reaches this module: it only knows method bodies.
 
 use std::collections::VecDeque;
+use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use bytes::Bytes;
 use mnr_core::hash::Hash;
 use mnr_core::verify::{quorum_tip, QuorumTip, TipReport};
 use mnr_core::wire::{GetInfoResult, JsonRpcRequest, JsonRpcResponse};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::config::{Config, Kind, Transport, UpstreamConfig};
 
@@ -83,6 +86,71 @@ pub struct Upstream {
     timeout: Duration,
     /// Requests we sent, for the public request-rate figure (rule 1).
     pub requests: AtomicU64,
+    /// Rule 3: light calls per second we allow ourselves against this node.
+    light: Mutex<LightBucket>,
+    /// Rule 3: concurrent `get_blocks.bin` streams against this node.
+    streams: Arc<Semaphore>,
+}
+
+/// Token bucket for the per-upstream light-call cap. Capacity equals one
+/// second of the rate, so a burst can never exceed the published ceiling.
+struct LightBucket {
+    tokens: f64,
+    rate: f64,
+    last: Instant,
+}
+
+impl LightBucket {
+    fn new(rps: u32) -> Self {
+        Self {
+            tokens: f64::from(rps),
+            rate: f64::from(rps),
+            last: Instant::now(),
+        }
+    }
+
+    fn try_take(&mut self, now: Instant) -> bool {
+        let elapsed = now.duration_since(self.last).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * self.rate).min(self.rate);
+        self.last = now;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// A forwarded upstream response, headers already reduced to what the
+/// client may see.
+#[derive(Debug, Clone)]
+pub struct Forwarded {
+    pub status: u16,
+    pub content_type: Option<String>,
+    pub body: Bytes,
+}
+
+/// Why a forward did not produce a response. `Cap` and the transport errors
+/// are retryable on another upstream; the caller decides.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForwardError {
+    /// Our own per-upstream cap (rule 3) is exhausted right now.
+    Cap,
+    Timeout,
+    Connect,
+    Other(String),
+}
+
+impl fmt::Display for ForwardError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Cap => f.write_str("upstream cap reached"),
+            Self::Timeout => f.write_str("timeout"),
+            Self::Connect => f.write_str("connect failed"),
+            Self::Other(s) => f.write_str(s),
+        }
+    }
 }
 
 pub struct Pool {
@@ -146,6 +214,8 @@ impl Pool {
                 };
                 Upstream {
                     id,
+                    light: Mutex::new(LightBucket::new(u.caps.rps_light)),
+                    streams: Arc::new(Semaphore::new(u.caps.max_streams as usize)),
                     cfg: u,
                     client,
                     timeout,
@@ -219,6 +289,10 @@ impl Pool {
             None => tracing::warn!(reports = reports.len(), "no quorum: degraded mode"),
         }
         *self.quorum.write() = q;
+    }
+
+    pub fn upstream(&self, id: usize) -> &Upstream {
+        &self.upstreams[id]
     }
 
     pub fn quorum(&self) -> Option<QuorumTip> {
@@ -365,6 +439,55 @@ struct Probe {
 }
 
 impl Upstream {
+    /// Take one light-call token, or fail immediately with [`ForwardError::Cap`].
+    pub fn try_take_light(&self) -> bool {
+        self.light.lock().try_take(Instant::now())
+    }
+
+    /// Reserve a stream slot, if one is free right now.
+    pub fn try_take_stream(&self) -> Option<OwnedSemaphorePermit> {
+        Arc::clone(&self.streams).try_acquire_owned().ok()
+    }
+
+    /// Forward a client body to `path` on this upstream.
+    ///
+    /// Rule 6: the request is rebuilt from scratch. Only the body, its
+    /// `Content-Type` and `Accept` travel; no client header of any kind is
+    /// copied. The identifying `User-Agent` comes from the shared client.
+    /// The response is likewise reduced to status, content type and body.
+    pub async fn forward(
+        &self,
+        path: &str,
+        content_type: &str,
+        body: Bytes,
+        timeout: Duration,
+    ) -> Result<Forwarded, ForwardError> {
+        self.requests.fetch_add(1, Ordering::Relaxed);
+        let url = format!("{}{}", self.cfg.url.trim_end_matches('/'), path);
+        let resp = self
+            .client
+            .post(url)
+            .timeout(timeout)
+            .header(reqwest::header::CONTENT_TYPE, content_type)
+            .header(reqwest::header::ACCEPT, content_type)
+            .body(body)
+            .send()
+            .await
+            .map_err(classify)?;
+        let status = resp.status().as_u16();
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let body = resp.bytes().await.map_err(classify)?;
+        Ok(Forwarded {
+            status,
+            content_type,
+            body,
+        })
+    }
+
     /// `get_info` with the identifying User-Agent and nothing else.
     async fn probe(&self) -> Result<Probe, String> {
         let req = JsonRpcRequest {
@@ -415,6 +538,16 @@ fn client(
         b = b.proxy(reqwest::Proxy::all(format!("socks5h://{addr}"))?);
     }
     b.build()
+}
+
+fn classify(e: reqwest::Error) -> ForwardError {
+    if e.is_timeout() {
+        ForwardError::Timeout
+    } else if e.is_connect() {
+        ForwardError::Connect
+    } else {
+        ForwardError::Other(trim_error(&e))
+    }
 }
 
 /// Error text without URLs, so a log line never carries an upstream host
@@ -616,6 +749,35 @@ transport = "onion"
         p.record_fault_at(2, "get_block", "x".into(), later);
         p.record_fault_at(2, "get_block", "x".into(), later);
         assert!(p.status().upstreams[2].ejected);
+    }
+
+    #[test]
+    fn light_cap_is_one_second_of_rate_then_refills() {
+        let mut b = LightBucket::new(5);
+        let t0 = Instant::now();
+        for _ in 0..5 {
+            assert!(b.try_take(t0));
+        }
+        assert!(!b.try_take(t0), "sixth call within a second is refused");
+        assert!(b.try_take(t0 + Duration::from_millis(200)));
+        assert!(!b.try_take(t0 + Duration::from_millis(200)));
+        // Idle time never banks more than one second of calls.
+        let t1 = t0 + Duration::from_secs(60);
+        for _ in 0..5 {
+            assert!(b.try_take(t1));
+        }
+        assert!(!b.try_take(t1));
+    }
+
+    #[test]
+    fn stream_slots_are_capped_per_upstream() {
+        let p = pool();
+        let u = p.upstream(1);
+        let a = u.try_take_stream().expect("slot 1");
+        let _b = u.try_take_stream().expect("slot 2");
+        assert!(u.try_take_stream().is_none(), "default cap is 2");
+        drop(a);
+        assert!(u.try_take_stream().is_some());
     }
 
     #[test]

@@ -624,6 +624,12 @@ static DENY_FALLBACK: Policy = Policy {
     note: "Unknown method; denied (allow-list).",
 };
 
+/// The whole allow-list, in table order (aliases included).
+#[must_use]
+pub fn table() -> &'static [Policy] {
+    TABLE
+}
+
 /// Look up the policy for a method. `None` means the method is not on the
 /// allow-list and must be denied.
 #[must_use]

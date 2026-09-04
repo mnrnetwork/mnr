@@ -1,26 +1,31 @@
 //! `mnr-relay` — the Stage 0 verified proxy (`docs/stage0-mvp-plan.md` §6).
 //!
-//! Week 2 slice: config, upstream pool, prober, ranking, quorum tip, degraded
-//! mode, and the status feed for the public upstreams page. RPC ingress,
-//! auth, limits and dispatch follow.
+//! Week 2: config, upstream pool and prober, ingress with token auth and
+//! limits, policy dispatch, passthrough and broadcast. Verification in the
+//! request path, the cache and metrics follow in week 3.
 
 #![forbid(unsafe_code)]
 
+mod auth;
 mod config;
-// Ranking and fault recording are consumed by dispatch (next slice).
+mod dispatch;
+mod ingress;
+mod limits;
+// Fault recording and the quorum accessor are consumed by verification
+// (week 3).
 #[allow(dead_code)]
 mod upstream;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::extract::State;
-use axum::routing::get;
-use axum::{Json, Router};
 use tracing_subscriber::EnvFilter;
 
+use auth::{MemoryTokenStore, Tier};
 use config::Config;
-use upstream::{Pool, PoolStatus};
+use ingress::App;
+use limits::MemoryLimiter;
+use upstream::Pool;
 
 #[tokio::main]
 async fn main() {
@@ -34,11 +39,11 @@ async fn main() {
         )
         .init();
 
-    let path = config_path().unwrap_or_else(|| {
-        eprintln!("usage: mnr-relay --config relay.toml");
+    let args = Args::parse().unwrap_or_else(|why| {
+        eprintln!("{why}\nusage: mnr-relay --config relay.toml [--dev-token <token>[:pro]]...");
         std::process::exit(2);
     });
-    let cfg = match Config::load(&path) {
+    let cfg = match Config::load(&args.config) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("{e}");
@@ -53,43 +58,70 @@ async fn main() {
         env!("CARGO_PKG_VERSION")
     );
 
+    // Dev tokens live in memory only; the SQLite store replaces this.
+    let mut store = MemoryTokenStore::new();
+    for (token, tier) in &args.dev_tokens {
+        let p = store.insert(token, *tier);
+        tracing::info!(handle = %p.handle, tier = tier.label(), "dev token registered");
+    }
+    if args.dev_tokens.is_empty() {
+        tracing::warn!("no token store configured: every request will be refused with 401");
+    }
+
     // First probe round before serving so the status feed is never empty.
     pool.probe_all().await;
     tokio::spawn(Arc::clone(&pool).run_prober());
 
-    let app = Router::new()
-        .route("/healthz", get(healthz))
-        .route("/upstreams.json", get(upstreams))
-        .with_state(pool);
-
+    let app = Arc::new(App {
+        pool,
+        store: Arc::new(store),
+        limiter: Arc::new(MemoryLimiter::new()),
+    });
     let listener = tokio::net::TcpListener::bind(cfg.listen)
         .await
         .expect("bind listen address");
     tracing::info!(listen = %cfg.listen, "listening");
-    axum::serve(listener, app).await.expect("serve");
+    axum::serve(listener, ingress::router(app))
+        .await
+        .expect("serve");
 }
 
-fn config_path() -> Option<PathBuf> {
-    let mut args = std::env::args().skip(1);
-    while let Some(a) = args.next() {
-        if a == "--config" {
-            return args.next().map(PathBuf::from);
+struct Args {
+    config: PathBuf,
+    dev_tokens: Vec<(String, Tier)>,
+}
+
+impl Args {
+    fn parse() -> Result<Self, String> {
+        let mut config = None;
+        let mut dev_tokens = Vec::new();
+        let mut args = std::env::args().skip(1);
+        while let Some(a) = args.next() {
+            match a.as_str() {
+                "--config" => config = args.next().map(PathBuf::from),
+                "--dev-token" => {
+                    let v = args.next().ok_or("--dev-token needs a value")?;
+                    let (token, tier) = match v.strip_suffix(":pro") {
+                        Some(t) => (t.to_owned(), Tier::Pro),
+                        None => (v.strip_suffix(":free").unwrap_or(&v).to_owned(), Tier::Free),
+                    };
+                    if !auth::looks_like_token(&token) {
+                        return Err("--dev-token must be `sub_` + base58 of 32 bytes".into());
+                    }
+                    dev_tokens.push((token, tier));
+                }
+                other => {
+                    if let Some(p) = other.strip_prefix("--config=") {
+                        config = Some(PathBuf::from(p));
+                    } else {
+                        return Err(format!("unknown argument {other}"));
+                    }
+                }
+            }
         }
-        if let Some(p) = a.strip_prefix("--config=") {
-            return Some(PathBuf::from(p));
-        }
+        Ok(Self {
+            config: config.ok_or("--config is required")?,
+            dev_tokens,
+        })
     }
-    None
-}
-
-async fn healthz(State(pool): State<Arc<Pool>>) -> (axum::http::StatusCode, &'static str) {
-    if pool.degraded() {
-        (axum::http::StatusCode::SERVICE_UNAVAILABLE, "degraded")
-    } else {
-        (axum::http::StatusCode::OK, "ok")
-    }
-}
-
-async fn upstreams(State(pool): State<Arc<Pool>>) -> Json<PoolStatus> {
-    Json(pool.status())
 }
