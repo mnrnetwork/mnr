@@ -594,6 +594,7 @@ async fn stream(
     if ranked.is_empty() {
         return Outcome::json_error(503, "no healthy upstream", Verify::None);
     }
+    let mut failed = 0usize;
     for id in ranked {
         let u = pool.upstream(id);
         let Some(slot) = u.try_take_stream() else {
@@ -620,10 +621,14 @@ async fn stream(
                     extra_wu: 0,
                 };
             }
-            Ok(_) | Err(_) => continue,
+            Ok(_) | Err(_) => failed += 1,
         }
     }
-    Outcome::json_error(503, "all stream slots busy", Verify::None)
+    if failed > 0 {
+        Outcome::json_error(502, "upstream unavailable for streams", Verify::None)
+    } else {
+        Outcome::json_error(503, "all stream slots busy", Verify::None)
+    }
 }
 
 /// Fan out to every healthy upstream; success if any accepts. The response

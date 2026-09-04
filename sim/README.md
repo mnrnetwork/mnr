@@ -21,13 +21,25 @@ designed behaviour.
 What it does not prove: a public node's tolerance, verification against real
 blocks beyond the fixtures, reorg handling under a real daemon.
 
-## Stagenet harness (planned, plan §7 weeks 5–6)
+## Reorg and ejection drill (exists)
 
-docker-compose with three `monerod --stagenet` nodes, the relay, and a fault
-injector in front of one node (wrong header, lagging height, dropped stream),
-used for the header-chain reorg drill and the ejection drill against real
-daemon behaviour. It needs Docker and a stagenet sync (hours), so it runs
-nightly, not on push. Not started yet: the unit tests with mock upstreams
-cover the injected-fault paths (tampered blob → fault → fall-through →
-ejection, lagging tip excluded from the vote, stalled stream cut at the idle
-timeout) until it exists.
+`sim/drill.sh` starts four synthetic nodes (`crates/relay/examples/injector.rs`,
+a deterministic header chain with runtime-switchable faults) behind the real
+relay binary and drives three scenarios end to end: every node switches to a
+branch and back (two reorgs: the header chain is truncated and rebuilt, the
+cache epoch bumps, a cached header becomes a miss), one node lies about three
+headers (three faults, ejection, the public feed shows it, clients still get
+verified answers from the others), and every node cuts its streams (short
+reads with HTTP 200; a full stream afterwards proves the slots were released).
+Takes about a minute; needs `curl` and `jq`. Exit status 0 only when every
+check passes.
+
+What it does not prove: real `monerod` behaviour (fields, timing, a real
+reorg). The unit tests carry the fixture-based verification; the drill carries
+the state machines around it.
+
+## Stagenet harness (planned)
+
+docker-compose with three `monerod --stagenet` nodes and the relay, for the
+same drill against real daemon behaviour. It needs Docker and a stagenet sync
+(hours), so it would run nightly, not on push. Not started.
