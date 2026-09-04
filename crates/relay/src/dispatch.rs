@@ -29,6 +29,7 @@ use mnr_core::policy::{Class, Policy, TIP_SAFETY_DEPTH};
 use mnr_core::wire::{GetTransactionsResult, JsonRpcResponse};
 use serde_json::{json, Value};
 
+use crate::agreement;
 use crate::auth::Tier;
 use crate::cache::{Cache, Cached, Status};
 use crate::chain::ChainStore;
@@ -66,7 +67,7 @@ pub struct Request {
     pub id: Value,
     pub content_type: &'static str,
     pub body: Bytes,
-    #[allow(dead_code)] // per-tier agreement (outputs family) follows
+    /// Decides the agreement rule for the outputs family.
     pub tier: Tier,
 }
 
@@ -127,6 +128,7 @@ pub async fn dispatch(ctx: Ctx, policy: &'static Policy, req: Request) -> Outcom
         Class::ImmutableConditional if verify::canonical(&req.method) == "/get_transactions" => {
             transactions(ctx, req, timeout).await
         }
+        Class::ImmutableConditional => agreement::agreement(ctx, policy, req, timeout).await,
         Class::Swr => consensus::swr(ctx, req, timeout).await,
         _ => read(&ctx.pool, req.path, req.content_type, req.body, timeout).await,
     }
@@ -507,7 +509,7 @@ fn assemble(
     out
 }
 
-async fn read(
+pub(crate) async fn read(
     pool: &Pool,
     path: &str,
     content_type: &str,

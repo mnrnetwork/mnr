@@ -12,6 +12,7 @@
 
 #![forbid(unsafe_code)]
 
+mod agreement;
 mod auth;
 mod cache;
 mod chain;
