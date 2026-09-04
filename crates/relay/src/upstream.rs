@@ -12,6 +12,7 @@
 //!
 //! No client identity ever reaches this module: it only knows method bodies.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -34,6 +35,8 @@ const FAULT_WINDOW: Duration = Duration::from_secs(3600);
 const FAULT_LIMIT: usize = 3;
 /// Ejection length.
 const EJECT_FOR: Duration = Duration::from_secs(24 * 3600);
+/// Newest fault events kept for the public log.
+const FAULT_LOG_MAX: usize = 1000;
 
 /// What kind of work a caller wants an upstream for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,7 +57,6 @@ pub struct Health {
     pub rtt_ema_ms: Option<f64>,
     pub last_probe: Option<SystemTime>,
     pub last_error: Option<String>,
-    pub consecutive_failures: u32,
     faults: Vec<Instant>,
     ejected_until: Option<Instant>,
 }
@@ -87,7 +89,7 @@ pub struct Pool {
     pub upstreams: Vec<Upstream>,
     health: RwLock<Vec<Health>>,
     quorum: RwLock<Option<QuorumTip>>,
-    faults: RwLock<Vec<FaultEvent>>,
+    faults: RwLock<VecDeque<FaultEvent>>,
     min_agree: usize,
     interval: Duration,
 }
@@ -156,7 +158,7 @@ impl Pool {
             upstreams,
             health: RwLock::new(vec![Health::default(); n]),
             quorum: RwLock::new(None),
-            faults: RwLock::new(Vec::new()),
+            faults: RwLock::new(VecDeque::new()),
             min_agree: cfg.probe.min_agree,
             interval: Duration::from_secs(cfg.probe.interval_secs),
         })
@@ -194,7 +196,6 @@ impl Pool {
                             None => p.rtt_ms,
                         });
                         h.last_error = None;
-                        h.consecutive_failures = 0;
                         if p.synchronized && !h.ejected(now) && p.block_count > 0 {
                             reports.push(TipReport {
                                 upstream: u.id,
@@ -205,7 +206,6 @@ impl Pool {
                     }
                     Err(e) => {
                         h.ok = false;
-                        h.consecutive_failures += 1;
                         h.last_error = Some(e);
                     }
                 }
@@ -229,9 +229,12 @@ impl Pool {
         self.quorum.read().is_none()
     }
 
+    /// Exactly on the quorum tip: same height *and* same hash. A node one
+    /// block ahead is skipped until the quorum catches up (at most one probe
+    /// round); a node at the same height with another hash is on a fork.
     fn on_tip(h: &Health, q: Option<&QuorumTip>) -> bool {
         match q {
-            Some(q) => h.block_count > q.height,
+            Some(q) => h.block_count == q.height + 1 && h.top_hash == Some(q.hash),
             None => false,
         }
     }
@@ -280,7 +283,10 @@ impl Pool {
     /// Record a verification failure against an upstream. Three in an hour
     /// eject it for 24 h; every fault is logged publicly.
     pub fn record_fault(&self, id: usize, method: &str, detail: String) {
-        let now = Instant::now();
+        self.record_fault_at(id, method, detail, Instant::now());
+    }
+
+    fn record_fault_at(&self, id: usize, method: &str, detail: String, now: Instant) {
         let ejected = {
             let mut health = self.health.write();
             let h = &mut health[id];
@@ -295,7 +301,11 @@ impl Pool {
         };
         let name = &self.upstreams[id].cfg.name;
         tracing::warn!(upstream = %name, method, %detail, ejected, "verification fault");
-        self.faults.write().push(FaultEvent {
+        let mut log = self.faults.write();
+        if log.len() >= FAULT_LOG_MAX {
+            log.pop_front();
+        }
+        log.push_back(FaultEvent {
             at_unix: unix_now(),
             upstream: name.clone(),
             method: method.to_owned(),
@@ -342,7 +352,7 @@ impl Pool {
             quorum_hash: q.as_ref().map(|q| hex(&q.hash)),
             quorum_agreeing: q.as_ref().map_or(0, |q| q.agreeing.len()),
             upstreams,
-            faults: self.faults.read().clone(),
+            faults: self.faults.read().iter().cloned().collect(),
         }
     }
 }
@@ -561,6 +571,60 @@ transport = "onion"
         assert!(s.upstreams[1].ejected);
         assert_eq!(s.quorum_height, Some(100));
         assert!(!s.degraded);
+    }
+
+    #[test]
+    fn ahead_of_quorum_and_forked_are_not_on_tip() {
+        let p = pool();
+        let mut forked = healthy(101, 1.0);
+        forked.top_hash = Some([8; 32]);
+        set(
+            &p,
+            [
+                healthy(102, 1.0),
+                healthy(101, 15.0),
+                forked,
+                healthy(101, 20.0),
+            ],
+            Some(100),
+        );
+        // own is one block ahead, pub-slow is on a fork: neither is on tip.
+        assert_eq!(p.ranked(Work::Light), vec![1, 3]);
+        let s = p.status();
+        assert!(!s.upstreams[0].on_tip && !s.upstreams[2].on_tip);
+    }
+
+    #[test]
+    fn faults_older_than_the_window_do_not_count() {
+        let p = pool();
+        set(
+            &p,
+            [
+                healthy(101, 30.0),
+                healthy(101, 15.0),
+                healthy(101, 20.0),
+                healthy(101, 1.0),
+            ],
+            Some(100),
+        );
+        let t0 = Instant::now();
+        p.record_fault_at(2, "get_block", "x".into(), t0);
+        p.record_fault_at(2, "get_block", "x".into(), t0);
+        let later = t0 + FAULT_WINDOW + Duration::from_secs(1);
+        p.record_fault_at(2, "get_block", "x".into(), later);
+        assert!(!p.status().upstreams[2].ejected, "two faults aged out");
+        p.record_fault_at(2, "get_block", "x".into(), later);
+        p.record_fault_at(2, "get_block", "x".into(), later);
+        assert!(p.status().upstreams[2].ejected);
+    }
+
+    #[test]
+    fn fault_log_is_bounded() {
+        let p = pool();
+        for _ in 0..(FAULT_LOG_MAX + 5) {
+            p.record_fault(1, "m", "d".into());
+        }
+        assert_eq!(p.status().faults.len(), FAULT_LOG_MAX);
     }
 
     #[test]

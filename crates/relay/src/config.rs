@@ -19,6 +19,8 @@ pub const DEFAULT_USER_AGENT: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     " (+https://mnr.network/upstreams)"
 );
+/// The disclosure link every User-Agent must carry, override included.
+const UA_LINK: &str = "(+https://mnr.network/upstreams)";
 
 #[derive(Debug)]
 pub enum ConfigError {
@@ -211,11 +213,18 @@ impl Config {
         if self.probe.min_agree == 0 {
             return invalid("probe.min_agree must be at least 1".into());
         }
+        if self.upstreams.len() < self.probe.min_agree {
+            return invalid(format!(
+                "{} upstreams cannot reach probe.min_agree = {}; the relay would be degraded forever",
+                self.upstreams.len(),
+                self.probe.min_agree
+            ));
+        }
         if let Some(ua) = &self.user_agent {
-            if !ua.starts_with("mnr-relay/") || !ua.contains("mnr.network") {
-                return invalid(
-                    "user_agent must identify mnr-relay and link to mnr.network (rule 4)".into(),
-                );
+            if !ua.starts_with("mnr-relay/") || !ua.contains(UA_LINK) {
+                return invalid(format!(
+                    "user_agent must start with `mnr-relay/` and contain `{UA_LINK}` (rule 4)"
+                ));
             }
         }
         let opt_out: HashSet<&str> = self.opt_out.iter().map(String::as_str).collect();
@@ -268,6 +277,9 @@ impl Config {
 mod tests {
     use super::*;
 
+    /// One upstream needs min_agree = 1 to be a valid config.
+    const PROBE1: &str = "[probe]\nmin_agree = 1\n";
+
     const MINIMAL: &str = r#"
 [[upstreams]]
 name = "cake"
@@ -278,21 +290,21 @@ transport = "https"
 
     #[test]
     fn minimal_config_gets_public_node_defaults() {
-        let c = Config::parse(MINIMAL).unwrap();
+        let c = Config::parse(&format!("{PROBE1}{MINIMAL}")).unwrap();
         assert_eq!(c.listen.port(), 18089);
         assert_eq!(c.probe.interval_secs, 15);
-        assert_eq!(c.probe.min_agree, 3);
+        assert_eq!(c.probe.min_agree, 1);
         let u = &c.upstreams[0];
         assert_eq!(u.caps, Caps::default());
         assert_eq!(u.caps.rps_light, 5);
         assert_eq!(u.host(), Some("xmr-node.cakewallet.com"));
         assert!(c.user_agent().starts_with("mnr-relay/"));
-        assert!(c.user_agent().contains("+https://mnr.network/upstreams"));
+        assert!(c.user_agent().contains(UA_LINK));
     }
 
     #[test]
     fn opted_out_host_is_refused_at_load() {
-        let text = format!("opt_out = [\"xmr-node.cakewallet.com\"]\n{MINIMAL}");
+        let text = format!("opt_out = [\"xmr-node.cakewallet.com\"]\n{PROBE1}{MINIMAL}");
         let err = Config::parse(&text).unwrap_err().to_string();
         assert!(err.contains("opt-out"), "{err}");
     }
@@ -300,6 +312,8 @@ transport = "https"
     #[test]
     fn onion_requires_tor_socks_and_matching_scheme() {
         let onion = r#"
+[probe]
+min_agree = 1
 [[upstreams]]
 name = "o"
 url = "http://abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwxyz234567.onion:18081"
@@ -324,8 +338,8 @@ transport = "onion"
     #[test]
     fn scheme_must_match_transport_and_names_unique() {
         let bad = MINIMAL.replace("transport = \"https\"", "transport = \"http\"");
-        assert!(Config::parse(&bad).is_err());
-        let dup = format!("{MINIMAL}{MINIMAL}");
+        assert!(Config::parse(&format!("{PROBE1}{bad}")).is_err());
+        let dup = format!("{PROBE1}{MINIMAL}{MINIMAL}");
         assert!(Config::parse(&dup)
             .unwrap_err()
             .to_string()
@@ -334,16 +348,28 @@ transport = "onion"
 
     #[test]
     fn user_agent_override_must_still_identify_us() {
-        let text = format!("user_agent = \"Mozilla/5.0\"\n{MINIMAL}");
+        let text = format!("user_agent = \"Mozilla/5.0\"\n{PROBE1}{MINIMAL}");
         assert!(Config::parse(&text).is_err());
-        let text =
-            format!("user_agent = \"mnr-relay/0.1 (+https://mnr.network/upstreams)\"\n{MINIMAL}");
+        let text = format!("user_agent = \"mnr-relay/0.1 (mnr.network)\"\n{PROBE1}{MINIMAL}");
+        assert!(
+            Config::parse(&text).is_err(),
+            "link must be the upstreams page"
+        );
+        let text = format!(
+            "user_agent = \"mnr-relay/0.1 (+https://mnr.network/upstreams)\"\n{PROBE1}{MINIMAL}"
+        );
         assert!(Config::parse(&text).is_ok());
     }
 
     #[test]
     fn unknown_fields_are_rejected() {
-        let text = format!("logging = true\n{MINIMAL}");
+        let text = format!("logging = true\n{PROBE1}{MINIMAL}");
         assert!(Config::parse(&text).is_err());
+    }
+
+    #[test]
+    fn too_few_upstreams_for_min_agree_is_refused() {
+        let err = Config::parse(MINIMAL).unwrap_err().to_string();
+        assert!(err.contains("min_agree"), "{err}");
     }
 }
