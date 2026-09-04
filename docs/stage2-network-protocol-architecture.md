@@ -296,11 +296,11 @@ The plan assumes two engineers. If it is one person, P3 slips beyond month 18 an
 ## 7. Decisions (closed 2026-09-04)
 
 1. **Name and domain:** mnr, at `mnr.network`, org `mnrnetwork` on GitHub.
-2. **Licenses:** AGPL-3.0 for `mnr-agent` and `mnr-relay`; `mnr-core` and `mnr-client` dual-licensed MIT OR Apache-2.0 so wallets can embed them. Applied to `mnr-core` in the workspace.
+2. **Licences:** AGPL-3.0 for `mnr-agent` and `mnr-relay`; Apache-2.0 for `mnr-core` and `mnr-client` so wallets can embed them; CC-BY 4.0 for the protocol spec and the verification methodology; the website, name and brand assets all rights reserved, with the name defended by `TRADEMARK.md`. Applied in the workspace.
 3. **Primary endpoint:** clearnet, `rpc.mnr.network`, is the advertised endpoint; the `.onion` is published beside it as an equal alternative, never as the headline. Most wallets and all backends reach clearnet first.
 4. **External review:** yes to both. Seek spec review from Monero developers before P1, after the Stage 0 beta has real traffic to show; submit `mnr-core`'s hashing fixtures upstream to `monero-oxide` as a test-only PR once the fixture set includes stagenet.
 5. **P2 beta operators:** chosen by rule, not by list: the ten Stage 0 upstream operators with the longest verified uptime on the public upstreams page who answered the operator notice. B produces the list at P2 from the status history.
-6. **Counsel jurisdiction:** the jurisdiction of the founders' operating entity. Counsel is engaged before the first paid invoice, not for Stage 0.
+6. **Counsel jurisdiction:** there is no legal entity and there may never be one; the project's identity is the domain `mnr.network` and the release signing key. If an entity is ever formed, counsel is in its jurisdiction; otherwise the founders engage counsel as individuals before the first paid invoice, not for Stage 0.
 7. **P1-min track:** deferred until the Stage 0 gate in `stage0-mvp-plan.md` §9 is met. First approach is to swap interfaces that already run their own `monerod`, since they are the ones with a `get_outs` agreement requirement and measured burst needs.
 8. **Parameters:** affiliate share 15%, probation weight 10%, as proposed. Both are snapshot parameters and can move by governance vote later.
 

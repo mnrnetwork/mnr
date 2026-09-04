@@ -31,7 +31,7 @@ The method policy table is code: `mnr-core::policy` is canonical, checked in tes
 
 ## Conventions
 
-- Licenses: AGPL-3.0-only for the workspace, MIT OR Apache-2.0 for `crates/core` (`mnr-core` must stay embeddable by wallets; keep it free of AGPL dependencies).
+- Licences: AGPL-3.0-only for the workspace, Apache-2.0 for `crates/core` (`mnr-core` must stay embeddable by wallets; keep it free of AGPL dependencies), CC-BY 4.0 for `spec/`, `brand/` all rights reserved. The name is defended by `TRADEMARK.md`, anchored on the domain and the release key, not on a legal entity; there is none.
 - Rust 2021, stable toolchain, `cargo fmt` + `cargo clippy -D warnings` clean before commit. tokio + axum + rustls; `moka` for cache; `rusqlite` for state; `governor` for rate limiting.
 - Monero serialization/hashing: prefer the `monero-serai` family of crates; wrap them behind `mnr-core::hash` so a crate swap never touches the relay. Every hashing function has fixture tests from real mainnet + stagenet blocks (include hard-fork boundary blocks, coinbase-only blocks, pruned and unpruned tx forms).
 - Tests: `cargo test` for units; `sim/` for integration; differential tests against a real `monerod` for `wire`/`hash`.

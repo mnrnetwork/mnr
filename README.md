@@ -26,4 +26,4 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-License: AGPL-3.0-only (see `LICENSE`) for the relay and everything else in this repository; `crates/core` (`mnr-core`) is MIT OR Apache-2.0 so wallets can embed it (see `crates/core/LICENSE-MIT` and `crates/core/LICENSE-APACHE`).
+Licences: **AGPL-3.0-only** for the relay and everything else here (`LICENSE`); **Apache-2.0** for `crates/core` (`mnr-core`) so wallets can embed it (`crates/core/LICENSE`); **CC-BY 4.0** for `spec/`; the name and the assets in `brand/` are **all rights reserved** (`brand/LICENSE`, `TRADEMARK.md`). Contributions are accepted under the DCO, see `CONTRIBUTING.md`.
