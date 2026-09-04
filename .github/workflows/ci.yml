@@ -18,6 +18,8 @@ jobs:
       - run: cargo build --release --workspace
   fuzz-smoke:
     runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: nightly
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
