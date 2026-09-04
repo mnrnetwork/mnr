@@ -270,8 +270,19 @@ impl HeaderChain {
                 "unsupported format version {version}"
             )));
         }
-        // Network id + 7 reserved bytes are part of the header; the network id
-        // is not validated yet so a future stagenet file can load by id.
+        // Only mainnet files exist in version 1, and the reserved bytes must
+        // be zero so that a loaded file always serialises back byte-for-byte.
+        if data[8] != NETWORK_ID_MAINNET {
+            return Err(ChainError::Corrupt(format!(
+                "unsupported network id {}",
+                data[8]
+            )));
+        }
+        if data[9..HEADER_SIZE].iter().any(|&b| b != 0) {
+            return Err(ChainError::Corrupt(
+                "reserved header bytes are not zero".to_owned(),
+            ));
+        }
 
         let body = &data[HEADER_SIZE..];
         if body.len() % ENTRY_SIZE != 0 {
@@ -500,6 +511,21 @@ mod tests {
         // Wrong format version.
         let mut bad = bytes.clone();
         bad[4] = 2;
+        assert!(matches!(
+            HeaderChain::from_bytes(&bad),
+            Err(ChainError::Corrupt(_))
+        ));
+
+        // Wrong network id, or non-zero reserved bytes (found by fuzzing:
+        // these loaded fine but did not round-trip).
+        let mut bad = bytes.clone();
+        bad[8] = 1;
+        assert!(matches!(
+            HeaderChain::from_bytes(&bad),
+            Err(ChainError::Corrupt(_))
+        ));
+        let mut bad = bytes.clone();
+        bad[15] = 0x9d;
         assert!(matches!(
             HeaderChain::from_bytes(&bad),
             Err(ChainError::Corrupt(_))
