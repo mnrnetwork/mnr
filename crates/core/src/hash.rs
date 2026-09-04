@@ -317,9 +317,9 @@ mod tests {
         let nonce_at = blob.len() - 1;
         blob[nonce_at] ^= 0x01;
         let want = h32(r["block_header"]["hash"].as_str().unwrap());
-        match parse_block(&blob) {
-            Ok(p) => assert_ne!(p.hash, want),
-            Err(_) => {} // also acceptable: the corruption made it unparsable
+        // An unparsable result is also acceptable: the corruption may break decoding.
+        if let Ok(p) = parse_block(&blob) {
+            assert_ne!(p.hash, want);
         }
     }
 
