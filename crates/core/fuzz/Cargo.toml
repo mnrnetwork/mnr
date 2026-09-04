@@ -41,6 +41,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "epee_parse"
+path = "fuzz_targets/epee_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "wire_json"
 path = "fuzz_targets/wire_json.rs"
 test = false

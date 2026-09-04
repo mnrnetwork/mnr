@@ -47,6 +47,6 @@ jobs:
       - name: run each target for 60 s
         run: |
           cd crates/core/fuzz
-          for t in parse_block tx_hash pruned_tx_hash headerchain_from_bytes wire_json; do
+          for t in parse_block tx_hash pruned_tx_hash headerchain_from_bytes wire_json epee_parse; do
             cargo fuzz run "$t" -- -max_total_time=60 -max_len=65536
           done

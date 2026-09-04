@@ -10,9 +10,11 @@
 //! - [`verify`] — the verification rules of `docs/stage0-mvp-plan.md` §4
 //! - [`policy`] — the method allow-list and per-method class/cache/quorum rules
 //! - [`headerchain`] — the `(hash, prev_hash, timestamp, height)` chain store
+//! - [`epee`] — read-only parser for monerod's epee binary (`.bin` endpoints), for cross-upstream comparison
 
 #![forbid(unsafe_code)]
 
+pub mod epee;
 pub mod hash;
 pub mod headerchain;
 pub mod policy;
