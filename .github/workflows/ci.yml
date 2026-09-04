@@ -16,6 +16,8 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: cargo build --release --workspace
+      - name: load test (10 s; asserts the per-upstream caps)
+        run: cargo run -p mnr-relay --release --example load -- --quick
   fuzz-smoke:
     runs-on: ubuntu-latest
     env:

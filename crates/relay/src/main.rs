@@ -1,47 +1,22 @@
-//! `mnr-relay` — the Stage 0 verified proxy (`docs/stage0-mvp-plan.md` §6).
-//!
-//! Week 2: config, upstream pool and prober, ingress with token auth and
-//! limits, policy dispatch, passthrough and broadcast, and a persistent
-//! token store with a work-unit limiter (see [`store`]). Week 3: the header
-//! chain ([`chain`]), verification in the request path ([`verify`],
-//! [`consensus`], [`agreement`]), the cache ([`cache`]) and Prometheus
-//! metrics ([`metrics`]). See `spec/headers.md` for what a client is told.
-//!
-//! With `[auth] database` set, tokens are managed through the `token`
-//! subcommand and requests are authenticated against SQLite; without it,
-//! `--dev-token` serves from memory (tests and local runs).
+//! `mnr-relay` binary: config, wiring, and the `token` management
+//! subcommand. Everything else lives in the library (see `lib.rs`).
 
 #![forbid(unsafe_code)]
-
-mod agreement;
-mod auth;
-mod cache;
-mod chain;
-mod config;
-mod consensus;
-mod dispatch;
-mod ingress;
-mod limits;
-mod metrics;
-mod store;
-mod stream;
-mod upstream;
-mod verify;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use tracing_subscriber::EnvFilter;
 
-use auth::{MemoryTokenStore, Tier, TokenStore};
-use cache::Cache;
-use chain::ChainStore;
-use config::Config;
-use ingress::App;
-use limits::{Limiter, MemoryLimiter};
-use metrics::Metrics;
-use store::SqliteStore;
-use upstream::Pool;
+use mnr_relay::auth::{self, MemoryTokenStore, Tier, TokenStore};
+use mnr_relay::cache::Cache;
+use mnr_relay::chain::ChainStore;
+use mnr_relay::config::Config;
+use mnr_relay::ingress::{self, App};
+use mnr_relay::limits::{Limiter, MemoryLimiter};
+use mnr_relay::metrics::{self, Metrics};
+use mnr_relay::store::SqliteStore;
+use mnr_relay::upstream::Pool;
 
 #[tokio::main]
 async fn main() {
