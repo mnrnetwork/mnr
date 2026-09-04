@@ -1,0 +1,50 @@
+# mnr-relay configuration (Stage 0). Copy to relay.toml and edit.
+#
+# Caps default to the public-node rules in .claude/rules/public-nodes.md:
+# 5 rps light calls, 2 concurrent get_blocks.bin streams, 10 MB/s per upstream.
+# A missing cap means the default, never "unlimited".
+
+listen = "127.0.0.1:18089"          # TLS is terminated in front of this
+# user_agent = "mnr-relay/0.1 (+https://mnr.network/upstreams)"  # must identify mnr
+# tor_socks = "127.0.0.1:9050"      # required if any upstream is transport = "onion"
+
+[probe]
+interval_secs = 15
+clearnet_timeout_ms = 2000
+onion_timeout_ms = 8000
+min_agree = 3                        # upstreams that must agree on a tip hash
+
+# Operators who asked to be removed (rule 5). An upstream on this list is
+# refused at load, not merely deprioritised. The list is public.
+opt_out = []
+
+[[upstreams]]
+name = "own-1"
+url = "http://10.8.0.2:18081"        # our full node over WireGuard
+kind = "owned"
+transport = "http"
+caps = { rps_light = 500, max_streams = 32, mbps = 200 }
+
+[[upstreams]]
+name = "cakewallet"
+url = "https://xmr-node.cakewallet.com:18081"
+kind = "public"
+transport = "https"
+
+[[upstreams]]
+name = "sethforprivacy"
+url = "https://node.sethforprivacy.com"
+kind = "public"
+transport = "https"
+
+[[upstreams]]
+name = "monerodevs-1"
+url = "http://node.monerodevs.org:18089"
+kind = "public"
+transport = "http"
+
+[[upstreams]]
+name = "hashvault"
+url = "http://nodes.hashvault.pro:18081"
+kind = "public"
+transport = "http"
