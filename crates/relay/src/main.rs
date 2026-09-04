@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
 use mnr_relay::auth::{self, MemoryTokenStore, Tier, TokenStore};
+use mnr_relay::billing::Billing;
 use mnr_relay::cache::Cache;
 use mnr_relay::chain::ChainStore;
 use mnr_relay::config::Config;
@@ -54,6 +55,7 @@ async fn main() {
         env!("CARGO_PKG_VERSION")
     );
 
+    let mut billing = None;
     let (store, limiter): (Arc<dyn TokenStore>, Arc<dyn Limiter>) = match &cfg.auth.database {
         Some(db) => {
             if !args.dev_tokens.is_empty() {
@@ -65,6 +67,16 @@ async fn main() {
                 std::process::exit(1);
             }));
             s.clone().run_flusher();
+            let b = Arc::new(
+                Billing::new(cfg.billing.clone(), Arc::clone(&s)).unwrap_or_else(|e| {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }),
+            );
+            if cfg.billing.wallet_rpc.is_some() {
+                tokio::spawn(Arc::clone(&b).run_watcher());
+            }
+            billing = Some(b);
             (s.clone(), s)
         }
         None => {
@@ -118,6 +130,7 @@ async fn main() {
         chain,
         cache,
         metrics,
+        billing,
         store,
         limiter,
     });
@@ -125,9 +138,12 @@ async fn main() {
         .await
         .expect("bind listen address");
     tracing::info!(listen = %cfg.listen, "listening");
-    axum::serve(listener, ingress::router(app))
-        .await
-        .expect("serve");
+    axum::serve(
+        listener,
+        ingress::router(app).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    .expect("serve");
 }
 
 /// `mnr-relay token issue|rotate|suspend|list ...` — management commands.

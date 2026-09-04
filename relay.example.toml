@@ -48,6 +48,23 @@ batch = 1000                          # headers per request; monerod's restricte
 [cache]
 max_bytes = 1073741824               # 1 GiB for the immutable tier
 
+# The storefront (plan §5): free tokens need only [auth] database; Pro
+# invoices also need a view-only monero-wallet-rpc on loopback, started with
+# --disable-rpc-login. Prices are atomic units per month, set by hand.
+# client_ip_header is for a trusted proxy in front (Cloudflare's
+# CF-Connecting-IP forwarded by Caddy) and is only accepted when `listen`
+# is a loopback address.
+[billing]
+# wallet_rpc = "http://127.0.0.1:18082/json_rpc"
+pro_price_atomic = 60000000000       # 0.06 XMR per month; update with the rate
+confirmations = 10
+free_per_day = 2000
+per_client_per_hour = 3
+months_max = 12
+# client_ip_header = "CF-Connecting-IP"
+secret_file = "invoice-secret"       # 32 random bytes, created on first start
+cors_origin = "https://mnr.network"
+
 # Prometheus /metrics: aggregate series only (never a token, path or client
 # address). Bind it to a private interface; leave unset to disable.
 [metrics]
@@ -55,9 +72,9 @@ listen = "127.0.0.1:9187"
 
 [[upstreams]]
 name = "own-1"
-url = "http://10.8.0.2:18081"        # our full node over WireGuard
+url = "https://node.kyc.rip"         # our full node (public, TLS on 443)
 kind = "owned"
-transport = "http"
+transport = "https"
 caps = { rps_light = 500, max_streams = 32, mbps = 200 }
 
 [[upstreams]]

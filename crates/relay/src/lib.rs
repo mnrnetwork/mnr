@@ -19,6 +19,7 @@
 
 pub mod agreement;
 pub mod auth;
+pub mod billing;
 pub mod cache;
 pub mod chain;
 pub mod config;

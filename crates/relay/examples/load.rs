@@ -279,12 +279,20 @@ async fn main() {
         chain: Arc::new(ChainStore::open(None).unwrap()),
         cache: Arc::new(Cache::new(1 << 28)),
         metrics: Arc::clone(&metrics),
+        billing: None,
         store,
         limiter,
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let relay = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, router(app)).await.unwrap() });
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router(app).into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap()
+    });
     let base = format!("http://{relay}/v1");
     let client = reqwest::Client::builder()
         .pool_max_idle_per_host(64)

@@ -24,6 +24,7 @@ use mnr_core::wire::{JsonRpcRequest, JsonRpcResponse, MNR_RATE_LIMITED, MNR_SUBS
 use serde_json::Value;
 
 use crate::auth::{self, AuthError, Principal, TokenStore};
+use crate::billing::{self, Billing};
 use crate::cache::Cache;
 use crate::chain::ChainStore;
 use crate::dispatch::{self, Outcome};
@@ -38,6 +39,8 @@ pub struct App {
     pub chain: Arc<ChainStore>,
     pub cache: Arc<Cache>,
     pub metrics: Arc<Metrics>,
+    /// The storefront; `None` without `[auth] database`.
+    pub billing: Option<Arc<Billing>>,
     pub store: Arc<dyn TokenStore>,
     pub limiter: Arc<dyn Limiter>,
 }
@@ -46,6 +49,12 @@ pub fn router(app: Arc<App>) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/upstreams.json", get(upstreams))
+        // Storefront (spec/storefront.md), before the RPC catch-alls.
+        .route("/v1/tokens/free", any(billing::free_token_handler))
+        .route("/v1/invoices", any(billing::create_invoice_handler))
+        .route("/v1/invoices/{id}", get(billing::invoice_status_handler))
+        // `/v1/{token}/rotate` is handled inside `rpc` (it would conflict
+        // with the catch-all in the router).
         .route("/v1/{*rest}", any(rpc))
         .route("/{*rest}", any(rpc))
         .with_state(app)
@@ -72,6 +81,12 @@ async fn rpc(
     body: Bytes,
 ) -> Response {
     let (path_token, rpc_path) = split_token(&rest);
+    // Token rotation lives beside the RPC paths: `/v1/<token>/rotate`.
+    if let Some(token) = path_token {
+        if rest.rsplit('/').next() == Some("rotate") {
+            return billing::rotate_response(&app, token, &method);
+        }
+    }
     let authz = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());

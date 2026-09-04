@@ -63,6 +63,8 @@ pub struct Config {
     pub cache: CacheConfig,
     #[serde(default)]
     pub metrics: MetricsConfig,
+    #[serde(default)]
+    pub billing: BillingConfig,
     /// Hosts that asked to be removed (rule 5). Any upstream whose host is
     /// listed here is refused at load.
     #[serde(default)]
@@ -90,6 +92,77 @@ pub struct ChainConfig {
     /// monerod refuses more than 1000 on a restricted node.
     #[serde(default = "default_chain_batch")]
     pub batch: u64,
+}
+
+/// The storefront (`docs/stage0-mvp-plan.md` §5 payments). Free tokens
+/// need only `[auth] database`; Pro invoices also need `wallet_rpc`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BillingConfig {
+    /// View-only `monero-wallet-rpc` JSON-RPC URL on loopback
+    /// (`--disable-rpc-login`). Unset disables Pro invoices.
+    pub wallet_rpc: Option<String>,
+    /// Price of one Pro month in atomic units. $9 is the promise; this
+    /// figure is set by hand (no exchange-rate lookups).
+    #[serde(default = "default_pro_price")]
+    pub pro_price_atomic: u64,
+    /// Confirmations before a payment counts (plan §5: 10).
+    #[serde(default = "default_confirmations")]
+    pub confirmations: u32,
+    /// Ceiling on Free tokens issued per day, all clients together.
+    #[serde(default = "default_free_per_day")]
+    pub free_per_day: u64,
+    /// Issuances (free tokens and invoices) per client key per hour.
+    #[serde(default = "default_per_client")]
+    pub per_client_per_hour: u32,
+    /// Longest Pro purchase, in months.
+    #[serde(default = "default_months_max")]
+    pub months_max: u32,
+    /// Header a trusted proxy sets with the client address (Cloudflare's
+    /// `CF-Connecting-IP`, forwarded by Caddy). Unset: the socket peer.
+    /// Only meaningful when the relay listens on loopback behind that proxy.
+    pub client_ip_header: Option<String>,
+    /// 32 random bytes the Pro tokens are derived from; created on first
+    /// start. Without it derived tokens change on every restart.
+    pub secret_file: Option<PathBuf>,
+    /// Origin allowed to call the storefront from a browser.
+    #[serde(default = "default_cors_origin")]
+    pub cors_origin: Option<String>,
+}
+
+fn default_pro_price() -> u64 {
+    60_000_000_000
+}
+fn default_confirmations() -> u32 {
+    10
+}
+fn default_free_per_day() -> u64 {
+    2000
+}
+fn default_per_client() -> u32 {
+    3
+}
+fn default_months_max() -> u32 {
+    12
+}
+fn default_cors_origin() -> Option<String> {
+    Some("https://mnr.network".to_owned())
+}
+
+impl Default for BillingConfig {
+    fn default() -> Self {
+        Self {
+            wallet_rpc: None,
+            pro_price_atomic: default_pro_price(),
+            confirmations: default_confirmations(),
+            free_per_day: default_free_per_day(),
+            per_client_per_hour: default_per_client(),
+            months_max: default_months_max(),
+            client_ip_header: None,
+            secret_file: None,
+            cors_origin: default_cors_origin(),
+        }
+    }
 }
 
 /// Prometheus exposition (`docs/stage0-mvp-plan.md` §6). Aggregate series
@@ -307,6 +380,14 @@ impl Config {
         }
         if self.metrics.listen == Some(self.listen) {
             return invalid("metrics.listen must differ from the public listen address".into());
+        }
+        if self.billing.client_ip_header.is_some() && !self.listen.ip().is_loopback() {
+            return invalid(
+                "billing.client_ip_header is only safe when listen is a loopback address behind the proxy that sets it".into(),
+            );
+        }
+        if self.billing.per_client_per_hour == 0 || self.billing.months_max == 0 {
+            return invalid("billing.per_client_per_hour and months_max must be non-zero".into());
         }
         if self.upstreams.len() < self.probe.min_agree {
             return invalid(format!(

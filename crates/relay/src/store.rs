@@ -33,7 +33,7 @@ use crate::limits::{Limiter, MemoryLimiter, StreamPermit, Verdict};
 /// Seconds the previous token stays valid after a rotation (gateway plan §3.1).
 const GRACE_SECS: u64 = 24 * 3600;
 /// Schema version, stored in `PRAGMA user_version`.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 /// How often the relay re-reads the token table to pick up CLI changes.
 const TOKEN_RELOAD_EVERY: Duration = Duration::from_secs(30);
 
@@ -53,6 +53,19 @@ CREATE TABLE IF NOT EXISTS usage(
   day INTEGER NOT NULL,
   wu INTEGER NOT NULL,
   PRIMARY KEY(token_id, day)
+);
+CREATE TABLE IF NOT EXISTS invoices(
+  id TEXT PRIMARY KEY,
+  subaddr_index INTEGER NOT NULL,
+  address TEXT NOT NULL,
+  amount INTEGER NOT NULL,
+  months INTEGER NOT NULL,
+  renew_hash BLOB,
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('pending','paid','expired')),
+  received INTEGER NOT NULL DEFAULT 0,
+  paid_at INTEGER
 );
 ";
 
@@ -98,6 +111,43 @@ impl Default for UsageState {
         Self {
             day: today_unix(),
             map: HashMap::new(),
+        }
+    }
+}
+
+/// One Pro invoice (plan §5 payments). Holds no client identity: the id is
+/// random, the subaddress is ours, and `renew_hash` is a token hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Invoice {
+    pub id: String,
+    pub subaddr_index: u32,
+    pub address: String,
+    /// Atomic units due.
+    pub amount: u64,
+    pub months: u32,
+    /// The token this invoice extends, if it is a renewal.
+    pub renew_hash: Option<[u8; 32]>,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub status: InvoiceStatus,
+    /// Atomic units seen with enough confirmations at the last check.
+    pub received: u64,
+    pub paid_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvoiceStatus {
+    Pending,
+    Paid,
+    Expired,
+}
+
+impl InvoiceStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Paid => "paid",
+            Self::Expired => "expired",
         }
     }
 }
@@ -388,7 +438,19 @@ impl SqliteStore {
     /// SHA-256 is stored. `valid_until` is a unix timestamp, `None` = never.
     pub fn issue(&self, tier: Tier, valid_until: Option<u64>) -> String {
         let token = generate_token();
-        let hash = token_hash(&token);
+        self.issue_token(&token, tier, valid_until);
+        token
+    }
+
+    /// Register a raw token the caller derived (the storefront derives a
+    /// Pro token from its invoice id and a secret, so nothing raw is ever
+    /// at rest). Only the hash is stored, as with [`SqliteStore::issue`].
+    /// A hash already present is left as it is.
+    pub fn issue_token(&self, token: &str, tier: Tier, valid_until: Option<u64>) {
+        let hash = token_hash(token);
+        if self.tokens.read().contains_key(&hash) {
+            return;
+        }
         let now = unix_now();
         let row = TokenRow {
             id: 0,
@@ -415,7 +477,147 @@ impl SqliteStore {
         let mut row = row;
         row.id = id;
         self.tokens.write().insert(hash, row);
-        token
+    }
+
+    /// The `valid_until` of a current token, `Some(None)` for "never",
+    /// `None` for an unknown token.
+    pub fn valid_until(&self, hash: &[u8; 32]) -> Option<Option<u64>> {
+        self.tokens.read().get(hash).map(|r| r.valid_until)
+    }
+
+    // ── invoices (storefront, plan §5) ──────────────────────────────────
+
+    pub fn create_invoice(&self, inv: &Invoice) -> Result<(), String> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO invoices (id, subaddr_index, address, amount, months, renew_hash, created_at, expires_at, status, received, paid_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', 0, NULL)",
+            params![
+                inv.id,
+                inv.subaddr_index as i64,
+                inv.address,
+                inv.amount as i64,
+                inv.months as i64,
+                inv.renew_hash.as_ref().map(|h| h.as_slice()),
+                inv.created_at as i64,
+                inv.expires_at as i64,
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn invoice(&self, id: &str) -> Option<Invoice> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT id, subaddr_index, address, amount, months, renew_hash, created_at, expires_at, status, received, paid_at
+             FROM invoices WHERE id = ?1",
+            params![id],
+            Self::row_to_invoice,
+        )
+        .ok()
+    }
+
+    /// Every invoice still waiting for its payment.
+    pub fn pending_invoices(&self) -> Vec<Invoice> {
+        let conn = self.conn.lock();
+        let mut stmt = match conn.prepare(
+            "SELECT id, subaddr_index, address, amount, months, renew_hash, created_at, expires_at, status, received, paid_at
+             FROM invoices WHERE status = 'pending'",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map([], Self::row_to_invoice)
+            .map(|rows| rows.filter_map(Result::ok).collect())
+            .unwrap_or_default()
+    }
+
+    /// The most recent invoice that renewed (or created) the token with
+    /// this hash, so a renewal can reuse its subaddress.
+    pub fn latest_invoice_for(&self, hash: &[u8; 32]) -> Option<Invoice> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT id, subaddr_index, address, amount, months, renew_hash, created_at, expires_at, status, received, paid_at
+             FROM invoices WHERE renew_hash = ?1 ORDER BY created_at DESC LIMIT 1",
+            params![hash.as_slice()],
+            Self::row_to_invoice,
+        )
+        .ok()
+    }
+
+    /// The paid purchase invoice (no renewal target) whose derived token has
+    /// hash `hash`, found by re-deriving over the paid purchases with
+    /// `derive` (there are few, and this runs on a renewal only).
+    pub fn purchase_invoice_for(
+        &self,
+        hash: &[u8; 32],
+        derive: impl Fn(&str) -> [u8; 32],
+    ) -> Option<Invoice> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, subaddr_index, address, amount, months, renew_hash, created_at, expires_at, status, received, paid_at
+                 FROM invoices WHERE status = 'paid' AND renew_hash IS NULL ORDER BY created_at DESC",
+            )
+            .ok()?;
+        let rows: Vec<Invoice> = stmt
+            .query_map([], Self::row_to_invoice)
+            .ok()?
+            .filter_map(Result::ok)
+            .collect();
+        rows.into_iter().find(|inv| derive(&inv.id) == *hash)
+    }
+
+    /// Record what an invoice's subaddress has received and, when `paid`,
+    /// close it.
+    pub fn update_invoice(&self, id: &str, received: u64, paid: bool) -> Result<(), String> {
+        let conn = self.conn.lock();
+        if paid {
+            conn.execute(
+                "UPDATE invoices SET received = ?1, status = 'paid', paid_at = ?2 WHERE id = ?3",
+                params![received as i64, unix_now() as i64, id],
+            )
+        } else {
+            conn.execute(
+                "UPDATE invoices SET received = ?1 WHERE id = ?2",
+                params![received as i64, id],
+            )
+        }
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    }
+
+    /// Expire pending invoices past their deadline; returns how many.
+    pub fn expire_invoices(&self, now: u64) -> usize {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE invoices SET status = 'expired' WHERE status = 'pending' AND expires_at < ?1",
+            params![now as i64],
+        )
+        .unwrap_or(0)
+    }
+
+    fn row_to_invoice(r: &rusqlite::Row<'_>) -> rusqlite::Result<Invoice> {
+        let renew: Option<Vec<u8>> = r.get(5)?;
+        let status: String = r.get(8)?;
+        Ok(Invoice {
+            id: r.get(0)?,
+            subaddr_index: r.get::<_, i64>(1)? as u32,
+            address: r.get(2)?,
+            amount: r.get::<_, i64>(3)? as u64,
+            months: r.get::<_, i64>(4)? as u32,
+            renew_hash: renew.and_then(|v| v.try_into().ok()),
+            created_at: r.get::<_, i64>(6)? as u64,
+            expires_at: r.get::<_, i64>(7)? as u64,
+            status: match status.as_str() {
+                "paid" => InvoiceStatus::Paid,
+                "expired" => InvoiceStatus::Expired,
+                _ => InvoiceStatus::Pending,
+            },
+            received: r.get::<_, i64>(9)? as u64,
+            paid_at: r.get::<_, Option<i64>>(10)?.map(|v| v as u64),
+        })
     }
 
     /// Rotate the token whose *current* hash is `hash`: the new token becomes
@@ -499,9 +701,7 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// Extend a token's `valid_until` (unix timestamp). Part of the management
-    /// API; not yet wired to a CLI subcommand.
-    #[allow(dead_code)]
+    /// Extend a token's `valid_until` (unix timestamp).
     pub fn extend(&self, hash: &[u8; 32], valid_until: u64) -> Result<(), String> {
         let conn = self.conn.lock();
         let n = conn
@@ -681,7 +881,7 @@ fn generate_token() -> String {
 }
 
 /// Base58, Bitcoin alphabet — the same one `auth::looks_like_token` accepts.
-fn base58_encode(bytes: &[u8]) -> String {
+pub fn base58_encode(bytes: &[u8]) -> String {
     const B58: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
     let mut zeros = 0;
     while zeros < bytes.len() && bytes[zeros] == 0 {
@@ -724,6 +924,96 @@ fn today_unix() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schema_v1_database_migrates_and_keeps_its_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v1.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE tokens(id INTEGER PRIMARY KEY, token_hash BLOB UNIQUE NOT NULL, prev_token_hash BLOB, prev_grace_until INTEGER, tier TEXT NOT NULL, status TEXT NOT NULL, valid_until INTEGER, created_at INTEGER NOT NULL);
+                 CREATE TABLE usage(token_id INTEGER NOT NULL, day INTEGER NOT NULL, wu INTEGER NOT NULL, PRIMARY KEY(token_id, day));
+                 INSERT INTO tokens VALUES (1, X'0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20', NULL, NULL, 'pro', 'active', NULL, 1);
+                 INSERT INTO usage VALUES (1, 20000, 77);
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+        }
+        let store = SqliteStore::open(Some(&path)).unwrap();
+        let hash: [u8; 32] = (1..=32u8).collect::<Vec<_>>().try_into().unwrap();
+        assert_eq!(store.authenticate(&hash).unwrap().tier, Tier::Pro);
+        assert_eq!(
+            store.list()[0].wu_used_30d,
+            0,
+            "a usage day far in the past is outside the window"
+        );
+        assert!(
+            store.pending_invoices().is_empty(),
+            "invoices table exists and is empty"
+        );
+        let v: i64 = store
+            .conn()
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn invoices_round_trip_and_expire() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(Some(&dir.path().join("i.db"))).unwrap();
+        let inv = Invoice {
+            id: "abc123".into(),
+            subaddr_index: 7,
+            address: "8xyz".into(),
+            amount: 60_000_000_000,
+            months: 2,
+            renew_hash: Some([9; 32]),
+            created_at: 1_000,
+            expires_at: 2_000,
+            status: InvoiceStatus::Pending,
+            received: 0,
+            paid_at: None,
+        };
+        store.create_invoice(&inv).unwrap();
+        assert_eq!(store.invoice("abc123"), Some(inv.clone()));
+        assert_eq!(store.pending_invoices().len(), 1);
+        assert_eq!(store.latest_invoice_for(&[9; 32]).unwrap().id, "abc123");
+        store.update_invoice("abc123", 10, false).unwrap();
+        assert_eq!(store.invoice("abc123").unwrap().received, 10);
+        assert_eq!(store.expire_invoices(1_500), 0);
+        assert_eq!(store.expire_invoices(2_500), 1);
+        assert_eq!(
+            store.invoice("abc123").unwrap().status,
+            InvoiceStatus::Expired
+        );
+        assert!(store.pending_invoices().is_empty());
+        let paid = Invoice {
+            id: "def".into(),
+            expires_at: 9_000,
+            ..inv
+        };
+        store.create_invoice(&paid).unwrap();
+        store.update_invoice("def", 60_000_000_000, true).unwrap();
+        let got = store.invoice("def").unwrap();
+        assert_eq!(got.status, InvoiceStatus::Paid);
+        assert!(got.paid_at.is_some());
+        // Derived tokens register by hash only, once.
+        store.issue_token(
+            "sub_derivedtoken1111111111111111111111111111",
+            Tier::Pro,
+            Some(5_000),
+        );
+        store.issue_token(
+            "sub_derivedtoken1111111111111111111111111111",
+            Tier::Pro,
+            Some(6_000),
+        );
+        let h = token_hash("sub_derivedtoken1111111111111111111111111111");
+        assert_eq!(store.valid_until(&h), Some(Some(5_000)));
+        assert_eq!(store.valid_until(&[0; 32]), None);
+    }
     use crate::auth::looks_like_token;
     use crate::limits::LIGHT_WU;
 
