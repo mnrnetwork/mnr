@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mnr"
+version = "0.0.1"
+description = "mnr — an RPC network for Monero. Reserved for the Python client; not yet implemented. https://mnr.network"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.9"
+authors = [{ name = "the mnr project", email = "dev@mnr.network" }]
+keywords = ["monero", "xmr", "rpc", "monerod", "remote-node", "verification"]
+classifiers = ["Development Status :: 1 - Planning", "License :: OSI Approved :: Apache Software License"]
+
+[project.urls]
+Homepage = "https://mnr.network"
+Source = "https://github.com/mnrnetwork/mnr"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mnr"]

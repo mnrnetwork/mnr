@@ -1,0 +1,14 @@
+[package]
+name = "mnr"
+description = "mnr — an RPC network for Monero. Reserved for the command-line entry point; see mnr-relay for the Stage 0 relay."
+version.workspace = true
+edition.workspace = true
+license = "AGPL-3.0-only"
+repository.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+
+[dependencies]
+
+[lints]
+workspace = true

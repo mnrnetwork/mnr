@@ -1,0 +1,12 @@
+{
+  "name": "mnr-network",
+  "version": "0.0.1",
+  "description": "mnr — an RPC network for Monero. Reserved for the JavaScript client; not yet implemented. https://mnr.network",
+  "license": "Apache-2.0",
+  "homepage": "https://mnr.network",
+  "repository": { "type": "git", "url": "https://github.com/mnrnetwork/mnr", "directory": "packages/npm/mnr-network" },
+  "bugs": { "email": "dev@mnr.network" },
+  "main": "index.js",
+  "files": ["index.js", "README.md"],
+  "keywords": ["monero", "xmr", "rpc", "monerod", "remote-node", "verification"]
+}

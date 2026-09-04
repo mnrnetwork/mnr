@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+readme = "README.md"
 
 [[bin]]
 name = "mnr-relay"
@@ -16,7 +17,7 @@ axum = "0.8"
 bytes = "1.12.1"
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 getrandom = "0.4.3"
-mnr-core = { path = "../core" }
+mnr-core = { path = "../core", version = "0.0.1" }
 parking_lot = "0.12"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "socks", "stream"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }

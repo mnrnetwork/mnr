@@ -827,6 +827,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "mnr"
+version = "0.0.1"
+
+[[package]]
+name = "mnr-agent"
+version = "0.0.1"
+
+[[package]]
+name = "mnr-client"
+version = "0.0.1"
+
+[[package]]
 name = "mnr-core"
 version = "0.0.1"
 dependencies = [

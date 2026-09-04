@@ -1,0 +1,14 @@
+[package]
+name = "mnr-agent"
+description = "mnr — an RPC network for Monero: the operator agent that runs beside monerod (Stage 2). Reserved; not yet implemented."
+version.workspace = true
+edition.workspace = true
+license = "AGPL-3.0-only"
+repository.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+
+[dependencies]
+
+[lints]
+workspace = true
