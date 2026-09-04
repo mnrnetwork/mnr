@@ -5,3 +5,4 @@ and verification rules are written here in words. Nothing here is normative yet.
 
 - `headers.md` — the `Mnr-*` response headers and the meaning of every `Mnr-Verify` value.
 - `verification.md` — what is checked per method, how faults are handled, what is cached.
+- `storefront.md` — how tokens are issued, paid for and rotated; what the relay never learns.
