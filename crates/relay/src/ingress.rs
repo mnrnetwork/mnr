@@ -33,10 +33,7 @@ use crate::upstream::{Pool, PoolStatus};
 /// Shared state for every handler.
 pub struct App {
     pub pool: Arc<Pool>,
-    // Read by verification (next commit).
-    #[allow(dead_code)]
     pub chain: Arc<ChainStore>,
-    #[allow(dead_code)]
     pub cache: Arc<Cache>,
     pub store: Arc<dyn TokenStore>,
     pub limiter: Arc<dyn Limiter>,
@@ -99,7 +96,7 @@ async fn rpc(
     }
 
     let is_jsonrpc = rpc_path == "/json_rpc";
-    let (policy, id, requested) = match rpc_path {
+    let (policy, id, requested, params) = match rpc_path {
         "/json_rpc" => {
             let req: JsonRpcRequest = match serde_json::from_slice(&body) {
                 Ok(r) => r,
@@ -113,9 +110,14 @@ async fn rpc(
                     )
                 }
             };
-            (policy::lookup_or_deny(&req.method), req.id, req.method)
+            (
+                policy::lookup_or_deny(&req.method),
+                req.id,
+                req.method,
+                req.params,
+            )
         }
-        p => (policy::lookup_or_deny(p), Value::Null, p.to_owned()),
+        p => (policy::lookup_or_deny(p), Value::Null, p.to_owned(), None),
     };
 
     match policy.class {
@@ -178,7 +180,21 @@ async fn rpc(
     } else {
         "application/json"
     };
-    let outcome = dispatch::dispatch(&app.pool, policy, rpc_path, content_type, body).await;
+    let ctx = dispatch::Ctx {
+        pool: &app.pool,
+        chain: &app.chain,
+        cache: &app.cache,
+    };
+    let request = dispatch::Request {
+        path: rpc_path,
+        method: requested,
+        params,
+        id,
+        content_type,
+        body,
+        tier: principal.tier,
+    };
+    let outcome = dispatch::dispatch(ctx, policy, request).await;
     if outcome.extra_wu > 0 {
         app.limiter.charge(&principal, outcome.extra_wu);
     }

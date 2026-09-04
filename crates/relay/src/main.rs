@@ -13,8 +13,6 @@
 #![forbid(unsafe_code)]
 
 mod auth;
-// Wired into dispatch with verification (next commit).
-#[allow(dead_code)]
 mod cache;
 mod chain;
 mod config;
@@ -23,6 +21,7 @@ mod ingress;
 mod limits;
 mod store;
 mod upstream;
+mod verify;
 
 use std::path::PathBuf;
 use std::sync::Arc;

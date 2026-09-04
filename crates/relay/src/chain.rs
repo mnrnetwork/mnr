@@ -131,8 +131,6 @@ impl ChainStore {
     }
 
     /// Read access for verification.
-    // Consumed by verification and the cache (next commits).
-    #[allow(dead_code)]
     pub fn read(&self) -> RwLockReadGuard<'_, HeaderChain> {
         self.chain.read()
     }
@@ -141,7 +139,12 @@ impl ChainStore {
         self.chain.read().tip()
     }
 
-    #[allow(dead_code)]
+    /// Replace the chain, for dispatch tests that need known heights.
+    #[cfg(test)]
+    pub fn set_for_test(&self, chain: HeaderChain) {
+        *self.chain.write() = chain;
+    }
+
     pub fn epoch(&self) -> u64 {
         self.epoch.load(Ordering::Relaxed)
     }
