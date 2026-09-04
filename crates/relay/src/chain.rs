@@ -100,6 +100,24 @@ impl ChainStore {
                 let mut bytes = Vec::new();
                 f.read_to_end(&mut bytes)
                     .map_err(|e| format!("cannot read header chain {}: {e}", p.display()))?;
+                // A crash inside an append can leave a partial record at the
+                // tail. It is not a record, so drop it and let linkage
+                // validation judge the rest.
+                if bytes.len() as u64 > FILE_HEADER {
+                    let body = bytes.len() as u64 - FILE_HEADER;
+                    let partial = body % RECORD;
+                    if partial != 0 {
+                        let keep = bytes.len() - partial as usize;
+                        tracing::warn!(
+                            dropped_bytes = partial,
+                            "header chain file has a partial trailing record; truncating"
+                        );
+                        bytes.truncate(keep);
+                        f.set_len(keep as u64)
+                            .and_then(|()| f.sync_data())
+                            .map_err(|e| format!("cannot truncate {}: {e}", p.display()))?;
+                    }
+                }
                 let chain = if bytes.is_empty() {
                     let empty = HeaderChain::new();
                     f.write_all(&empty.to_bytes())
@@ -149,7 +167,6 @@ impl ChainStore {
         self.epoch.load(Ordering::Relaxed)
     }
 
-    #[allow(dead_code)]
     pub fn reorgs(&self) -> u64 {
         self.reorgs.load(Ordering::Relaxed)
     }
@@ -804,6 +821,31 @@ mod tests {
         assert_on_branch(&store, 3001, b2);
         assert!(store.reorgs() >= 3, "cut back plus the fork-point reorg");
         assert!(store.epoch() > epoch0 + 1);
+    }
+
+    #[tokio::test]
+    async fn partial_trailing_record_is_dropped_on_load() {
+        let net = Net::new(3, 3).await;
+        net.quorum_at(30, Spec { branch: 0, fork: 0 });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("headers.mnrh");
+        let store = ChainStore::open(Some(&path)).unwrap();
+        run_until_idle(&store, &net.pool, 1000, 5).await;
+        drop(store);
+        // Simulate a crash mid-append: 37 bytes of a would-be record 31.
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(&[0xEE; 37]).unwrap();
+        drop(f);
+        let again = ChainStore::open(Some(&path)).unwrap();
+        assert_on_branch(&again, 30, Spec { branch: 0, fork: 0 });
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            FILE_HEADER + 31 * RECORD
+        );
+        // And it keeps extending from there.
+        net.quorum_at(40, Spec { branch: 0, fork: 0 });
+        assert_eq!(again.step(&net.pool, 1000).await, Step::Idle);
+        assert_on_branch(&again, 40, Spec { branch: 0, fork: 0 });
     }
 
     #[tokio::test]

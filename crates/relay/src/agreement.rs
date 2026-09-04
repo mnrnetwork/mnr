@@ -70,13 +70,11 @@ pub async fn agreement(
 
     let ranked = ctx.pool.ranked(Work::Light);
     let mut chosen = Vec::with_capacity(need);
-    let mut spare = None;
+    let mut spares = Vec::new();
     for id in ranked.into_iter().take(CANDIDATES) {
         if chosen.len() == need {
-            spare = Some(id);
-            break;
-        }
-        if ctx.pool.upstream(id).try_take_light() {
+            spares.push(id);
+        } else if ctx.pool.upstream(id).try_take_light() {
             chosen.push(id);
         }
     }
@@ -108,16 +106,25 @@ pub async fn agreement(
         return o;
     }
 
-    // Tie-break with the next ranked upstream that has a token.
-    let third = match spare {
-        Some(id) if ctx.pool.upstream(id).try_take_light() => ask(&ctx.pool, &[id], &req, timeout)
-            .await
-            .into_iter()
-            .next(),
-        _ => None,
-    };
-    let Some(third) = third else {
+    // Tie-break with the next ranked upstream that has a token right now.
+    let spare = spares
+        .into_iter()
+        .find(|&id| ctx.pool.upstream(id).try_take_light());
+    let Some(spare) = spare else {
         return Outcome::json_error(502, "upstreams disagree", Verify::Failed);
+    };
+    let Some(third) = ask(&ctx.pool, &[spare], &req, timeout)
+        .await
+        .into_iter()
+        .next()
+    else {
+        // The tie-breaker did not answer: nobody is proven wrong, and the
+        // client is told the relay could not decide, not that nodes lied.
+        return Outcome::json_error(
+            502,
+            "upstreams disagree and the tie-breaker is unavailable",
+            Verify::None,
+        );
     };
     let Some(tie) = comparable(req.path, &third.1.body) else {
         return Outcome::json_error(502, "upstreams disagree", Verify::Failed);
@@ -479,6 +486,29 @@ mod tests {
             .await;
         assert_eq!(o.status, 502);
         assert_eq!(header(&o, "Mnr-Verify"), Some("failed"));
+    }
+
+    #[tokio::test]
+    async fn tie_break_skips_a_spare_without_capacity() {
+        // m2 is the first spare but has no token left; m3 breaks the tie.
+        let env = Env::new(vec![
+            outs_node(&[1, 9], 0),
+            outs_node(&[1, 2], 0),
+            outs_node(&[1, 2], 0),
+            outs_node(&[1, 2], 0),
+        ])
+        .await;
+        let u = env.ctx.pool.upstream(2);
+        while u.try_take_light() {}
+        let o = env
+            .call(Tier::Pro, "/get_outs", None, Bytes::from_static(b"{}"))
+            .await;
+        assert_eq!(o.status, 200);
+        assert_eq!(header(&o, "Mnr-Verify"), Some("agreement"));
+        assert_eq!(header(&o, "Mnr-Agreeing"), Some("2/3"));
+        let s = env.ctx.pool.status();
+        assert_eq!(s.upstreams[3].requests, 1, "m3 broke the tie");
+        assert_eq!(s.faults[0].upstream, "m0");
     }
 
     #[tokio::test]

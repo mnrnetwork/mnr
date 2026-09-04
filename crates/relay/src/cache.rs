@@ -120,7 +120,10 @@ pub struct Cache {
     immutable: Moka<String, Arc<Cached>>,
     txs: Moka<String, Arc<Bytes>>,
     swr: Moka<String, Arc<SwrEntry>>,
-    /// SWR keys with a refresh in flight (single-flight).
+    /// SWR keys with a refresh in flight (single-flight). A claim that is
+    /// never released (a panicking refresh task) only blocks background
+    /// refreshes; the entry itself expires with the tier's TTL and the
+    /// next miss fetches through `try_get_with`, which does not consult it.
     refreshing: Mutex<HashSet<String>>,
 }
 
@@ -221,7 +224,6 @@ impl Cache {
     }
 
     /// `(entries, bytes)` per tier for metrics, after pending housekeeping.
-    #[allow(dead_code)] // metrics (next commit)
     pub async fn stats(&self) -> [(&'static str, u64, u64); 3] {
         self.immutable.run_pending_tasks().await;
         self.txs.run_pending_tasks().await;

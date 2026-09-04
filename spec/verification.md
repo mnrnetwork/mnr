@@ -36,8 +36,10 @@ fabricates a PoW-valid alternate chain is a 51% attacker, outside this model.
 | `get_block_headers_range` | Exactly `end − start + 1` headers, heights contiguous from `start`, each linking to the previous, each equal to the chain's record. No partial trust: one header beyond the chain makes the whole answer `none`. | `chain` / `none` |
 | `on_get_block_hash` | The returned hash must equal the chain's at the requested height. | `chain`; `none` if the chain is shorter |
 
-A mismatch anywhere is a **fault**: the answer is never returned, the fault is
-recorded against the upstream (three in an hour eject it for 24 hours, every
+A request the relay cannot interpret (a malformed `hash` param, for instance)
+is passed through with the daemon's own answer as `none`; the fault log counts
+wrong *answers* only. A mismatch anywhere is a **fault**: the answer is never
+returned, the fault is recorded against the upstream (three in an hour eject it for 24 hours, every
 one is public), and the next ranked upstream is asked, up to three. If every
 attempt faults the client receives HTTP 502 with `Mnr-Verify: failed`.
 
@@ -46,8 +48,11 @@ the current chain epoch; the alias forms (`getblock`, …) share the entry.
 
 ## Transactions
 
-`/get_transactions`: every returned entry must have been requested. For each
-entry the blob is hashed and must equal `tx_hash`: the full form from `as_hex`,
+`/get_transactions`: every returned entry must have been requested, and the
+parallel arrays a wallet may read instead of the entries (`txs_as_hex`,
+`txs_as_json`) must have one element per entry carrying the same bytes as
+`txs[i].as_hex` / `txs[i].as_json`. For each entry the blob is hashed and must
+equal `tx_hash`: the full form from `as_hex`,
 or the pruned form from `pruned_as_hex` plus `prunable_hash`. A confirmed entry
 must not claim a height above the quorum tip. An entry with no hashable form
 (a pruned v1 transaction) is *unverifiable*, not a fault. `missed_tx` entries
@@ -92,7 +97,9 @@ of `credits`, `top_hash`, `untrusted` and `status`, and compared as trees so a
 field one node adds is not a disagreement. Identical answers are `agreement`
 with `Mnr-Agreeing: 2/2`. If they differ, a third upstream breaks the tie: the
 answers matching it win and the outlier is a fault. No majority, or no third
-upstream, is HTTP 502 `failed`: a wrong ring is worse than no ring. An answer
+upstream with capacity, is HTTP 502 `failed`: a wrong ring is worse than no
+ring. A tie-breaker that does not answer at all is HTTP 502 `none` (nobody is
+proven wrong). An answer
 the relay cannot parse is served as `none`, never as agreement.
 
 Only `get_output_distribution` with `to_height` at or below the safety line is

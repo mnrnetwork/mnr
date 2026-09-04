@@ -148,12 +148,16 @@ fn param_u64(params: Option<&Value>, key: &str) -> Option<u64> {
     params?.get(key)?.as_u64()
 }
 
-fn param_hash(params: Option<&Value>, key: &str) -> Option<Result<Hash, Fault>> {
+/// A hash the *client* supplied. A malformed one is the client's problem,
+/// never the upstream's: the daemon's error answer passes through as
+/// `none`, and no fault is recorded (the public fault log counts wrong
+/// answers only).
+fn param_hash(params: Option<&Value>, key: &str) -> Option<Hash> {
     let s = params?.get(key)?.as_str()?;
     if s.is_empty() {
         return None;
     }
-    Some(decode_hex32(s).map_err(|_| Fault(format!("request {key} is not a hash"))))
+    decode_hex32(s).ok()
 }
 
 fn hex(h: &Hash) -> String {
@@ -168,9 +172,17 @@ fn verify_get_block(
     let Some(result) = envelope::<GetBlockResult>(body)? else {
         return Ok(Verified::none());
     };
+    // monerod serves by hash when one is given, else by height. A hash we
+    // cannot decode cannot be checked against anything.
+    let hash_given = params
+        .and_then(|p| p.get("hash"))
+        .and_then(Value::as_str)
+        .is_some_and(|h| !h.is_empty());
+    let by_hash = param_hash(params, "hash");
+    if hash_given && by_hash.is_none() {
+        return Ok(Verified::none());
+    }
     let blob = decode_hex(&result.blob).map_err(|_| Fault("block blob is not hex".into()))?;
-    // monerod serves by hash when one is given, else by height.
-    let by_hash = param_hash(params, "hash").transpose()?;
     let by_height = param_u64(params, "height");
     let (parsed, verify) = match (by_hash, by_height) {
         (Some(want), _) => {
@@ -272,7 +284,8 @@ fn verify_header_by_hash(
     chain: &HeaderChain,
 ) -> Result<Verified, Fault> {
     // The `hashes: [...]` batch form returns `block_headers`; not checked.
-    let Some(requested) = param_hash(params, "hash").transpose()? else {
+    // Nor is a request hash we cannot decode.
+    let Some(requested) = param_hash(params, "hash") else {
         return Ok(Verified::none());
     };
     let Some(result) = envelope::<GetBlockHeaderResult>(body)? else {
@@ -406,8 +419,37 @@ pub fn verify_transactions(
     result: &GetTransactionsResult,
     tip: Option<u64>,
 ) -> Result<Vec<TxCheck>, Fault> {
+    // The parallel arrays a wallet may read instead of `txs[i]` must carry
+    // the same bytes as the entries that were hashed, or a node could pass
+    // a txid-valid entry next to a different blob.
+    if result.txs_as_hex.len() != result.txs.len() {
+        return Err(Fault(format!(
+            "{} txs_as_hex for {} txs",
+            result.txs_as_hex.len(),
+            result.txs.len()
+        )));
+    }
+    if let Some(as_json) = &result.txs_as_json {
+        if as_json.len() != result.txs.len() {
+            return Err(Fault(format!(
+                "{} txs_as_json for {} txs",
+                as_json.len(),
+                result.txs.len()
+            )));
+        }
+    }
     let mut out = Vec::with_capacity(result.txs.len());
-    for e in &result.txs {
+    for (i, e) in result.txs.iter().enumerate() {
+        if result.txs_as_hex[i] != e.as_hex {
+            return Err(Fault(format!("txs_as_hex disagrees with txs[{i}].as_hex")));
+        }
+        if let Some(as_json) = &result.txs_as_json {
+            if as_json[i] != e.as_json {
+                return Err(Fault(format!(
+                    "txs_as_json disagrees with txs[{i}].as_json"
+                )));
+            }
+        }
         if !requested.iter().any(|r| r.eq_ignore_ascii_case(&e.tx_hash)) {
             return Err(Fault(format!(
                 "unrequested tx {} in answer",
@@ -825,21 +867,40 @@ mod tests {
         let requested: Vec<String> = r.txs.iter().map(|t| t.tx_hash.clone()).collect();
         // A flipped byte in the prefix does not parse; one in the signature
         // parses and hashes to something else. Both are faults.
+        // (The parallel array is tampered the same way, or the cross-check
+        // fires first.)
         let mut hex_blob = r.txs[0].as_hex.clone();
         hex_blob.replace_range(20..21, if &hex_blob[20..21] == "0" { "1" } else { "0" });
-        r.txs[0].as_hex = hex_blob;
+        r.txs[0].as_hex = hex_blob.clone();
+        r.txs_as_hex[0] = hex_blob;
         let f = verify_transactions(&requested, &r, Some(3_754_000)).unwrap_err();
         assert!(f.0.contains("malformed"), "{}", f.0);
         let mut hex_blob = r.txs[1].as_hex.clone();
         let last = hex_blob.len() - 1;
         hex_blob.replace_range(last.., if &hex_blob[last..] == "0" { "1" } else { "0" });
-        r.txs[1].as_hex = hex_blob;
-        r.txs[0] = serde_json::from_str::<GetTransactionsResult>(TXS_FULL)
-            .unwrap()
-            .txs[0]
-            .clone();
+        r.txs[1].as_hex = hex_blob.clone();
+        r.txs_as_hex[1] = hex_blob;
+        let pristine = serde_json::from_str::<GetTransactionsResult>(TXS_FULL).unwrap();
+        r.txs[0] = pristine.txs[0].clone();
+        r.txs_as_hex[0] = pristine.txs_as_hex[0].clone();
         let f = verify_transactions(&requested, &r, Some(3_754_000)).unwrap_err();
         assert!(f.0.contains("hash mismatch"), "{}", f.0);
+
+        // The parallel array carries other bytes than the hashed entry.
+        let mut r: GetTransactionsResult = serde_json::from_str(TXS_FULL).unwrap();
+        let mut other = r.txs[0].as_hex.clone();
+        other.push_str("00");
+        r.txs_as_hex[0] = other;
+        let f = verify_transactions(&requested, &r, Some(3_754_000)).unwrap_err();
+        assert!(f.0.contains("txs_as_hex"), "{}", f.0);
+        let mut r: GetTransactionsResult = serde_json::from_str(TXS_FULL).unwrap();
+        r.txs_as_hex.pop();
+        assert!(verify_transactions(&requested, &r, Some(3_754_000)).is_err());
+        let mut r: GetTransactionsResult = serde_json::from_str(TXS_FULL).unwrap();
+        r.txs_as_json = Some(vec![String::from("{}"); r.txs.len()]);
+        r.txs[0].as_json = String::from("{\"x\":1}");
+        let f = verify_transactions(&requested, &r, Some(3_754_000)).unwrap_err();
+        assert!(f.0.contains("txs_as_json"), "{}", f.0);
 
         let r: GetTransactionsResult = serde_json::from_str(TXS_V1_PRUNED).unwrap();
         let requested: Vec<String> = r.txs.iter().map(|t| t.tx_hash.clone()).collect();

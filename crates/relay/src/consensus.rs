@@ -202,19 +202,28 @@ async fn fetch(pool: &Pool, plan: &FetchPlan) -> Result<SwrEntry, String> {
     }
     let asked = chosen.len();
     let quorum = pool.quorum().map(|q| q.height);
-    let (value, agreeing) = reduce(&plan.method, answers, quorum);
+    let Reduced {
+        value,
+        agreeing,
+        members,
+    } = reduce(&plan.method, answers, quorum);
     let value = finish(&plan.method, value);
-    let verify = if agreeing.is_some_and(|(k, _)| k >= MIN_AGREE) {
-        Verify::Majority
-    } else {
-        Verify::None
-    };
+    let majority = agreeing.is_some_and(|k| k >= MIN_AGREE);
+    if majority {
+        // The agreeing upstreams' answers were confirmed by each other:
+        // that is what the public verified count records.
+        for id in &members {
+            pool.record_verified(*id);
+        }
+    }
     Ok(SwrEntry {
         body: Bytes::from(serde_json::to_vec(&value).map_err(|e| e.to_string())?),
-        verify: verify.label(),
-        agreeing: agreeing
-            .filter(|(k, _)| *k >= MIN_AGREE)
-            .map(|(k, _)| (k, asked)),
+        verify: if majority {
+            Verify::Majority.label()
+        } else {
+            Verify::None.label()
+        },
+        agreeing: agreeing.filter(|k| *k >= MIN_AGREE).map(|k| (k, asked)),
         fetched: Instant::now(),
     })
 }
@@ -257,13 +266,18 @@ fn agreement_key(method: &str, v: &Value, quorum: Option<u64>) -> Option<Value> 
     }
 }
 
-/// The value to serve and `(agreeing, voting)`: the largest group of
-/// identical keys, or the best-ranked answer when nothing agrees.
-fn reduce(
-    method: &str,
-    answers: Vec<Answer>,
-    quorum: Option<u64>,
-) -> (Value, Option<(usize, usize)>) {
+/// What [`reduce`] settled on.
+struct Reduced {
+    value: Value,
+    /// How many answers agreed, when a vote took place.
+    agreeing: Option<usize>,
+    /// The upstreams whose answers agreed (empty without a majority).
+    members: Vec<usize>,
+}
+
+/// The value to serve: the largest group of identical keys, or the
+/// best-ranked answer (`answers` are in rank order) when nothing agrees.
+fn reduce(method: &str, answers: Vec<Answer>, quorum: Option<u64>) -> Reduced {
     if method == "get_fee_estimate" {
         return fee_median(answers);
     }
@@ -271,7 +285,6 @@ fn reduce(
         .into_iter()
         .map(|a| (agreement_key(method, &a.value, quorum), a))
         .collect();
-    let voting = keyed.iter().filter(|(k, _)| k.is_some()).count();
     let mut best: Option<(usize, usize)> = None; // (count, index of first member)
     for (i, (k, _)) in keyed.iter().enumerate() {
         let Some(k) = k else { continue };
@@ -285,37 +298,51 @@ fn reduce(
     }
     match best {
         Some((count, i)) if count >= MIN_AGREE => {
+            let key = keyed[i].0.clone();
+            let members = keyed
+                .iter()
+                .filter(|(k, _)| *k == key)
+                .map(|(_, a)| a.upstream)
+                .collect();
             let value = keyed
                 .into_iter()
                 .nth(i)
                 .expect("index from iteration")
                 .1
                 .value;
-            (value, Some((count, voting)))
+            Reduced {
+                value,
+                agreeing: Some(count),
+                members,
+            }
         }
-        _ => {
-            // Best-ranked (first chosen) answer, unverified.
-            let first = keyed
-                .into_iter()
-                .min_by_key(|(_, a)| a.upstream)
-                .expect("non-empty")
-                .1;
-            (first.value, None)
-        }
+        _ => Reduced {
+            // Rank order is preserved from `chosen`: the first answer is
+            // the best-ranked upstream that answered.
+            value: keyed.into_iter().next().expect("non-empty").1.value,
+            agreeing: None,
+            members: Vec::new(),
+        },
     }
 }
 
 /// `fee` = median of the estimates; `fees[i]` element-wise median when the
-/// vectors align; everything else from the first answer.
-fn fee_median(answers: Vec<Answer>) -> (Value, Option<(usize, usize)>) {
+/// vectors align; everything else from the first answer. Every parseable
+/// answer takes part, so the agreeing count is the parseable count.
+fn fee_median(answers: Vec<Answer>) -> Reduced {
     let parsed: Vec<(GetFeeEstimateResult, &Answer)> = answers
         .iter()
         .filter_map(|a| serde_json::from_value(a.value.clone()).ok().map(|p| (p, a)))
         .collect();
     let n = parsed.len();
+    let members: Vec<usize> = parsed.iter().map(|(_, a)| a.upstream).collect();
     let Some((first, first_answer)) = parsed.first() else {
         let value = answers.into_iter().next().map_or(Value::Null, |a| a.value);
-        return (value, None);
+        return Reduced {
+            value,
+            agreeing: None,
+            members: Vec::new(),
+        };
     };
     let mut out = first.clone();
     out.fee = median(&parsed.iter().map(|(p, _)| p.fee).collect::<Vec<_>>()).unwrap_or(first.fee);
@@ -340,7 +367,11 @@ fn fee_median(answers: Vec<Answer>) -> (Value, Option<(usize, usize)>) {
         }
     }
     let value = serde_json::to_value(&out).unwrap_or_else(|_| first_answer.value.clone());
-    (value, Some((n, n)))
+    Reduced {
+        value,
+        agreeing: Some(n),
+        members,
+    }
 }
 
 /// Last touches before an answer is cached: `get_info` node-specific
@@ -540,6 +571,16 @@ mod tests {
         assert_eq!(v["result"]["top_block_hash"], "aa");
         assert_eq!(v["result"]["incoming_connections_count"], 0, "normalised");
         assert_eq!(env.hits.load(Ordering::SeqCst), 3);
+        let s = env.ctx.pool.status();
+        assert_eq!(
+            (
+                s.upstreams[0].verified,
+                s.upstreams[1].verified,
+                s.upstreams[2].verified
+            ),
+            (1, 1, 0),
+            "agreeing upstreams count as verified"
+        );
         // Fresh: served from cache, nobody asked again.
         let o = env.call("get_info").await;
         assert_eq!(header(&o, "Mnr-Cache"), Some("hit"));
@@ -570,6 +611,30 @@ mod tests {
         assert_eq!(header(&o, "Mnr-Agreeing"), None);
         let v: Value = serde_json::from_slice(&o.body).unwrap();
         assert_eq!(v["hash"], "aa", "best-ranked answer");
+        assert!(env
+            .ctx
+            .pool
+            .status()
+            .upstreams
+            .iter()
+            .all(|u| u.verified == 0));
+        // Rank, not pool index, decides the fallback: make m2 the fastest.
+        let env = Env::new(vec![
+            node(1001, "aa", 1),
+            node(1001, "bb", 1),
+            node(1001, "cc", 1),
+        ])
+        .await;
+        let mut health: Vec<Health> = (0..3)
+            .map(|_| Health::healthy_for_test(1001, [7; 32]))
+            .collect();
+        health[0].rtt_ema_ms = Some(50.0);
+        health[1].rtt_ema_ms = Some(40.0);
+        health[2].rtt_ema_ms = Some(1.0);
+        env.ctx.pool.set_for_test(health, Some((1000, [7; 32])));
+        let o = env.call("/get_height").await;
+        let v: Value = serde_json::from_slice(&o.body).unwrap();
+        assert_eq!(v["hash"], "cc");
         // A lone upstream cannot form a majority either.
         let env = Env::new(vec![node(1001, "aa", 1)]).await;
         let o = env.call("get_block_count").await;
