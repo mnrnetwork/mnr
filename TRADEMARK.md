@@ -38,8 +38,11 @@ A fork must pick its own name. It may say it is "based on mnr".
 
 ## Names we hold
 
-The GitHub organisation `mnrnetwork`, the crates `mnr`, `mnr-core`,
-`mnr-relay`, `mnr-client` and `mnr-agent`, and the domain `mnr.network`.
+The domain `mnr.network`; the GitHub organisation `mnrnetwork`; on
+crates.io `mnr`, `mnr-core`, `mnr-relay`, `mnr-client` and `mnr-agent`; on
+PyPI `mnr`; on npm the package `mnr-network` and the organisations
+`@mnrnetwork` (where packages are published) and `@mnr-network` (held, unused).
+`mnr` on npm belongs to an unrelated package and is not ours.
 
 ## Enforcement
 
