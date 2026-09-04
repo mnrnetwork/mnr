@@ -1,0 +1,52 @@
+[package]
+name = "mnr-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+mnr-core = { path = ".." }
+
+[[bin]]
+name = "parse_block"
+path = "fuzz_targets/parse_block.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tx_hash"
+path = "fuzz_targets/tx_hash.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pruned_tx_hash"
+path = "fuzz_targets/pruned_tx_hash.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "headerchain_from_bytes"
+path = "fuzz_targets/headerchain_from_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_json"
+path = "fuzz_targets/wire_json.rs"
+test = false
+doc = false
+bench = false
+
+[dependencies.serde_json]
+version = "1"
+
+[workspace]

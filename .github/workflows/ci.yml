@@ -16,3 +16,33 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: cargo build --release --workspace
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/core/fuzz
+      - run: cargo install cargo-fuzz --locked
+      - name: seed corpora from fixtures
+        run: |
+          cd crates/core/fuzz
+          mkdir -p corpus/parse_block corpus/tx_hash corpus/wire_json
+          python3 - <<'PY'
+          import json, glob, binascii
+          for f in glob.glob('../fixtures/mainnet/block-*.json'):
+              r = json.load(open(f))['result']
+              h = r['block_header']['height']
+              open(f'corpus/parse_block/{h}.bin','wb').write(binascii.unhexlify(r['blob']))
+              open(f'corpus/wire_json/block-{h}.json','w').write(open(f).read())
+          for f in glob.glob('../fixtures/mainnet/txs-*-prune-false.json'):
+              for i, t in enumerate(json.load(open(f))['txs']):
+                  open(f'corpus/tx_hash/{t["tx_hash"][:8]}.bin','wb').write(binascii.unhexlify(t['as_hex']))
+          PY
+      - name: run each target for 60 s
+        run: |
+          cd crates/core/fuzz
+          for t in parse_block tx_hash pruned_tx_hash headerchain_from_bytes wire_json; do
+            cargo fuzz run "$t" -- -max_total_time=60 -max_len=65536
+          done
