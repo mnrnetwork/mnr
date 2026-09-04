@@ -42,7 +42,7 @@ The method policy table is code: `mnr-core::policy` is canonical, checked in tes
 
 - `mnrnetwork/mnr` (this repo, public) — Cargo workspace, spec, sim, deploy playbooks, engineering docs.
 - `mnrnetwork/mnr.network` (public, local `../mnr.network`) — the static site: front page, upstreams page, docs. Design source lives there in `design/`.
-- `mnrnetwork/internal` (private, local `../mnr-internal`) — business plans, profit model, operator contact and opt-out log, Ansible inventory and secrets, weekly gate numbers. Never copy its contents here.
+- `mnrnetwork/internal` (private, local `../internal`) — business plans, profit model, operator contact and opt-out log, Ansible inventory and secrets, weekly gate numbers. Never copy its contents here.
 
 ## Commands
 
@@ -53,6 +53,6 @@ The method policy table is code: `mnr-core::policy` is canonical, checked in tes
 
 ## Where decisions came from
 
-`docs/` holds the engineering history; the original aggregator doc, the business plans and the profit model live in the private `mnrnetwork/internal` repo (local: `../mnr-internal`). Three independent reviews shaped Stage 1; Stage 2 adds the operator network with mechanisms borrowed from THORChain (probation lane, payout splits, affiliate share, work-weighted votes). When a question is "why is it like this", the answer is in those documents; when a question is "what do I build next", the answer is `docs/stage0-mvp-plan.md` §7.
+`docs/` holds the engineering history; the original aggregator doc, the business plans and the profit model live in the private `mnrnetwork/internal` repo (local: `../internal`). Three independent reviews shaped Stage 1; Stage 2 adds the operator network with mechanisms borrowed from THORChain (probation lane, payout splits, affiliate share, work-weighted votes). When a question is "why is it like this", the answer is in those documents; when a question is "what do I build next", the answer is `docs/stage0-mvp-plan.md` §7.
 
 Open decisions the founders have not made yet are listed at the end of each plan; do not resolve them silently in code — flag them.
