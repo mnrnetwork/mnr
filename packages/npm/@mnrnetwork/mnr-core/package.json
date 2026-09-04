@@ -1,0 +1,13 @@
+{
+  "name": "@mnrnetwork/mnr-core",
+  "version": "0.0.1",
+  "description": "mnr — an RPC network for Monero. Wire types, hashing and verification rules for Monero daemon RPC, from mnr-core (planned WebAssembly build). Reserved; not yet implemented. https://mnr.network",
+  "license": "Apache-2.0",
+  "homepage": "https://mnr.network",
+  "repository": { "type": "git", "url": "https://github.com/mnrnetwork/mnr", "directory": "packages/npm/@mnrnetwork/mnr-core" },
+  "bugs": { "email": "dev@mnr.network" },
+  "main": "index.js",
+  "files": ["index.js", "README.md"],
+  "publishConfig": { "access": "public" },
+  "keywords": ["monero", "xmr", "rpc", "monerod", "remote-node", "verification"]
+}

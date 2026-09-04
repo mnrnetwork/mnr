@@ -1,0 +1,13 @@
+{
+  "name": "@mnrnetwork/mnr-client",
+  "version": "0.0.1",
+  "description": "mnr — an RPC network for Monero. Client library for wallets and backends: verifies what a relayer returns (planned). Reserved; not yet implemented. https://mnr.network",
+  "license": "Apache-2.0",
+  "homepage": "https://mnr.network",
+  "repository": { "type": "git", "url": "https://github.com/mnrnetwork/mnr", "directory": "packages/npm/@mnrnetwork/mnr-client" },
+  "bugs": { "email": "dev@mnr.network" },
+  "main": "index.js",
+  "files": ["index.js", "README.md"],
+  "publishConfig": { "access": "public" },
+  "keywords": ["monero", "xmr", "rpc", "monerod", "remote-node", "verification"]
+}

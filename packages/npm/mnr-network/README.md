@@ -1,5 +1,6 @@
 # mnr-network
 
-Reserved for the JavaScript client of [mnr — an RPC network for Monero](https://mnr.network).
-Nothing to use yet; the Rust crates `mnr-core` and `mnr-client` come first.
-Licence: Apache-2.0. Contact: dev@mnr.network.
+Name holder for [mnr — an RPC network for Monero](https://mnr.network).
+The real packages live under the `@mnrnetwork` scope, mirroring the Rust
+crates: `@mnrnetwork/mnr-core` and `@mnrnetwork/mnr-client`. Nothing to use
+here. Licence: Apache-2.0. Contact: dev@mnr.network.
