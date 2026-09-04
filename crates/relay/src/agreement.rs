@@ -100,6 +100,9 @@ pub async fn agreement(
     }
     let all_agree = trees.iter().all(|t| t == &trees[0]);
     if all_agree {
+        for (id, _) in &answers {
+            ctx.pool.record_verified(*id);
+        }
         let o = annotated(first, Verify::Agreement, Some((need, need)));
         cache_if_distribution(&ctx, cache_key, &first.1).await;
         return o;
@@ -130,8 +133,13 @@ pub async fn agreement(
     }
     let asked = need + 1;
     let agreeing = matching.len() + 1;
+    ctx.pool.record_verified(third.0);
     for (i, (id, _)) in answers.iter().enumerate() {
-        if !matching.contains(&i) {
+        if matching.contains(&i) {
+            ctx.pool.record_verified(*id);
+            continue;
+        }
+        {
             ctx.pool.record_fault(
                 *id,
                 policy.method,

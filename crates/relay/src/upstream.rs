@@ -107,6 +107,11 @@ pub struct Upstream {
     timeout: Duration,
     /// Requests we sent, for the public request-rate figure (rule 1).
     pub requests: AtomicU64,
+    /// Answers from this upstream that passed verification (plan §4: the
+    /// public numbers on the upstreams page).
+    pub verified: AtomicU64,
+    /// Answers that failed verification, ever (the fault log is bounded).
+    pub faults: AtomicU64,
     /// Rule 3: light calls per second we allow ourselves against this node.
     light: Mutex<LightBucket>,
     /// Rule 3: concurrent `get_blocks.bin` streams against this node.
@@ -196,6 +201,8 @@ pub struct UpstreamStatus {
     pub rtt_ms: Option<u64>,
     pub synchronized: bool,
     pub requests: u64,
+    pub verified: u64,
+    pub faults: u64,
     pub caps: crate::config::Caps,
     pub last_error: Option<String>,
 }
@@ -241,6 +248,8 @@ impl Pool {
                     client,
                     timeout,
                     requests: AtomicU64::new(0),
+                    verified: AtomicU64::new(0),
+                    faults: AtomicU64::new(0),
                 }
             })
             .collect::<Vec<_>>();
@@ -403,7 +412,13 @@ impl Pool {
         self.record_fault_at(id, method, detail, Instant::now());
     }
 
+    /// Count an answer from `id` that passed verification.
+    pub fn record_verified(&self, id: usize) {
+        self.upstreams[id].verified.fetch_add(1, Ordering::Relaxed);
+    }
+
     fn record_fault_at(&self, id: usize, method: &str, detail: String, now: Instant) {
+        self.upstreams[id].faults.fetch_add(1, Ordering::Relaxed);
         let ejected = {
             let mut health = self.health.write();
             let h = &mut health[id];
@@ -458,6 +473,8 @@ impl Pool {
                     rtt_ms: h.rtt_ema_ms.map(|r| r.round() as u64),
                     synchronized: h.synchronized,
                     requests: u.requests.load(Ordering::Relaxed),
+                    verified: u.verified.load(Ordering::Relaxed),
+                    faults: u.faults.load(Ordering::Relaxed),
                     caps: u.cfg.caps,
                     last_error: h.last_error.clone(),
                 }

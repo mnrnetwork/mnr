@@ -61,6 +61,8 @@ pub struct Config {
     pub chain: ChainConfig,
     #[serde(default)]
     pub cache: CacheConfig,
+    #[serde(default)]
+    pub metrics: MetricsConfig,
     /// Hosts that asked to be removed (rule 5). Any upstream whose host is
     /// listed here is refused at load.
     #[serde(default)]
@@ -88,6 +90,16 @@ pub struct ChainConfig {
     /// monerod refuses more than 1000 on a restricted node.
     #[serde(default = "default_chain_batch")]
     pub batch: u64,
+}
+
+/// Prometheus exposition (`docs/stage0-mvp-plan.md` §6). Aggregate series
+/// only; served on its own listener so it is never reachable through the
+/// public address.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsConfig {
+    /// Address for `/metrics`. Unset disables the exporter.
+    pub listen: Option<SocketAddr>,
 }
 
 /// In-memory response cache (`docs/stage0-mvp-plan.md` §5).
@@ -278,6 +290,9 @@ impl Config {
         }
         if self.chain.batch == 0 || self.chain.batch > 1000 {
             return invalid("chain.batch must be between 1 and 1000".into());
+        }
+        if self.metrics.listen == Some(self.listen) {
+            return invalid("metrics.listen must differ from the public listen address".into());
         }
         if self.upstreams.len() < self.probe.min_agree {
             return invalid(format!(

@@ -388,6 +388,9 @@ async fn transactions(ctx: Ctx, req: Request, timeout: Duration) -> Outcome {
         Ok(x) => x,
         Err(o) => return o,
     };
+    if checks.iter().any(|c| matches!(c, TxCheck::Verified { .. })) {
+        ctx.pool.record_verified(id);
+    }
     let answer: Value = serde_json::from_slice(&f.body).unwrap_or(Value::Null);
 
     // Cache every verified, confirmed entry below the safety line.

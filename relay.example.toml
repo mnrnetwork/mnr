@@ -36,6 +36,11 @@ batch = 1000                          # headers per request; monerod's restricte
 [cache]
 max_bytes = 1073741824               # 1 GiB for the immutable tier
 
+# Prometheus /metrics: aggregate series only (never a token, path or client
+# address). Bind it to a private interface; leave unset to disable.
+[metrics]
+listen = "127.0.0.1:9187"
+
 # Operators who asked to be removed (rule 5). An upstream on this list is
 # refused at load, not merely deprioritised. The list is public.
 opt_out = []

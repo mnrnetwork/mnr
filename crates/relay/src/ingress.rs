@@ -28,6 +28,7 @@ use crate::cache::Cache;
 use crate::chain::ChainStore;
 use crate::dispatch::{self, Outcome};
 use crate::limits::{Limiter, Verdict, LIGHT_WU};
+use crate::metrics::Metrics;
 use crate::upstream::{Pool, PoolStatus};
 
 /// Shared state for every handler.
@@ -35,6 +36,7 @@ pub struct App {
     pub pool: Arc<Pool>,
     pub chain: Arc<ChainStore>,
     pub cache: Arc<Cache>,
+    pub metrics: Arc<Metrics>,
     pub store: Arc<dyn TokenStore>,
     pub limiter: Arc<dyn Limiter>,
 }
@@ -73,19 +75,24 @@ async fn rpc(
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
     let Some(token) = auth::extract_token(path_token, authz) else {
+        app.metrics.refused("unauthorized");
         return unauthorized();
     };
     let principal = match app.store.authenticate(&auth::token_hash(&token)) {
         Ok(p) => p,
-        Err(AuthError::Unknown) => return unauthorized(),
+        Err(AuthError::Unknown) => {
+            app.metrics.refused("unauthorized");
+            return unauthorized();
+        }
         Err(AuthError::Expired) => {
+            app.metrics.refused("expired");
             return json_rpc_error(
                 StatusCode::FORBIDDEN,
                 Value::Null,
                 MNR_SUBSCRIPTION_EXPIRED,
                 "subscription expired",
                 &[],
-            )
+            );
         }
     };
     // Token is out of scope from here on; only the principal travels.
@@ -101,13 +108,14 @@ async fn rpc(
             let req: JsonRpcRequest = match serde_json::from_slice(&body) {
                 Ok(r) => r,
                 Err(_) => {
+                    app.metrics.refused("bad_request");
                     return json_rpc_error(
                         StatusCode::BAD_REQUEST,
                         Value::Null,
                         mnr_core::wire::PARSE_ERROR,
                         "parse error",
                         &[],
-                    )
+                    );
                 }
             };
             (
@@ -121,8 +129,12 @@ async fn rpc(
     };
 
     match policy.class {
-        Class::Deny => return denied(is_jsonrpc, id, &requested),
+        Class::Deny => {
+            app.metrics.refused("denied");
+            return denied(is_jsonrpc, id, &requested);
+        }
         Class::NotDaemon => {
+            app.metrics.refused("not_daemon");
             let hint = policy.note.split(';').next().map(str::trim);
             return json_response(
                 StatusCode::OK,
@@ -136,22 +148,24 @@ async fn rpc(
     match app.limiter.admit(&principal, LIGHT_WU) {
         Verdict::Allow => {}
         Verdict::RateLimited { retry_after_secs } => {
+            app.metrics.refused("rate_limited");
             return json_rpc_error(
                 StatusCode::TOO_MANY_REQUESTS,
                 id,
                 MNR_RATE_LIMITED,
                 "rate limited",
                 &[("Retry-After", retry_after_secs.to_string())],
-            )
+            );
         }
         Verdict::QuotaExceeded => {
+            app.metrics.refused("quota");
             return json_rpc_error(
                 StatusCode::TOO_MANY_REQUESTS,
                 id,
                 MNR_RATE_LIMITED,
                 "work-unit allowance exhausted",
                 &[("Retry-After", "3600".into())],
-            )
+            );
         }
     }
 
@@ -162,13 +176,14 @@ async fn rpc(
         match app.limiter.take_stream(&principal) {
             Some(p) => Some(p),
             None => {
+                app.metrics.refused("streams");
                 return json_rpc_error(
                     StatusCode::TOO_MANY_REQUESTS,
                     id,
                     MNR_RATE_LIMITED,
                     "too many concurrent streams",
                     &[("Retry-After", "1".into())],
-                )
+                );
             }
         }
     } else {
@@ -198,6 +213,21 @@ async fn rpc(
     if outcome.extra_wu > 0 {
         app.limiter.charge(&principal, outcome.extra_wu);
     }
+    app.metrics
+        .charged(principal.tier, LIGHT_WU + outcome.extra_wu);
+    let label = |name: &str| -> String {
+        outcome
+            .headers
+            .iter()
+            .find(|(k, _)| *k == name)
+            .map_or_else(|| "-".to_owned(), |(_, v)| v.clone())
+    };
+    app.metrics.request(
+        policy.class.label(),
+        &label("Mnr-Verify"),
+        &label("Mnr-Cache"),
+        outcome.status,
+    );
     respond(outcome, &principal)
 }
 

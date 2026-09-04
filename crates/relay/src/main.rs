@@ -21,6 +21,7 @@ mod consensus;
 mod dispatch;
 mod ingress;
 mod limits;
+mod metrics;
 mod store;
 mod upstream;
 mod verify;
@@ -36,6 +37,7 @@ use chain::ChainStore;
 use config::Config;
 use ingress::App;
 use limits::{Limiter, MemoryLimiter};
+use metrics::Metrics;
 use store::SqliteStore;
 use upstream::Pool;
 
@@ -119,10 +121,25 @@ async fn main() {
     tokio::spawn(Arc::clone(&pool).run_prober());
     tokio::spawn(Arc::clone(&chain).run_sync(Arc::clone(&pool), cfg.chain.batch));
 
+    let cache = Arc::new(Cache::new(cfg.cache.max_bytes));
+    let metrics = Arc::new(Metrics::new());
+    if let Some(listen) = cfg.metrics.listen {
+        tokio::spawn(metrics::serve(
+            listen,
+            Arc::new(metrics::Exporter {
+                metrics: Arc::clone(&metrics),
+                pool: Arc::clone(&pool),
+                chain: Arc::clone(&chain),
+                cache: Arc::clone(&cache),
+            }),
+        ));
+    }
+
     let app = Arc::new(App {
         pool,
         chain,
-        cache: Arc::new(Cache::new(cfg.cache.max_bytes)),
+        cache,
+        metrics,
         store,
         limiter,
     });
