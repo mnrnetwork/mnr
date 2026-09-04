@@ -123,6 +123,8 @@ impl Metrics {
             ("mnr_upstream_rtt_ms", "gauge"),
             ("mnr_upstream_healthy", "gauge"),
             ("mnr_upstream_on_tip", "gauge"),
+            ("mnr_upstream_ejected", "gauge"),
+            ("mnr_upstream_opted_out", "gauge"),
         ] {
             let _ = writeln!(out, "# TYPE {name} {help}");
             for u in &status.upstreams {
@@ -133,7 +135,9 @@ impl Metrics {
                     "mnr_upstream_faults_total" => u.faults,
                     "mnr_upstream_rtt_ms" => u.rtt_ms.unwrap_or(0),
                     "mnr_upstream_healthy" => u64::from(u.ok && !u.ejected),
-                    _ => u64::from(u.on_tip),
+                    "mnr_upstream_on_tip" => u64::from(u.on_tip),
+                    "mnr_upstream_ejected" => u64::from(u.ejected),
+                    _ => u64::from(u.opted_out),
                 };
                 line(&mut out, name, &labels, value);
             }
@@ -267,6 +271,8 @@ mod tests {
         has("mnr_upstream_faults_total{upstream=\"own\"} 1");
         has("mnr_upstream_healthy{upstream=\"own\"} 1");
         has("mnr_upstream_on_tip{upstream=\"own\"} 1");
+        has("mnr_upstream_ejected{upstream=\"own\"} 0");
+        has("mnr_upstream_opted_out{upstream=\"own\"} 0");
         has("mnr_quorum_height 100");
         has("mnr_degraded 0");
         has("mnr_chain_height 0");

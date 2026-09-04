@@ -81,8 +81,14 @@ pub struct Health {
     /// rotation for the life of this process; the operator moves it to the
     /// config's `opt_out` list.
     pub opted_out: bool,
+    /// What the node's `get_info.restricted` said last (plan §3: the
+    /// restricted-RPC check). Information for the upstreams page; the
+    /// allow-list already guarantees we call nothing else (rule 7).
+    pub restricted: Option<bool>,
     faults: Vec<Instant>,
     ejected_until: Option<Instant>,
+    /// Ejected at the last probe round, so the lapse is logged once.
+    was_ejected: bool,
 }
 
 impl Health {
@@ -119,6 +125,9 @@ pub struct FaultEvent {
     pub method: String,
     pub detail: String,
     pub ejected: bool,
+    /// When the ejection this fault caused lapses (unix seconds).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ejected_until: Option<u64>,
 }
 
 pub struct Upstream {
@@ -232,6 +241,11 @@ pub struct UpstreamStatus {
     pub ok: bool,
     pub on_tip: bool,
     pub ejected: bool,
+    /// Unix seconds at which the current ejection lapses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ejected_until: Option<u64>,
+    /// `get_info.restricted` at the last probe; `null` before the first.
+    pub restricted: Option<bool>,
     pub height: Option<u64>,
     pub rtt_ms: Option<u64>,
     pub synchronized: bool,
@@ -333,6 +347,7 @@ impl Pool {
                         h.block_count = p.block_count;
                         h.top_hash = Some(p.top_hash);
                         h.synchronized = p.synchronized;
+                        h.restricted = Some(p.restricted);
                         h.rtt_ema_ms = Some(match h.rtt_ema_ms {
                             Some(prev) => prev + RTT_ALPHA * (p.rtt_ms - prev),
                             None => p.rtt_ms,
@@ -353,6 +368,7 @@ impl Pool {
                 }
             }
         }
+        self.note_ejection_lapses(now);
         let q = quorum_tip(&reports, self.min_agree);
         match &q {
             Some(q) => {
@@ -365,6 +381,18 @@ impl Pool {
 
     pub fn upstream(&self, id: usize) -> &Upstream {
         &self.upstreams[id]
+    }
+
+    /// Log, once, every ejection that has lapsed since the last round.
+    fn note_ejection_lapses(&self, now: Instant) {
+        let mut health = self.health.write();
+        for (u, h) in self.upstreams.iter().zip(health.iter_mut()) {
+            let ejected = h.ejected(now);
+            if h.was_ejected && !ejected {
+                tracing::info!(upstream = %u.cfg.name, "ejection lapsed: back in rotation");
+            }
+            h.was_ejected = ejected;
+        }
     }
 
     /// Install synthetic health and quorum so dispatch tests can run
@@ -468,11 +496,13 @@ impl Pool {
             h.faults.push(now);
             if h.faults.len() >= FAULT_LIMIT && !h.ejected(now) {
                 h.ejected_until = Some(now + EJECT_FOR);
+                h.was_ejected = true;
                 true
             } else {
                 false
             }
         };
+        let ejected_until = ejected.then(|| unix_at(now + EJECT_FOR, now));
         let name = &self.upstreams[id].cfg.name;
         tracing::warn!(upstream = %name, method, %detail, ejected, "verification fault");
         let mut log = self.faults.write();
@@ -485,6 +515,7 @@ impl Pool {
             method: method.to_owned(),
             detail,
             ejected,
+            ejected_until,
         });
     }
 
@@ -511,6 +542,11 @@ impl Pool {
                     ok: h.ok,
                     on_tip: Self::on_tip(h, q.as_ref()),
                     ejected: h.ejected(now),
+                    ejected_until: h
+                        .ejected_until
+                        .filter(|t| *t > now)
+                        .map(|t| unix_at(t, now)),
+                    restricted: h.restricted,
                     height: (h.block_count > 0).then(|| h.block_count - 1),
                     rtt_ms: h.rtt_ema_ms.map(|r| r.round() as u64),
                     synchronized: h.synchronized,
@@ -587,6 +623,7 @@ struct Probe {
     block_count: u64,
     top_hash: Hash,
     synchronized: bool,
+    restricted: bool,
     rtt_ms: f64,
 }
 
@@ -769,6 +806,7 @@ impl Upstream {
             block_count: info.height,
             top_hash: tip.hash,
             synchronized: info.synchronized,
+            restricted: info.restricted,
             rtt_ms,
         })
     }
@@ -816,6 +854,11 @@ fn trim_error(e: &reqwest::Error) -> String {
 
 fn hex(h: &Hash) -> String {
     h.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A monotonic instant expressed as unix seconds, relative to `now`.
+fn unix_at(t: Instant, now: Instant) -> u64 {
+    unix_now() + t.saturating_duration_since(now).as_secs()
 }
 
 fn unix_now() -> u64 {
@@ -975,6 +1018,68 @@ transport = "onion"
         assert_eq!(p.ranked(Work::Light), vec![1, 3]);
         let s = p.status();
         assert!(!s.upstreams[0].on_tip && !s.upstreams[2].on_tip);
+    }
+
+    #[test]
+    fn ejection_lapse_is_visible_and_logged_once() {
+        let p = pool();
+        set(
+            &p,
+            [
+                healthy(101, 30.0),
+                healthy(101, 15.0),
+                healthy(101, 20.0),
+                healthy(101, 1.0),
+            ],
+            Some(100),
+        );
+        let t0 = Instant::now();
+        for _ in 0..3 {
+            p.record_fault_at(2, "get_block", "x".into(), t0);
+        }
+        let s = p.status();
+        assert!(s.upstreams[2].ejected);
+        let until = s.upstreams[2].ejected_until.unwrap();
+        assert!(until >= unix_now() + EJECT_FOR.as_secs() - 2);
+        // Two wall-clock reads: allow a second of rounding between them.
+        let logged = s.faults[2].ejected_until.unwrap();
+        assert!(logged.abs_diff(until) <= 1, "{logged} vs {until}");
+        assert!(s.faults[1].ejected_until.is_none());
+        // A day later the ejection has lapsed: back in rotation, the
+        // status feed no longer shows an end time, and the transition is
+        // noted once (the flag flips).
+        // (`status()` reads the real clock, so only the flag is checked.)
+        let later = t0 + EJECT_FOR + Duration::from_secs(1);
+        assert!(p.health.read()[2].was_ejected);
+        p.note_ejection_lapses(later);
+        assert!(!p.health.read()[2].was_ejected);
+        p.note_ejection_lapses(later);
+        assert!(
+            !p.health.read()[2].was_ejected,
+            "a second round does not re-log"
+        );
+    }
+
+    #[test]
+    fn restricted_flag_is_reported_from_the_probe() {
+        let p = pool();
+        let mut open = healthy(101, 1.0);
+        open.restricted = Some(false);
+        set(
+            &p,
+            [
+                healthy(101, 30.0),
+                open,
+                healthy(101, 20.0),
+                healthy(101, 1.0),
+            ],
+            Some(100),
+        );
+        let s = p.status();
+        assert_eq!(s.upstreams[0].restricted, None, "not probed yet");
+        assert_eq!(s.upstreams[1].restricted, Some(false));
+        // Information only: an unrestricted node still serves.
+        assert!(p.ranked(Work::Light).contains(&1));
     }
 
     #[test]
