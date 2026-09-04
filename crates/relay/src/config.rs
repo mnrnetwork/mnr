@@ -59,6 +59,8 @@ pub struct Config {
     pub auth: AuthConfig,
     #[serde(default)]
     pub chain: ChainConfig,
+    #[serde(default)]
+    pub cache: CacheConfig,
     /// Hosts that asked to be removed (rule 5). Any upstream whose host is
     /// listed here is refused at load.
     #[serde(default)]
@@ -86,6 +88,27 @@ pub struct ChainConfig {
     /// monerod refuses more than 1000 on a restricted node.
     #[serde(default = "default_chain_batch")]
     pub batch: u64,
+}
+
+/// In-memory response cache (`docs/stage0-mvp-plan.md` §5).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CacheConfig {
+    /// Ceiling for the immutable tier (blocks, headers, txs) in bytes.
+    #[serde(default = "default_cache_bytes")]
+    pub max_bytes: u64,
+}
+
+fn default_cache_bytes() -> u64 {
+    1 << 30
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            max_bytes: default_cache_bytes(),
+        }
+    }
 }
 
 fn default_chain_batch() -> u64 {

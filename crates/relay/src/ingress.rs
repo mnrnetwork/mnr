@@ -24,6 +24,7 @@ use mnr_core::wire::{JsonRpcRequest, JsonRpcResponse, MNR_RATE_LIMITED, MNR_SUBS
 use serde_json::Value;
 
 use crate::auth::{self, AuthError, Principal, TokenStore};
+use crate::cache::Cache;
 use crate::chain::ChainStore;
 use crate::dispatch::{self, Outcome};
 use crate::limits::{Limiter, Verdict, LIGHT_WU};
@@ -35,6 +36,8 @@ pub struct App {
     // Read by verification (next commit).
     #[allow(dead_code)]
     pub chain: Arc<ChainStore>,
+    #[allow(dead_code)]
+    pub cache: Arc<Cache>,
     pub store: Arc<dyn TokenStore>,
     pub limiter: Arc<dyn Limiter>,
 }

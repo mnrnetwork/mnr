@@ -13,6 +13,9 @@
 #![forbid(unsafe_code)]
 
 mod auth;
+// Wired into dispatch with verification (next commit).
+#[allow(dead_code)]
+mod cache;
 mod chain;
 mod config;
 mod dispatch;
@@ -27,6 +30,7 @@ use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
 use auth::{MemoryTokenStore, Tier, TokenStore};
+use cache::Cache;
 use chain::ChainStore;
 use config::Config;
 use ingress::App;
@@ -117,6 +121,7 @@ async fn main() {
     let app = Arc::new(App {
         pool,
         chain,
+        cache: Arc::new(Cache::new(cfg.cache.max_bytes)),
         store,
         limiter,
     });

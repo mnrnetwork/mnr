@@ -30,6 +30,12 @@ database = "relay.db"
 path = "headers.mnrh"
 batch = 1000                          # headers per request; monerod's restricted limit
 
+# In-memory cache (plan §5). Immutable data (blocks, headers, txs) is cached
+# only below the tip safety line and only after verification; consensus
+# state is served stale-while-revalidate (1/5/15 s) from a small tier.
+[cache]
+max_bytes = 1073741824               # 1 GiB for the immutable tier
+
 # Operators who asked to be removed (rule 5). An upstream on this list is
 # refused at load, not merely deprioritised. The list is public.
 opt_out = []
