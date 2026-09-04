@@ -22,6 +22,14 @@ min_agree = 3                        # upstreams that must agree on a tip hash
 [auth]
 database = "relay.db"
 
+# The relay's own header chain (plan §4): built once from the upstreams by
+# majority (about an hour on mainnet, ~280 MB), extended every probe round,
+# and the source of truth for by-height verification. Without a path it is
+# kept in memory and rebuilt on every start.
+[chain]
+path = "headers.mnrh"
+batch = 1000                          # headers per request; monerod's restricted limit
+
 # Operators who asked to be removed (rule 5). An upstream on this list is
 # refused at load, not merely deprioritised. The list is public.
 opt_out = []

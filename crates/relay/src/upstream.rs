@@ -332,6 +332,16 @@ impl Pool {
         self.quorum.read().clone()
     }
 
+    /// Upstreams that must agree on a tip hash (plan §3: 3).
+    pub fn min_agree(&self) -> usize {
+        self.min_agree
+    }
+
+    /// Seconds between probe rounds.
+    pub fn interval(&self) -> Duration {
+        self.interval
+    }
+
     pub fn degraded(&self) -> bool {
         self.quorum.read().is_none()
     }

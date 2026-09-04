@@ -18,6 +18,7 @@
 use std::fmt;
 
 use crate::hash::{Hash, ParsedBlock};
+use crate::verify::ReportedHeader;
 
 /// File magic: `mnrh`.
 const MAGIC: [u8; 4] = *b"mnrh";
@@ -51,6 +52,19 @@ impl From<&ParsedBlock> for Entry {
             hash: b.hash,
             prev_hash: b.prev_hash,
             timestamp: b.timestamp,
+        }
+    }
+}
+
+/// A header a node reported (`get_block_headers_range`) becomes a record once
+/// enough nodes agree on it; the agreement is the caller's job.
+impl From<&ReportedHeader> for Entry {
+    fn from(h: &ReportedHeader) -> Self {
+        Self {
+            height: h.height,
+            hash: h.hash,
+            prev_hash: h.prev_hash,
+            timestamp: h.timestamp,
         }
     }
 }

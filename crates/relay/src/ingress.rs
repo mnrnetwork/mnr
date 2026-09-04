@@ -24,6 +24,7 @@ use mnr_core::wire::{JsonRpcRequest, JsonRpcResponse, MNR_RATE_LIMITED, MNR_SUBS
 use serde_json::Value;
 
 use crate::auth::{self, AuthError, Principal, TokenStore};
+use crate::chain::ChainStore;
 use crate::dispatch::{self, Outcome};
 use crate::limits::{Limiter, Verdict, LIGHT_WU};
 use crate::upstream::{Pool, PoolStatus};
@@ -31,6 +32,9 @@ use crate::upstream::{Pool, PoolStatus};
 /// Shared state for every handler.
 pub struct App {
     pub pool: Arc<Pool>,
+    // Read by verification (next commit).
+    #[allow(dead_code)]
+    pub chain: Arc<ChainStore>,
     pub store: Arc<dyn TokenStore>,
     pub limiter: Arc<dyn Limiter>,
 }

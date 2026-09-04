@@ -57,6 +57,8 @@ pub struct Config {
     pub probe: ProbeConfig,
     #[serde(default)]
     pub auth: AuthConfig,
+    #[serde(default)]
+    pub chain: ChainConfig,
     /// Hosts that asked to be removed (rule 5). Any upstream whose host is
     /// listed here is refused at load.
     #[serde(default)]
@@ -70,6 +72,33 @@ pub struct AuthConfig {
     /// Path to the SQLite token/usage database. When set, tokens are managed
     /// with `mnr-relay token ...` and `--dev-token` is refused.
     pub database: Option<PathBuf>,
+}
+
+/// The relay's own header chain (`docs/stage0-mvp-plan.md` §4): built once
+/// by majority from the upstreams, extended at the tip every probe round.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChainConfig {
+    /// Where the chain is persisted (`mnr-core` byte format, ~280 MB on
+    /// mainnet). Unset keeps it in memory only: every restart rebuilds.
+    pub path: Option<PathBuf>,
+    /// Headers fetched per `get_block_headers_range` call while building.
+    /// monerod refuses more than 1000 on a restricted node.
+    #[serde(default = "default_chain_batch")]
+    pub batch: u64,
+}
+
+fn default_chain_batch() -> u64 {
+    1000
+}
+
+impl Default for ChainConfig {
+    fn default() -> Self {
+        Self {
+            path: None,
+            batch: default_chain_batch(),
+        }
+    }
 }
 
 fn default_listen() -> SocketAddr {
@@ -223,6 +252,9 @@ impl Config {
         }
         if self.probe.min_agree == 0 {
             return invalid("probe.min_agree must be at least 1".into());
+        }
+        if self.chain.batch == 0 || self.chain.batch > 1000 {
+            return invalid("chain.batch must be between 1 and 1000".into());
         }
         if self.upstreams.len() < self.probe.min_agree {
             return invalid(format!(

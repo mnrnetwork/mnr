@@ -2,8 +2,9 @@
 //!
 //! Week 2: config, upstream pool and prober, ingress with token auth and
 //! limits, policy dispatch, passthrough and broadcast, and a persistent
-//! token store with a work-unit limiter (see [`store`]). Verification in the
-//! request path, the cache and metrics follow in week 3.
+//! token store with a work-unit limiter (see [`store`]). Week 3: the header
+//! chain (see [`chain`]); verification in the request path, the cache and
+//! metrics follow.
 //!
 //! With `[auth] database` set, tokens are managed through the `token`
 //! subcommand and requests are authenticated against SQLite; without it,
@@ -12,14 +13,12 @@
 #![forbid(unsafe_code)]
 
 mod auth;
+mod chain;
 mod config;
 mod dispatch;
 mod ingress;
 mod limits;
 mod store;
-// Fault recording and the quorum accessor are consumed by verification
-// (week 3).
-#[allow(dead_code)]
 mod upstream;
 
 use std::path::PathBuf;
@@ -28,6 +27,7 @@ use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
 use auth::{MemoryTokenStore, Tier, TokenStore};
+use chain::ChainStore;
 use config::Config;
 use ingress::App;
 use limits::{Limiter, MemoryLimiter};
@@ -97,12 +97,26 @@ async fn main() {
         }
     };
 
+    let chain = Arc::new(
+        ChainStore::open(cfg.chain.path.as_deref()).unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }),
+    );
+    if cfg.chain.path.is_none() {
+        tracing::warn!(
+            "no [chain] path: the header chain is rebuilt from the upstreams on every start"
+        );
+    }
+
     // First probe round before serving so the status feed is never empty.
     pool.probe_all().await;
     tokio::spawn(Arc::clone(&pool).run_prober());
+    tokio::spawn(Arc::clone(&chain).run_sync(Arc::clone(&pool), cfg.chain.batch));
 
     let app = Arc::new(App {
         pool,
+        chain,
         store,
         limiter,
     });
