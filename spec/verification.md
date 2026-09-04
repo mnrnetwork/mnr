@@ -39,9 +39,15 @@ fabricates a PoW-valid alternate chain is a 51% attacker, outside this model.
 A request the relay cannot interpret (a malformed `hash` param, for instance)
 is passed through with the daemon's own answer as `none`; the fault log counts
 wrong *answers* only. A mismatch anywhere is a **fault**: the answer is never
-returned, the fault is recorded against the upstream (three in an hour eject it for 24 hours, every
-one is public), and the next ranked upstream is asked, up to three. If every
-attempt faults the client receives HTTP 502 with `Mnr-Verify: failed`.
+returned, the fault is recorded against the upstream, and the next ranked
+upstream is asked, up to three. If every attempt faults the client receives
+HTTP 502 with `Mnr-Verify: failed`.
+
+**Ejection.** Three faults within an hour eject an upstream for 24 hours. The
+fault log entry that caused it and the upstreams feed both carry
+`ejected_until`; when the ejection lapses the upstream re-enters the ranking on
+the next probe round and the lapse is logged once. Faults, ejections and the
+`verified` count per upstream are public.
 
 Verified answers whose height is at or below `quorum_tip − 10` are cached under
 the current chain epoch; the alias forms (`getblock`, …) share the entry.
@@ -105,6 +111,26 @@ the relay cannot parse is served as `none`, never as agreement.
 Only `get_output_distribution` with `to_height` at or below the safety line is
 cached, and only when agreed. The rest of the family needs the output
 distribution to map indices to heights before it could be cached safely.
+
+## Streams
+
+The `get_blocks.bin` family is not verified in Stage 0 (`none`). A stream is
+sent through as it arrives, never buffered: paced to the upstream's published
+bandwidth cap, ended after 15 s without a chunk from the upstream (a slow
+client does not count), and bounded at 1 GiB per answer. The client pays
+20 work units per MB received, settled when the stream ends or the client
+disconnects.
+
+## Opt-out (rule 5)
+
+Every upstream host is read at `https://<host>/.well-known/mnr-optout`
+(`http://` for plain-HTTP and onion upstreams) at start and once a day, with
+the relay's identifying `User-Agent` and no light-call token. Any HTTP 200 means
+the operator has opted out: the host leaves rotation at once, the event is in
+the public feed, and the relay's operator is told to add the host to the
+config's `opt_out` list, which refuses it at load. Anything else (404, no
+answer) means "no answer today" and is re-read the next day; removing the file
+re-admits the host on the next read.
 
 ## Not verified
 

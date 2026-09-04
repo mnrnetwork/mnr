@@ -42,8 +42,16 @@ max_bytes = 1073741824               # 1 GiB for the immutable tier
 listen = "127.0.0.1:9187"
 
 # Operators who asked to be removed (rule 5). An upstream on this list is
-# refused at load, not merely deprioritised. The list is public.
+# refused at load, not merely deprioritised. The list is public. The relay
+# also reads https://<host>/.well-known/mnr-optout on every upstream host at
+# start and daily: an HTTP 200 there takes the host out of rotation at once
+# and logs an error asking for it to be added here.
 opt_out = []
+
+# Not configurable, stated for the record (rule 3): a read queues up to
+# 250 ms for a light-call token on the best-ranked public upstream (1 s on
+# the owned node) before trying the next one; streams are paced to `mbps`
+# and cut after 15 s of upstream silence or 1 GiB.
 
 [[upstreams]]
 name = "own-1"
