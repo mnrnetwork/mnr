@@ -34,6 +34,7 @@ use tokio::time::Instant;
 
 use crate::auth::Principal;
 use crate::limits::{stream_wu, Limiter, StreamPermit, LIGHT_WU};
+use crate::metrics::Metrics;
 use crate::upstream::ForwardError;
 
 /// Longest silence from the upstream before a stream is cut (policy note:
@@ -210,6 +211,7 @@ pub struct Accounted {
     inner: BoxStream<'static, Result<Bytes, io::Error>>,
     bytes: u64,
     limiter: Arc<dyn Limiter>,
+    metrics: Arc<Metrics>,
     principal: Principal,
     _permit: Option<StreamPermit>,
 }
@@ -218,6 +220,7 @@ impl Accounted {
     pub fn new(
         inner: BoxStream<'static, Result<Bytes, io::Error>>,
         limiter: Arc<dyn Limiter>,
+        metrics: Arc<Metrics>,
         principal: Principal,
         permit: Option<StreamPermit>,
     ) -> Self {
@@ -225,6 +228,7 @@ impl Accounted {
             inner,
             bytes: 0,
             limiter,
+            metrics,
             principal,
             _permit: permit,
         }
@@ -245,9 +249,14 @@ impl Stream for Accounted {
 
 impl Drop for Accounted {
     fn drop(&mut self) {
+        // The quota (limiter) and the aggregate gauge both see the stream's
+        // work units; the light unit was charged at admission. `charge` is
+        // an in-memory delta in both limiters (the SQLite one flushes from
+        // a task), so nothing blocks on this drop path.
         let wu = stream_wu(self.bytes).saturating_sub(LIGHT_WU);
         if wu > 0 {
             self.limiter.charge(&self.principal, wu);
+            self.metrics.charged(self.principal.tier, wu);
         }
     }
 }
@@ -366,8 +375,15 @@ mod tests {
             handle: "cafebabe".into(),
         };
         let permit = limiter.take_stream(&p);
+        let metrics = Arc::new(Metrics::new());
         let inner = stream::iter((0..5).map(|_| Ok(Bytes::from(vec![0u8; 500_000])))).boxed();
-        let mut s = Accounted::new(inner, Arc::clone(&limiter), p.clone(), permit);
+        let mut s = Accounted::new(
+            inner,
+            Arc::clone(&limiter),
+            Arc::clone(&metrics),
+            p.clone(),
+            permit,
+        );
         // The client reads 1.5 MB and disconnects.
         for _ in 0..3 {
             s.next().await.unwrap().unwrap();
@@ -375,6 +391,27 @@ mod tests {
         assert_eq!(limiter.used(&p), 0, "nothing charged before drop");
         drop(s);
         assert_eq!(limiter.used(&p), stream_wu(1_500_000) - LIGHT_WU);
+        // The aggregate gauge saw the same work units, under the tier.
+        let text = metrics
+            .render(
+                &crate::upstream::Pool::from_config(
+                    &crate::config::Config::parse(
+                        "[probe]\nmin_agree = 1\n[[upstreams]]\nname = \"o\"\nurl = \"http://10.0.0.2:18081\"\nkind = \"owned\"\ntransport = \"http\"\n",
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+                &crate::chain::ChainStore::open(None).unwrap(),
+                &crate::cache::Cache::new(1),
+            )
+            .await;
+        assert!(
+            text.contains(&format!(
+                "mnr_wu_charged_total{{tier=\"pro\"}} {}",
+                stream_wu(1_500_000) - LIGHT_WU
+            )),
+            "{text}"
+        );
         // The permit came back with the drop: all three pro slots are free.
         let _a = limiter.take_stream(&p).unwrap();
         let _b = limiter.take_stream(&p).unwrap();

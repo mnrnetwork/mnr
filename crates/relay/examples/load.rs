@@ -455,12 +455,14 @@ async fn main() {
         elapsed.as_secs_f64(),
         total as f64 / elapsed.as_secs_f64()
     );
+    let refused = total - ok;
     eprintln!(
-        "  p50 {:?}  p95 {:?}  p99 {:?}  max {:?}",
+        "  p50 {:?}  p95 {:?}  p99 {:?}  max {:?}  (over all {total} answers; {refused} = {:.1}% refused under the caps, by design)",
         percentile(&lat, 0.5),
         percentile(&lat, 0.95),
         percentile(&lat, 0.99),
-        lat.last().copied().unwrap_or_default()
+        lat.last().copied().unwrap_or_default(),
+        100.0 * refused as f64 / total.max(1) as f64
     );
     eprintln!(
         "  status: {:?}  (200 = {:.1}%)",

@@ -229,7 +229,7 @@ async fn rpc(
         &label("Mnr-Cache"),
         outcome.status,
     );
-    respond(outcome, &principal, &app.limiter, stream_permit)
+    respond(outcome, &principal, &app, stream_permit)
 }
 
 /// `sub_…/json_rpc` → (token, "/json_rpc"); `json_rpc` → (None, "/json_rpc").
@@ -325,7 +325,7 @@ fn json_response<T: serde::Serialize>(
 fn respond(
     o: Outcome,
     principal: &Principal,
-    limiter: &Arc<dyn Limiter>,
+    app: &App,
     stream_permit: Option<StreamPermit>,
 ) -> Response {
     let status = StatusCode::from_u16(o.status).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -333,8 +333,13 @@ fn respond(
         Some(inner) => {
             // The client's stream permit and the work-unit charge live with
             // the body: released and settled when it ends or the client goes.
-            let counted =
-                Accounted::new(inner, Arc::clone(limiter), principal.clone(), stream_permit);
+            let counted = Accounted::new(
+                inner,
+                Arc::clone(&app.limiter),
+                Arc::clone(&app.metrics),
+                principal.clone(),
+                stream_permit,
+            );
             let mut r = (status, axum::body::Body::from_stream(counted)).into_response();
             if let Some(n) = o.content_length {
                 if let Ok(v) = HeaderValue::from_str(&n.to_string()) {

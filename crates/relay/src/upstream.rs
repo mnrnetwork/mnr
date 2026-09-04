@@ -1205,6 +1205,39 @@ transport = "onion"
         assert_eq!(u.queue_wait(), PUBLIC_QUEUE_WAIT);
     }
 
+    #[tokio::test]
+    async fn contended_queue_never_exceeds_the_cap() {
+        // 20 waiters on an exhausted 5 rps bucket, each willing to wait
+        // 250 ms: at most one token refills in that window (200 ms), so at
+        // most one or two succeed and every waiter is back by ~250 ms.
+        let p = Arc::new(pool());
+        let u = p.upstream(1);
+        while u.try_take_light() {}
+        let t0 = Instant::now();
+        let waiters: Vec<_> = (0..20)
+            .map(|_| {
+                let p = Arc::clone(&p);
+                tokio::spawn(async move {
+                    p.upstream(1)
+                        .take_light_within(Duration::from_millis(250))
+                        .await
+                })
+            })
+            .collect();
+        let mut granted = 0;
+        for w in waiters {
+            if w.await.unwrap() {
+                granted += 1;
+            }
+        }
+        assert!(granted <= 2, "{granted} granted from one refill window");
+        assert!(
+            t0.elapsed() < Duration::from_millis(400),
+            "{:?}",
+            t0.elapsed()
+        );
+    }
+
     #[test]
     fn stream_slots_are_capped_per_upstream() {
         let p = pool();
