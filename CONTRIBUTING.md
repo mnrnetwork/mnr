@@ -1,6 +1,6 @@
 # Contributing to mnr
 
-Thank you. Before you start, read `CLAUDE.md` for what is being built right
+Thank you. Questions, security reports and operator opt-outs: dev@mnr.network. Before you start, read `CLAUDE.md` for what is being built right
 now and `.claude/rules/public-nodes.md` for the rules every upstream code
 path must satisfy; they are not negotiable.
 

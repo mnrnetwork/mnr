@@ -46,4 +46,4 @@ The GitHub organisation `mnrnetwork`, the crates `mnr`, `mnr-core`,
 This policy is a statement of how the maintainers use and defend the name.
 Rights in the mark arise from its use, are not currently registered, and
 the maintainers may register it in one or more jurisdictions at any time.
-Questions and permission requests: the contact published at mnr.network.
+Questions and permission requests: dev@mnr.network.
