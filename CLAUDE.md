@@ -1,0 +1,58 @@
+# mnr — an RPC network for Monero
+
+This repository is **Stage 0**: a verified proxy over public Monero nodes plus one node we run. It is the seed of two larger designs (Stage 1 owned mesh, Stage 2 operator network) and must not foreclose them. Read `@docs/stage0-mvp-plan.md` before doing anything; it is the to-do list. The Stage 1/2 documents in `docs/` are the map, not current scope.
+
+## What we are building right now
+
+One Rust binary, `mnr-relay`, on one VPS, exposing Monero **daemon** RPC at `rpc.mnr.network` (+ a `.onion`). It authenticates a path token, applies a method policy, caches what is safe, verifies what can be verified, fans out writes, and forwards the rest to a pool of upstreams: curated public nodes plus our own full node. Free tier and a $9 Pro tier, no uptime promise.
+
+Explicitly **out of scope** for Stage 0: operator agent, directory, settlement/payouts, affiliate program, stream verification of `get_blocks.bin`, Cloudflare, `monero-wallet-rpc` methods, SLAs.
+
+## Non-negotiable invariants (from the plan; do not "simplify" these away)
+
+1. **Verify, don't trust.** Block/header responses are re-hashed and matched to the requested hash or our header chain; tx blobs are hashed and matched to txids; consensus state (`get_info`, `get_height`, fee) is the majority of ≥3 upstreams. Anything unverifiable is annotated (`Mnr-Verify: none`, `Mnr-Upstream: <n>`), never silently trusted.
+2. **Tip safety.** Never cache a block/header/tx within 10 blocks of the quorum tip. Cache keys carry an epoch that is bumped on reorg detection.
+3. **Method allow-list.** Only the methods in the policy table are dispatched; admin/mining/peer methods are denied at the edge even though nodes run `--restricted-rpc`.
+4. **Writes fan out.** `send_raw_transaction` goes to every healthy upstream in parallel; success if any accepts; `Mnr-Relayed: k/n`.
+5. **Public-node rules** (`.claude/rules/public-nodes.md`): per-upstream caps, identifying `User-Agent`, opt-out honoured, no client identity forwarded, restricted methods only. These are ethics, not tuning knobs.
+6. **No request logs.** No path, no token, no client IP is ever written. Tokens are stored hashed. Error samples carry only an 8-char token-hash prefix.
+7. **Stock wallets must work** with nothing but `--daemon-address` (path token) or `--daemon-login` (Basic auth). Never require a custom header.
+
+## Architecture (Stage 0)
+
+- `crates/core` — `mnr-core`: `wire` (JSON-RPC + epee types), `hash` (Keccak-256, block hashing blob, tx-tree hash, pruned tx hash), `verify` (pure functions over bytes), `policy` (the method table; docs are generated from it), `headerchain`. No I/O. Fuzz targets for every parser.
+- `crates/relay` — `mnr-relay`: axum ingress (TLS + onion via local Tor), token auth (SQLite, hashed), in-process token bucket + daily WU quota, policy dispatch, `moka` cache, upstream prober (15 s), ranking, quorum tip, degraded mode, verification, broadcast, invoice watcher against a view-only `monero-wallet-rpc`, Prometheus `/metrics`.
+- `spec/` — protocol notes that will become the Stage 2 spec; keep the method table and verification rules here in prose as they land in code.
+- `deploy/` — Ansible for the relayer VPS and the owned node (WireGuard, Tor, systemd, monitoring).
+- `sim/` — docker-compose stagenet harness with a fault injector (wrong header, lagging height, dropped stream). Nightly in CI.
+- Work unit (WU): 1 light request = 1 WU; 1 MB of `get_blocks.bin` = 20 WU. Quotas, invoices and (later) payouts all use WU.
+
+The method policy table lives in `docs/stage1-gateway-development-plan.md` §3.3 until it is code in `mnr-core::policy`; then the code is canonical and the doc is regenerated from it.
+
+## Conventions
+
+- Rust 2021, stable toolchain, `cargo fmt` + `cargo clippy -D warnings` clean before commit. tokio + axum + rustls; `moka` for cache; `rusqlite` for state; `governor` for rate limiting.
+- Monero serialization/hashing: prefer the `monero-serai` family of crates; wrap them behind `mnr-core::hash` so a crate swap never touches the relay. Every hashing function has fixture tests from real mainnet + stagenet blocks (include hard-fork boundary blocks, coinbase-only blocks, pruned and unpruned tx forms).
+- Tests: `cargo test` for units; `sim/` for integration; differential tests against a real `monerod` for `wire`/`hash`.
+- Config is one TOML file; upstreams are a list with `kind = "owned" | "public"`, `transport = "https" | "http" | "onion"`, and per-node caps.
+- Headers we emit are `Mnr-*`. Package/crate prefix is `mnr`. The name is written lowercase `mnr`; in prose, "mnr — an RPC network for Monero", never "the Monero network".
+- Commit messages: imperative, one line, reference the plan section when implementing it (e.g. `relay: add upstream prober (plan §3)`).
+
+## Repositories
+
+- `mnrnetwork/mnr` (this repo, public) — Cargo workspace, spec, sim, deploy playbooks, engineering docs.
+- `mnrnetwork/mnr.network` (public, local `../mnr.network`) — the static site: front page, upstreams page, docs. Design source lives there in `design/`.
+- `mnrnetwork/internal` (private, local `../mnr-internal`) — business plans, profit model, operator contact and opt-out log, Ansible inventory and secrets, weekly gate numbers. Never copy its contents here.
+
+## Commands
+
+- Build: `cargo build --release`
+- Test: `cargo test --workspace`
+- Sim: `docker compose -f sim/compose.yml up`
+- Run locally: `cargo run -p mnr-relay -- --config relay.toml`
+
+## Where decisions came from
+
+`docs/` holds the engineering history; the original aggregator doc, the business plans and the profit model live in the private `mnrnetwork/internal` repo (local: `../mnr-internal`). Three independent reviews shaped Stage 1; Stage 2 adds the operator network with mechanisms borrowed from THORChain (probation lane, payout splits, affiliate share, work-weighted votes). When a question is "why is it like this", the answer is in those documents; when a question is "what do I build next", the answer is `docs/stage0-mvp-plan.md` §7.
+
+Open decisions the founders have not made yet are listed at the end of each plan; do not resolve them silently in code — flag them.

@@ -1,0 +1,13 @@
+[package]
+name = "mnr-core"
+description = "mnr — an RPC network for Monero: wire types, hashing, verification, method policy, header chain. No I/O."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

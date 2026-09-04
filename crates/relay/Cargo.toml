@@ -1,0 +1,18 @@
+[package]
+name = "mnr-relay"
+description = "mnr — an RPC network for Monero: the verified relay binary (Stage 0)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "mnr-relay"
+path = "src/main.rs"
+
+[dependencies]
+mnr-core = { path = "../core" }
+
+[lints]
+workspace = true

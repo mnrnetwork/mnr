@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+.DS_Store
+# local tool state
+.ccb/
+opencode.json
+# local relay config may hold upstream secrets
+/relay.toml
