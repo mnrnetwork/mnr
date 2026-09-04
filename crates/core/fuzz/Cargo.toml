@@ -10,6 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 mnr-core = { path = ".." }
+serde = "1.0.229"
 
 [[bin]]
 name = "parse_block"

@@ -8,8 +8,10 @@
 //!   extra: BTreeMap<String, Value>` so fields this version of `mnr-core` does
 //!   not know about (newer or node-specific fields) round-trip unchanged. The
 //!   round-trip tests prove it.
-//! - **Newer fields parse everywhere.** Fields monerod added after 0.15 are
-//!   `#[serde(default)]`, so a response from an older node still parses.
+//! - **Newer fields parse everywhere, and absent stays absent.** Fields
+//!   monerod added after 0.15 are `Option`s that are skipped when `None`, so
+//!   a response from an older node parses and is not padded with invented
+//!   zeroes on the way out (found by fuzzing).
 //!
 //! The JSON-RPC error codes mirror `docs/stage1-gateway-development-plan.md`
 //! §3.1–3.2: the relay's own `-32001` (subscription expired) and `-32005`
@@ -124,6 +126,10 @@ pub struct JsonRpcResponse<T> {
     pub result: Option<T>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<JsonRpcError>,
+    /// Top-level keys this version does not know, kept so a response
+    /// round-trips losslessly (found by fuzzing: they were dropped).
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
 }
 
 impl<T> JsonRpcResponse<T> {
@@ -139,6 +145,7 @@ impl<T> JsonRpcResponse<T> {
                 message: message.into(),
                 data: None,
             }),
+            extra: BTreeMap::new(),
         }
     }
 
@@ -156,6 +163,7 @@ impl<T> JsonRpcResponse<T> {
                 message: format!("method not found: {method}"),
                 data: hint.map(|h| serde_json::json!({ "hint": h })),
             }),
+            extra: BTreeMap::new(),
         }
     }
 }
@@ -167,32 +175,32 @@ pub struct BlockHeader {
     pub block_size: u64,
     pub block_weight: u64,
     pub cumulative_difficulty: u64,
-    #[serde(default)]
-    pub cumulative_difficulty_top64: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cumulative_difficulty_top64: Option<u64>,
     pub depth: u64,
     pub difficulty: u64,
-    #[serde(default)]
-    pub difficulty_top64: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub difficulty_top64: Option<u64>,
     pub hash: String,
     pub height: u64,
-    #[serde(default)]
-    pub long_term_weight: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub long_term_weight: Option<u64>,
     pub major_version: u8,
     pub miner_tx_hash: String,
     pub minor_version: u8,
     pub nonce: u32,
     pub num_txes: u64,
-    #[serde(default)]
-    pub orphan_status: bool,
-    #[serde(default)]
-    pub pow_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orphan_status: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pow_hash: Option<String>,
     pub prev_hash: String,
     pub reward: u64,
     pub timestamp: u64,
-    #[serde(default)]
-    pub wide_cumulative_difficulty: String,
-    #[serde(default)]
-    pub wide_difficulty: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wide_cumulative_difficulty: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wide_difficulty: Option<String>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
 }
@@ -204,14 +212,14 @@ pub struct GetBlockResult {
     pub block_header: BlockHeader,
     pub json: String,
     pub miner_tx_hash: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tx_hashes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_hashes: Option<Vec<String>>,
     pub status: String,
     pub untrusted: bool,
-    #[serde(default)]
-    pub credits: u64,
-    #[serde(default)]
-    pub top_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credits: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_hash: Option<String>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
 }
@@ -222,10 +230,10 @@ pub struct GetBlockHeaderResult {
     pub block_header: BlockHeader,
     pub status: String,
     pub untrusted: bool,
-    #[serde(default)]
-    pub credits: u64,
-    #[serde(default)]
-    pub top_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credits: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_hash: Option<String>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
 }
@@ -239,10 +247,10 @@ pub struct GetBlockHeadersRangeResult {
     pub headers: Vec<BlockHeader>,
     pub status: String,
     pub untrusted: bool,
-    #[serde(default)]
-    pub credits: u64,
-    #[serde(default)]
-    pub top_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credits: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_hash: Option<String>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
 }
@@ -253,21 +261,21 @@ pub struct TxEntry {
     pub as_hex: String,
     pub as_json: String,
     pub block_height: u64,
-    #[serde(default)]
-    pub block_timestamp: u64,
-    #[serde(default)]
-    pub confirmations: u64,
-    #[serde(default)]
-    pub double_spend_seen: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_timestamp: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmations: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub double_spend_seen: Option<bool>,
     pub in_pool: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub output_indices: Vec<u64>,
-    #[serde(default)]
-    pub prunable_as_hex: String,
-    #[serde(default)]
-    pub prunable_hash: String,
-    #[serde(default)]
-    pub pruned_as_hex: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_indices: Option<Vec<u64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prunable_as_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prunable_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pruned_as_hex: Option<String>,
     pub tx_hash: String,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
@@ -277,17 +285,17 @@ pub struct TxEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GetTransactionsResult {
     pub txs: Vec<TxEntry>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub missed_tx: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub missed_tx: Option<Vec<String>>,
     pub txs_as_hex: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub txs_as_json: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub txs_as_json: Option<Vec<String>>,
     pub status: String,
     pub untrusted: bool,
-    #[serde(default)]
-    pub credits: u64,
-    #[serde(default)]
-    pub top_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credits: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_hash: Option<String>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
 }
@@ -295,39 +303,39 @@ pub struct GetTransactionsResult {
 /// `get_info` result, with every field monerod 0.18 returns.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GetInfoResult {
-    #[serde(default)]
-    pub adjusted_time: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adjusted_time: Option<u64>,
     pub alt_blocks_count: u64,
     pub block_size_limit: u64,
     pub block_size_median: u64,
     pub block_weight_limit: u64,
     pub block_weight_median: u64,
-    #[serde(default)]
-    pub bootstrap_daemon_address: String,
-    #[serde(default)]
-    pub busy_syncing: bool,
-    #[serde(default)]
-    pub credits: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap_daemon_address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub busy_syncing: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credits: Option<u64>,
     pub cumulative_difficulty: u64,
-    #[serde(default)]
-    pub cumulative_difficulty_top64: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cumulative_difficulty_top64: Option<u64>,
     pub database_size: u64,
     pub difficulty: u64,
-    #[serde(default)]
-    pub difficulty_top64: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub difficulty_top64: Option<u64>,
     pub free_space: u64,
     pub grey_peerlist_size: u64,
     pub height: u64,
-    #[serde(default)]
-    pub height_without_bootstrap: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height_without_bootstrap: Option<u64>,
     pub incoming_connections_count: u64,
     pub mainnet: bool,
     pub nettype: String,
     pub offline: bool,
     pub outgoing_connections_count: u64,
     pub restricted: bool,
-    #[serde(default)]
-    pub rpc_connections_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpc_connections_count: Option<u64>,
     pub stagenet: bool,
     pub start_time: u64,
     pub status: String,
@@ -336,21 +344,21 @@ pub struct GetInfoResult {
     pub target_height: u64,
     pub testnet: bool,
     pub top_block_hash: String,
-    #[serde(default)]
-    pub top_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_hash: Option<String>,
     pub tx_count: u64,
     pub tx_pool_size: u64,
     pub untrusted: bool,
     pub update_available: bool,
-    #[serde(default)]
-    pub version: String,
-    #[serde(default)]
-    pub was_bootstrap_ever_used: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub was_bootstrap_ever_used: Option<bool>,
     pub white_peerlist_size: u64,
-    #[serde(default)]
-    pub wide_cumulative_difficulty: String,
-    #[serde(default)]
-    pub wide_difficulty: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wide_cumulative_difficulty: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wide_difficulty: Option<String>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
 }
@@ -392,7 +400,7 @@ impl GetInfoResult {
     pub fn normalise_get_info(&mut self) {
         self.incoming_connections_count = 0;
         self.outgoing_connections_count = 0;
-        self.rpc_connections_count = 0;
+        self.rpc_connections_count = self.rpc_connections_count.map(|_| 0);
         self.white_peerlist_size = 0;
         self.grey_peerlist_size = 0;
         self.update_available = false;
@@ -407,14 +415,14 @@ impl GetInfoResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GetHeightResult {
     pub height: u64,
-    #[serde(default)]
-    pub status: String,
-    #[serde(default)]
-    pub untrusted: bool,
-    #[serde(default)]
-    pub credits: u64,
-    #[serde(default)]
-    pub top_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub untrusted: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credits: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_hash: Option<String>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
 }
@@ -423,16 +431,16 @@ pub struct GetHeightResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GetFeeEstimateResult {
     pub fee: u64,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub fees: Vec<u64>,
-    #[serde(default)]
-    pub quantization_mask: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fees: Option<Vec<u64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quantization_mask: Option<u64>,
     pub status: String,
     pub untrusted: bool,
-    #[serde(default)]
-    pub credits: u64,
-    #[serde(default)]
-    pub top_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credits: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_hash: Option<String>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
 }
@@ -570,6 +578,17 @@ mod tests {
     }
 
     #[test]
+    fn unknown_envelope_keys_round_trip_through_extra() {
+        // Fuzz finding: a misspelt `result` key was silently dropped.
+        let raw = r#"{"id":"0","jsonrpc":"2.0","resutl":{"flob":false}}"#;
+        let v: JsonRpcResponse<GetBlockResult> = serde_json::from_str(raw).unwrap();
+        assert!(v.result.is_none() && v.error.is_none());
+        assert_eq!(v.extra["resutl"]["flob"], Value::Bool(false));
+        let again: Value = serde_json::to_value(&v).unwrap();
+        assert_eq!(again, serde_json::from_str::<Value>(raw).unwrap());
+    }
+
+    #[test]
     fn unknown_fields_round_trip_through_extra() {
         let mut v: Value = serde_json::from_str(BLOCKS[1].1).unwrap();
         v["result"]["block_header"]["future_field"] = serde_json::json!({ "x": 1 });
@@ -640,7 +659,7 @@ mod tests {
 
         assert_eq!(info.incoming_connections_count, 0);
         assert_eq!(info.outgoing_connections_count, 0);
-        assert_eq!(info.rpc_connections_count, 0);
+        assert_eq!(info.rpc_connections_count, Some(0));
         assert_eq!(info.white_peerlist_size, 0);
         assert_eq!(info.grey_peerlist_size, 0);
         assert_eq!(info.start_time, 0);

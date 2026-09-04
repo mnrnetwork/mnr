@@ -247,6 +247,7 @@ version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
  "mnr-core",
+ "serde",
  "serde_json",
 ]
 

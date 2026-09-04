@@ -36,6 +36,8 @@ jobs:
               h = r['block_header']['height']
               open(f'corpus/parse_block/{h}.bin','wb').write(binascii.unhexlify(r['blob']))
               open(f'corpus/wire_json/block-{h}.json','w').write(open(f).read())
+          for f in glob.glob('../fixtures/mainnet/txs-*.json') + glob.glob('../fixtures/mainnet/get_*.json'):
+              open('corpus/wire_json/' + f.rsplit('/', 1)[1], 'w').write(open(f).read())
           for f in glob.glob('../fixtures/mainnet/txs-*-prune-false.json'):
               for i, t in enumerate(json.load(open(f))['txs']):
                   open(f'corpus/tx_hash/{t["tx_hash"][:8]}.bin','wb').write(binascii.unhexlify(t['as_hex']))
