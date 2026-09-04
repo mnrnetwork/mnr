@@ -1,0 +1,38 @@
+{
+  "id": "0",
+  "jsonrpc": "2.0",
+  "result": {
+    "blob": "0b0b83ce9ce40533bc11a064de3a337d712e9404bd33be5503a6cb1a9801c1f76cf9171c9a45d17b80050002ec966d01ffb0966d01f0d2d384b85a029e5f40ac886219ae29eee0cdf2a252f3aa7949b0e0575d1baee6b2193c34879a2b014088e03b1997e1809bfd7857b684146a4898947e500e75d979c1fb54cfe32546020801bec56552fdfc00000301127fbdf42c107ef190935e18c165fc4cd8368a27bb42cc5dd16738c8cb912ba8fcc15255f278748d08ade8618688b1634fa800752c958b0c3f57168816372a02c2703cc44eb1275f72f33ef2f20d6417d7fdea18e3622effe68efed59b9f34",
+    "block_header": {
+      "block_size": 8733,
+      "block_weight": 8733,
+      "cumulative_difficulty": 27898342083236647,
+      "cumulative_difficulty_top64": 0,
+      "depth": 1966048,
+      "difficulty": 20318291356,
+      "difficulty_top64": 0,
+      "hash": "61765b9d7e88eed25a1168a04839fa99ed8c7e2b5362292e9e0d299b771cc4b7",
+      "height": 1788720,
+      "long_term_weight": 8733,
+      "major_version": 11,
+      "miner_tx_hash": "6c1d538c4bb5239173c455be7349272863188f33eff3a96787f08e47f7046767",
+      "minor_version": 11,
+      "nonce": 360571,
+      "num_txes": 3,
+      "orphan_status": false,
+      "pow_hash": "",
+      "prev_hash": "33bc11a064de3a337d712e9404bd33be5503a6cb1a9801c1f76cf9171c9a45d1",
+      "reward": 3107418597744,
+      "timestamp": 1552361219,
+      "wide_cumulative_difficulty": "0x631d64f1b19327",
+      "wide_difficulty": "0x4bb10859c"
+    },
+    "credits": 0,
+    "json": "{\n  \"major_version\": 11, \n  \"minor_version\": 11, \n  \"timestamp\": 1552361219, \n  \"prev_id\": \"33bc11a064de3a337d712e9404bd33be5503a6cb1a9801c1f76cf9171c9a45d1\", \n  \"nonce\": 360571, \n  \"miner_tx\": {\n    \"version\": 2, \n    \"unlock_time\": 1788780, \n    \"vin\": [ {\n        \"gen\": {\n          \"height\": 1788720\n        }\n      }\n    ], \n    \"vout\": [ {\n        \"amount\": 3107418597744, \n        \"target\": {\n          \"key\": \"9e5f40ac886219ae29eee0cdf2a252f3aa7949b0e0575d1baee6b2193c34879a\"\n        }\n      }\n    ], \n    \"extra\": [ 1, 64, 136, 224, 59, 25, 151, 225, 128, 155, 253, 120, 87, 182, 132, 20, 106, 72, 152, 148, 126, 80, 14, 117, 217, 121, 193, 251, 84, 207, 227, 37, 70, 2, 8, 1, 190, 197, 101, 82, 253, 252, 0\n    ], \n    \"rct_signatures\": {\n      \"type\": 0\n    }\n  }, \n  \"tx_hashes\": [ \"01127fbdf42c107ef190935e18c165fc4cd8368a27bb42cc5dd16738c8cb912b\", \"a8fcc15255f278748d08ade8618688b1634fa800752c958b0c3f57168816372a\", \"02c2703cc44eb1275f72f33ef2f20d6417d7fdea18e3622effe68efed59b9f34\"\n  ]\n}",
+    "miner_tx_hash": "6c1d538c4bb5239173c455be7349272863188f33eff3a96787f08e47f7046767",
+    "status": "OK",
+    "top_hash": "",
+    "tx_hashes": ["01127fbdf42c107ef190935e18c165fc4cd8368a27bb42cc5dd16738c8cb912b","a8fcc15255f278748d08ade8618688b1634fa800752c958b0c3f57168816372a","02c2703cc44eb1275f72f33ef2f20d6417d7fdea18e3622effe68efed59b9f34"],
+    "untrusted": false
+  }
+}

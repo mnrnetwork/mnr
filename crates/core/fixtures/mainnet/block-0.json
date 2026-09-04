@@ -1,0 +1,37 @@
+{
+  "id": "0",
+  "jsonrpc": "2.0",
+  "result": {
+    "blob": "010000000000000000000000000000000000000000000000000000000000000000000010270000013c01ff0001ffffffffffff03029b2e4c0281c0b02e7c53291a94d1d0cbff8883f8024f5142ee494ffbbd08807121017767aafcde9be00dcfd098715ebcf7f410daebc582fda69d24a28e9d0bc890d100",
+    "block_header": {
+      "block_size": 80,
+      "block_weight": 80,
+      "cumulative_difficulty": 1,
+      "cumulative_difficulty_top64": 0,
+      "depth": 3754768,
+      "difficulty": 1,
+      "difficulty_top64": 0,
+      "hash": "418015bb9ae982a1975da7d79277c2705727a56894ba0fb246adaabb1f4632e3",
+      "height": 0,
+      "long_term_weight": 80,
+      "major_version": 1,
+      "miner_tx_hash": "c88ce9783b4f11190d7b9c17a69c1c52200f9faaee8e98dd07e6811175177139",
+      "minor_version": 0,
+      "nonce": 10000,
+      "num_txes": 0,
+      "orphan_status": false,
+      "pow_hash": "",
+      "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "reward": 17592186044415,
+      "timestamp": 0,
+      "wide_cumulative_difficulty": "0x1",
+      "wide_difficulty": "0x1"
+    },
+    "credits": 0,
+    "json": "{\n  \"major_version\": 1, \n  \"minor_version\": 0, \n  \"timestamp\": 0, \n  \"prev_id\": \"0000000000000000000000000000000000000000000000000000000000000000\", \n  \"nonce\": 10000, \n  \"miner_tx\": {\n    \"version\": 1, \n    \"unlock_time\": 60, \n    \"vin\": [ {\n        \"gen\": {\n          \"height\": 0\n        }\n      }\n    ], \n    \"vout\": [ {\n        \"amount\": 17592186044415, \n        \"target\": {\n          \"key\": \"9b2e4c0281c0b02e7c53291a94d1d0cbff8883f8024f5142ee494ffbbd088071\"\n        }\n      }\n    ], \n    \"extra\": [ 1, 119, 103, 170, 252, 222, 155, 224, 13, 207, 208, 152, 113, 94, 188, 247, 244, 16, 218, 235, 197, 130, 253, 166, 157, 36, 162, 142, 157, 11, 200, 144, 209\n    ], \n    \"signatures\": [ ]\n  }, \n  \"tx_hashes\": [ ]\n}",
+    "miner_tx_hash": "c88ce9783b4f11190d7b9c17a69c1c52200f9faaee8e98dd07e6811175177139",
+    "status": "OK",
+    "top_hash": "",
+    "untrusted": false
+  }
+}
