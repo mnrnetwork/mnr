@@ -164,7 +164,7 @@ const SWR_CACHE: &str = "SWR 1/5/15 s (max-age=1, stale-while-revalidate=5, stal
 const SWR_QUORUM: &str =
     "Majority of >=3 upstreams on quorum tip (each probe height >= quorum_tip - 1).";
 const TXS_CACHE: &str = "Cache 30 d per tx hash only for txs with block_height <= quorum_tip - TIP_SAFETY_DEPTH; mempool/young txs pass through. Per-tx-hash, not per request body; batches reassembled at the edge.";
-const OUTPUTS_CACHE: &str = "Cache 24 h only if all requested indices belong to blocks <= quorum_tip - TIP_SAFETY_DEPTH; else pass through.";
+const OUTPUTS_CACHE: &str = "Cache 24 h only if all requested indices belong to blocks <= quorum_tip - TIP_SAFETY_DEPTH; else pass through. Stage 0: only get_output_distribution with to_height <= the safety line is cached (needs the distribution to map indices to heights for the rest).";
 const STREAM_CACHE: &str = "None - streamed body-through, no buffering.";
 const STREAM_QUORUM: &str =
     "Route to the healthiest full node on quorum tip (pruned node only if request has prune=true).";
@@ -355,7 +355,7 @@ const P_GET_BLOCK_HEADER_BY_HEIGHT: Policy = immutable(
 );
 const P_GET_BLOCK_HEADERS_RANGE: Policy = immutable(
     "get_block_headers_range",
-    "Range requests are split at the safety line.",
+    "Every header checked against the header chain; a range that crosses the safety line is verified but not cached.",
 );
 const P_ON_GET_BLOCK_HASH: Policy = immutable(
     "on_get_block_hash",
