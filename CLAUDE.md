@@ -27,7 +27,7 @@ Explicitly **out of scope** for Stage 0: operator agent, directory, settlement/p
 - `sim/` — docker-compose stagenet harness with a fault injector (wrong header, lagging height, dropped stream). Nightly in CI.
 - Work unit (WU): 1 light request = 1 WU; 1 MB of `get_blocks.bin` = 20 WU. Quotas, invoices and (later) payouts all use WU.
 
-The method policy table lives in `docs/stage1-gateway-development-plan.md` §3.3 until it is code in `mnr-core::policy`; then the code is canonical and the doc is regenerated from it.
+The method policy table is code: `mnr-core::policy` is canonical, checked in tests against monerod's endpoint registry (`crates/core/fixtures/monerod-core_rpc_server.h`), and `docs/method-policy.md` is regenerated from it with `cargo run -p mnr-core --example render_policy > docs/method-policy.md`. `docs/stage1-gateway-development-plan.md` §3.3 is the historical source.
 
 ## Conventions
 
