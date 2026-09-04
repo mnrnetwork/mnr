@@ -224,14 +224,14 @@ async fn fetch_verified<T>(
     timeout: Duration,
     method: &str,
     mut check: impl FnMut(&Forwarded) -> Result<T, Fault>,
-) -> Result<(Forwarded, usize, T), Outcome> {
+) -> Result<(Forwarded, usize, T), Box<Outcome>> {
     let ranked = pool.ranked(Work::Light);
     if ranked.is_empty() {
-        return Err(Outcome::json_error(
+        return Err(Box::new(Outcome::json_error(
             503,
             "no healthy upstream",
             Verify::None,
-        ));
+        )));
     }
     let mut last = ForwardError::Cap;
     let mut faults = 0usize;
@@ -256,18 +256,18 @@ async fn fetch_verified<T>(
         }
     }
     if faults > 0 && faults == attempts {
-        return Err(Outcome::json_error(
+        return Err(Box::new(Outcome::json_error(
             502,
             "upstream answers failed verification",
             Verify::Failed,
-        ));
+        )));
     }
     let status = if last == ForwardError::Cap { 503 } else { 502 };
-    Err(Outcome::json_error(
+    Err(Box::new(Outcome::json_error(
         status,
         &format!("upstream unavailable: {last}"),
         Verify::None,
-    ))
+    )))
 }
 
 /// Immutable JSON-RPC methods: cache, fetch, verify, fault-and-retry, cache.
@@ -298,7 +298,7 @@ async fn immutable(ctx: Ctx, req: Request, timeout: Duration) -> Outcome {
     .await;
     let (f, id, v) = match fetched {
         Ok(x) => x,
-        Err(o) => return o,
+        Err(o) => return *o,
     };
     let cacheable =
         v.verify != Verify::None && matches!((v.height, line), (Some(h), Some(l)) if h <= l);
@@ -420,7 +420,7 @@ async fn transactions(ctx: Ctx, req: Request, timeout: Duration) -> Outcome {
     .await;
     let (f, id, (result, checks)) = match fetched {
         Ok(x) => x,
-        Err(o) => return o,
+        Err(o) => return *o,
     };
     if checks.iter().any(|c| matches!(c, TxCheck::Verified { .. })) {
         ctx.pool.record_verified(id);
