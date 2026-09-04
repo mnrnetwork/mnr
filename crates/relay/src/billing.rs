@@ -63,6 +63,8 @@ const BUCKET_WINDOW: Duration = Duration::from_secs(3600);
 /// Transfers older than this before the invoice was created are not
 /// counted for it (clock skew between us and the wallet).
 const CREATED_SLACK: u64 = 60;
+/// How long after payment the status call still shows a purchase's token.
+const TOKEN_WINDOW: u64 = 7 * 24 * 3600;
 const TOKEN_DOMAIN: &[u8] = b"mnr-invoice-token-v1";
 
 pub struct Billing {
@@ -73,6 +75,8 @@ pub struct Billing {
     boot_key: [u8; 32],
     /// Issuance timestamps per client key, pruned to the last hour.
     buckets: Mutex<HashMap<[u8; 32], Vec<Instant>>>,
+    /// Invoice status reads per client key, same window.
+    status_buckets: Mutex<HashMap<[u8; 32], Vec<Instant>>>,
     /// `(day, count)` of free tokens issued today.
     free_today: Mutex<(u64, u64)>,
 }
@@ -130,6 +134,7 @@ impl Billing {
             secret,
             boot_key,
             buckets: Mutex::new(HashMap::new()),
+            status_buckets: Mutex::new(HashMap::new()),
             free_today: Mutex::new((0, 0)),
         })
     }
@@ -165,14 +170,33 @@ impl Billing {
 
     /// Take one issuance from the client's bucket, or refuse.
     fn admit(&self, key: [u8; 32], now: Instant) -> Result<(), Refusal> {
-        let mut buckets = self.buckets.lock();
+        Self::take(&self.buckets, key, now, self.cfg.per_client_per_hour)
+    }
+
+    /// Take one status read from the client's bucket, or refuse.
+    fn admit_status(&self, key: [u8; 32], now: Instant) -> Result<(), Refusal> {
+        Self::take(
+            &self.status_buckets,
+            key,
+            now,
+            self.cfg.status_per_client_per_hour,
+        )
+    }
+
+    fn take(
+        buckets: &Mutex<HashMap<[u8; 32], Vec<Instant>>>,
+        key: [u8; 32],
+        now: Instant,
+        limit: u32,
+    ) -> Result<(), Refusal> {
+        let mut buckets = buckets.lock();
         // Keep the map bounded: drop clients whose window is empty.
         buckets.retain(|_, v| {
             v.retain(|t| now.duration_since(*t) < BUCKET_WINDOW);
             !v.is_empty()
         });
         let v = buckets.entry(key).or_default();
-        if v.len() >= self.cfg.per_client_per_hour as usize {
+        if v.len() >= limit as usize {
             return Err(Refusal::Throttled);
         }
         v.push(now);
@@ -382,8 +406,10 @@ impl Billing {
     // ── handlers ────────────────────────────────────────────────────────
 
     async fn free_token(&self, headers: &HeaderMap, peer: IpAddr) -> Result<Value, Refusal> {
-        self.admit(self.client_key(headers, peer), Instant::now())?;
+        // The relay-wide ceiling first, so a day that is already spent does
+        // not also burn the client's own allowance.
         self.admit_free_today()?;
+        self.admit(self.client_key(headers, peer), Instant::now())?;
         let token = self.store.issue(Tier::Free, None);
         Ok(json!({
             "token": token,
@@ -410,18 +436,35 @@ impl Billing {
         if months == 0 || months > self.cfg.months_max {
             return Err(Refusal::BadRequest("months out of range"));
         }
-        self.admit(self.client_key(headers, peer), Instant::now())?;
         let renew_hash = match req.renew.as_deref() {
             Some(t) if auth::looks_like_token(t) => {
                 let h = token_hash(t);
-                if self.store.valid_until(&h).is_none() {
-                    return Err(Refusal::BadRequest("unknown token to renew"));
+                // Only a current, active Pro token can be renewed: a Free
+                // token has nothing to extend, and a suspended one stays
+                // suspended. An expired Pro token is exactly what renewal
+                // is for.
+                match self.store.token_state(&h) {
+                    Some(st) if st.tier == Tier::Pro && st.active => {}
+                    Some(_) => {
+                        return Err(Refusal::BadRequest(
+                            "only an active Pro token can be renewed",
+                        ))
+                    }
+                    None => return Err(Refusal::BadRequest("unknown token to renew")),
+                }
+                // One open invoice per token: its subaddress is reused, so a
+                // second pending invoice would be paid by the same transfer.
+                if self.store.pending_invoice_for(&h).is_some() {
+                    return Err(Refusal::BadRequest(
+                        "an invoice for this token is already pending",
+                    ));
                 }
                 Some(h)
             }
             Some(_) => return Err(Refusal::BadRequest("renew is not a token")),
             None => None,
         };
+        self.admit(self.client_key(headers, peer), Instant::now())?;
         let id = new_invoice_id();
         // A renewal reuses the token's previous subaddress so the wallet
         // does not grow by one address per month per customer: the last
@@ -459,7 +502,13 @@ impl Billing {
         Ok(invoice_view(&inv, None, 0))
     }
 
-    async fn invoice_status(&self, id: &str) -> Result<Value, Refusal> {
+    async fn invoice_status(
+        &self,
+        headers: &HeaderMap,
+        peer: IpAddr,
+        id: &str,
+    ) -> Result<Value, Refusal> {
+        self.admit_status(self.client_key(headers, peer), Instant::now())?;
         let Some(inv) = self.store.invoice(id) else {
             return Err(Refusal::NotFound);
         };
@@ -471,8 +520,12 @@ impl Billing {
                 .unwrap_or(0),
             _ => u64::from(self.cfg.confirmations),
         };
-        let token = match (inv.status, inv.renew_hash) {
-            (InvoiceStatus::Paid, None) => Some(self.derived_token(&inv.id)),
+        // A purchase shows its token for a week after payment; after that a
+        // leaked invoice id recovers nothing.
+        let token = match (inv.status, inv.renew_hash, inv.paid_at) {
+            (InvoiceStatus::Paid, None, Some(paid_at)) if unix_now() <= paid_at + TOKEN_WINDOW => {
+                Some(self.derived_token(&inv.id))
+            }
             _ => None,
         };
         Ok(invoice_view(&inv, token, confirmations))
@@ -588,6 +641,9 @@ pub async fn free_token_handler(
     if method == Method::OPTIONS {
         return finish(b, Ok(Value::Null));
     }
+    if method != Method::POST {
+        return StatusCode::METHOD_NOT_ALLOWED.into_response();
+    }
     let r = match b.as_ref() {
         Some(b) => b.free_token(&headers, peer.ip()).await,
         None => disabled(),
@@ -606,6 +662,9 @@ pub async fn create_invoice_handler(
     if method == Method::OPTIONS {
         return finish(b, Ok(Value::Null));
     }
+    if method != Method::POST {
+        return StatusCode::METHOD_NOT_ALLOWED.into_response();
+    }
     let req: InvoiceRequest = if body.is_empty() {
         InvoiceRequest::default()
     } else {
@@ -623,14 +682,16 @@ pub async fn create_invoice_handler(
 
 pub async fn invoice_status_handler(
     State(app): State<Arc<crate::ingress::App>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     AxPath(id): AxPath<String>,
+    headers: HeaderMap,
 ) -> Response {
     let b = &app.billing;
     if id.len() != 32 || !id.bytes().all(|c| c.is_ascii_hexdigit()) {
         return finish(b, Err(Refusal::NotFound));
     }
     let r = match b.as_ref() {
-        Some(b) => b.invoice_status(&id).await,
+        Some(b) => b.invoice_status(&headers, peer.ip(), &id).await,
         None => disabled(),
     };
     finish(b, r)
@@ -718,6 +779,7 @@ mod tests {
             confirmations: 10,
             free_per_day: 100,
             per_client_per_hour: 3,
+            status_per_client_per_hour: 400,
             months_max: 12,
             client_ip_header: Some("CF-Connecting-IP".into()),
             secret_file: Some(dir.join("secret")),
@@ -809,7 +871,7 @@ mod tests {
         let now = unix_now();
         w.transfers.lock().push((1, 120_000_000_000, 9, now));
         b.check_invoices().await;
-        let s = b.invoice_status(&id).await.unwrap();
+        let s = b.invoice_status(&h, peer(), &id).await.unwrap();
         assert_eq!(s["status"], "pending");
         assert_eq!(s["confirmations"], 9);
         assert!(s.get("token").is_none());
@@ -818,12 +880,15 @@ mod tests {
             .lock()
             .push((1, 500_000_000_000, 50, now - 3600));
         b.check_invoices().await;
-        assert_eq!(b.invoice_status(&id).await.unwrap()["status"], "pending");
+        assert_eq!(
+            b.invoice_status(&h, peer(), &id).await.unwrap()["status"],
+            "pending"
+        );
         // Ten confirmations: paid, token derived, authenticates as Pro.
         w.transfers.lock().clear();
         w.transfers.lock().push((1, 120_000_000_000, 10, now));
         b.check_invoices().await;
-        let s = b.invoice_status(&id).await.unwrap();
+        let s = b.invoice_status(&h, peer(), &id).await.unwrap();
         assert_eq!(s["status"], "paid");
         let token = s["token"].as_str().unwrap().to_owned();
         assert_eq!(token, b.derived_token(&id));
@@ -833,7 +898,10 @@ mod tests {
         assert!(until >= now + 2 * MONTH_SECS - 5 && until <= now + 2 * MONTH_SECS + 60);
         // The status can be read again later and still carries the token;
         // nothing raw is in the database.
-        assert_eq!(b.invoice_status(&id).await.unwrap()["token"], token);
+        assert_eq!(
+            b.invoice_status(&h, peer(), &id).await.unwrap()["token"],
+            token
+        );
         let rows: Vec<String> = {
             let conn = store.conn();
             let mut stmt = conn.prepare("SELECT address FROM invoices").unwrap();
@@ -866,13 +934,112 @@ mod tests {
         assert_eq!(v["address"], "8sub1", "same subaddress");
         assert_eq!(v["renewal"], true);
         let rid = v["invoice_id"].as_str().unwrap().to_owned();
+        // A second renewal while one is pending would share the subaddress
+        // and be paid by the same transfer: refused.
+        assert!(matches!(
+            b.create_invoice(&h, peer(), InvoiceRequest { months: Some(1), renew: Some(token.clone()) }).await,
+            Err(Refusal::BadRequest(m)) if m.contains("already pending")
+        ));
         w.transfers.lock().push((1, 60_000_000_000, 12, unix_now()));
         b.check_invoices().await;
-        let s = b.invoice_status(&rid).await.unwrap();
+        let s = b.invoice_status(&h, peer(), &rid).await.unwrap();
         assert_eq!(s["status"], "paid");
         assert!(s.get("token").is_none(), "a renewal reveals nothing");
         let extended = store.valid_until(&token_hash(&token)).unwrap().unwrap();
         assert!(extended >= until + MONTH_SECS - 5, "{extended} vs {until}");
+        // Once paid, another renewal is allowed again.
+        assert!(b
+            .create_invoice(
+                &h,
+                peer(),
+                InvoiceRequest {
+                    months: Some(1),
+                    renew: Some(token.clone())
+                }
+            )
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn only_active_pro_tokens_renew_and_status_is_throttled() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteStore::open(Some(&dir.path().join("b.db"))).unwrap());
+        let w = Arc::new(Wallet {
+            next_index: AtomicU64::new(1),
+            transfers: Mutex::new(Vec::new()),
+            calls: AtomicU64::new(0),
+        });
+        let url = wallet(Arc::clone(&w)).await;
+        let mut c = cfg(Some(url), dir.path());
+        c.status_per_client_per_hour = 5;
+        let b = Billing::new(c, Arc::clone(&store)).unwrap();
+        let h = HeaderMap::new();
+        // A Free token has nothing to extend.
+        let free = store.issue(Tier::Free, None);
+        assert!(matches!(
+            b.create_invoice(&h, peer(), InvoiceRequest { months: Some(1), renew: Some(free) }).await,
+            Err(Refusal::BadRequest(m)) if m.contains("active Pro")
+        ));
+        // A suspended Pro token stays suspended.
+        let pro = store.issue(Tier::Pro, Some(unix_now() + 100));
+        store.suspend(&token_hash(&pro)).unwrap();
+        assert!(matches!(
+            b.create_invoice(
+                &h,
+                peer(),
+                InvoiceRequest {
+                    months: Some(1),
+                    renew: Some(pro)
+                }
+            )
+            .await,
+            Err(Refusal::BadRequest(_))
+        ));
+        // An expired Pro token is exactly what renewal is for.
+        let expired = store.issue(Tier::Pro, Some(1));
+        let v = b
+            .create_invoice(
+                &h,
+                peer(),
+                InvoiceRequest {
+                    months: Some(1),
+                    renew: Some(expired.clone()),
+                },
+            )
+            .await
+            .unwrap();
+        let id = v["invoice_id"].as_str().unwrap().to_owned();
+        w.transfers.lock().push((1, 60_000_000_000, 10, unix_now()));
+        b.check_invoices().await;
+        let until = store.valid_until(&token_hash(&expired)).unwrap().unwrap();
+        assert!(
+            until >= unix_now() + MONTH_SECS - 5,
+            "extends from now, not from the past"
+        );
+        // Status reads are throttled per client key.
+        let calls_before = w.calls.load(Ordering::SeqCst);
+        for _ in 0..5 {
+            b.invoice_status(&h, peer(), &id).await.unwrap();
+        }
+        assert!(matches!(
+            b.invoice_status(&h, peer(), &id).await,
+            Err(Refusal::Throttled)
+        ));
+        assert!(
+            w.calls.load(Ordering::SeqCst) <= calls_before + 5,
+            "a refused read costs no wallet call"
+        );
+        // Without a configured header, a forged one is ignored.
+        let mut forged = HeaderMap::new();
+        forged.insert("cf-connecting-ip", HeaderValue::from_static("198.51.100.1"));
+        let mut plain_cfg = cfg(None, dir.path());
+        plain_cfg.client_ip_header = None;
+        let b2 = Billing::new(plain_cfg, Arc::clone(&store)).unwrap();
+        assert_eq!(
+            b2.client_key(&forged, peer()),
+            b2.client_key(&HeaderMap::new(), peer())
+        );
     }
 
     #[tokio::test]
@@ -917,11 +1084,13 @@ mod tests {
             InvoiceStatus::Expired
         );
         assert_eq!(
-            b.invoice_status(&old.id).await.unwrap()["status"],
+            b.invoice_status(&HeaderMap::new(), peer(), &old.id)
+                .await
+                .unwrap()["status"],
             "expired"
         );
         assert!(matches!(
-            b.invoice_status("nope").await,
+            b.invoice_status(&HeaderMap::new(), peer(), "nope").await,
             Err(Refusal::NotFound)
         ));
         // Without a wallet, invoices are refused but free tokens still work.
@@ -1002,6 +1171,15 @@ mod tests {
         let token = v["token"].as_str().unwrap().to_owned();
         assert!(auth::looks_like_token(&token));
 
+        // Only POST issues; GET is refused.
+        let r = c
+            .get(format!("{base}/v1/tokens/free"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 405);
+        let r = c.get(format!("{base}/v1/invoices")).send().await.unwrap();
+        assert_eq!(r.status(), 405);
         // Preflight.
         let r = c
             .request(Method::OPTIONS, format!("{base}/v1/invoices"))

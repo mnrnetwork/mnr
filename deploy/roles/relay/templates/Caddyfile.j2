@@ -1,13 +1,21 @@
 # {{ ansible_managed }}
 # TLS for the public name; everything proxied to the relay on loopback.
-# No access log (invariant 6). Behind Cloudflare, the client address for the
-# storefront throttle arrives in CF-Connecting-IP and is passed on as
-# X-Forwarded-For only from Cloudflare's ranges (trusted_proxies).
+# No access log (invariant 6).
+{% if mnr_behind_cloudflare %}
+# Behind Cloudflare: only Cloudflare's ranges are trusted proxies, and the
+# client address is taken from CF-Connecting-IP *only* when the connection
+# comes from one of them ({client_ip}); a direct hitter forging the header
+# gets its own socket address instead. 443 is also firewalled to those
+# ranges (see the relay role), so this is belt and braces.
+{% endif %}
 {
 	email {{ mnr_contact }}
+{% if mnr_behind_cloudflare %}
 	servers {
-		trusted_proxies cloudflare
+		trusted_proxies static {{ (cloudflare_ipv4 + cloudflare_ipv6) | join(' ') }}
+		client_ip_headers CF-Connecting-IP
 	}
+{% endif %}
 }
 
 {{ mnr_domain }} {
@@ -16,7 +24,7 @@
 	}
 	encode zstd gzip
 	reverse_proxy 127.0.0.1:18089 {
-		header_up X-Forwarded-For {http.request.header.CF-Connecting-IP}
+		header_up X-Forwarded-For {client_ip}
 		flush_interval -1
 		transport http {
 			read_timeout 120s

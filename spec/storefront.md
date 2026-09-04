@@ -28,7 +28,11 @@ Issues a Free token immediately.
 The token is shown once. Nothing links it to whoever asked: issuance is
 throttled per client (three per hour) through a key that is a hash of the
 client address with a random key that lives only in the relay process, so it
-cannot be reversed later and is never written anywhere. A relay-wide daily
+cannot be reversed later and is never written anywhere. Behind a proxy, the
+address is read from a header only when the relay listens on loopback and
+the proxy sets that header from a trusted source alone (the deploy playbook
+firewalls the origin to Cloudflare's ranges and takes the address from
+`CF-Connecting-IP` only on connections from them). A relay-wide daily
 ceiling bounds the total.
 
 ## `POST /v1/invoices`
@@ -53,7 +57,12 @@ Creates a Pro invoice. Body, all optional: `{"months": 1, "renew": "<token>"}`.
 ```
 
 The address is a fresh subaddress on the relay's **view-only** wallet, one per
-invoice; a renewal reuses the token's previous one. The price is per month and
+invoice; a renewal reuses the token's previous one, which is why only one
+invoice per token may be open at a time (a second one would be paid by the
+same transfer). Only a current, active **Pro** token can be renewed: a Free
+token has nothing to extend and a suspended one stays suspended; an expired
+Pro token is exactly what renewal is for, and its new validity runs from the
+payment. The price is per month and
 set by the operator in XMR (the promise is about nine dollars; there is no
 exchange-rate lookup in the relay). An invoice is open for 24 hours. Creation
 is throttled like free tokens.
@@ -65,7 +74,9 @@ expired`, `received_atomic` and `confirmations` updated from the wallet, and
 after payment, for a purchase, `token`: the Pro token. For a renewal there is
 no token to show; the renewed one simply runs longer.
 
-The invoice id is the only secret. Keep it until the token is in the wallet.
+The invoice id is the only secret. Keep it until the token is in the wallet:
+the token is shown for seven days after payment, then a leaked id recovers
+nothing. Status reads are throttled per client (a few hundred an hour).
 
 ### Payment rule
 

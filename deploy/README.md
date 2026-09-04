@@ -26,17 +26,26 @@ the restricted port opened.
   with a hardened unit (`ProtectSystem=strict`, private tmp, no new privileges).
 - `/etc/mnr/relay.toml` rendered from `relay.toml.j2`; the upstream list, caps,
   opt-outs and price come from the inventory.
-- Caddy on 443 for `mnr_domain`, ACME by e-mail, access log discarded,
-  `CF-Connecting-IP` forwarded as `X-Forwarded-For` only from Cloudflare's
-  ranges (`trusted_proxies cloudflare`). If the domain is not behind
-  Cloudflare, set `mnr_client_ip_header` to `X-Forwarded-For` and drop the
-  `header_up` line so Caddy's own client address is used.
+- Caddy on 443 for `mnr_domain`, ACME by e-mail, access log discarded. With
+  `mnr_behind_cloudflare` (default) 443 is firewalled to Cloudflare's ranges
+  (`group_vars/all.yml`, refresh them when Cloudflare does), Caddy trusts
+  `CF-Connecting-IP` only from those ranges and passes the result to the relay
+  as `X-Forwarded-For`; a direct connection forging the header is throttled by
+  its own address. Set `mnr_behind_cloudflare: false` for a bare origin: 443
+  opens to everyone and the socket peer is the client.
 - Tor with a v3 hidden service on the same relay; the address is printed at
   the end of the play and lives in `/var/lib/tor/mnr/hostname`.
 - `monero-wallet-rpc` **view-only** on loopback for invoices. The wallet is
   restored on first run from `mnr_wallet_address` and the vaulted view key;
   the spend key never touches this box.
 - Prometheus and node_exporter scraping the relay's private `/metrics`.
+
+## Back up the invoice secret
+
+`/var/lib/mnr/invoice-secret` (32 bytes, created on the first start) is what
+purchase tokens are derived from. Copy it into the vault after the first run.
+If it is lost, tokens already issued keep working, but an invoice can no
+longer show its token to a customer who did not save it.
 
 ## First run and checks
 

@@ -190,12 +190,29 @@
     mode: "0644"
   notify: restart prometheus
 
-- name: Allow HTTPS (and HTTP for ACME)
+# 443 only from Cloudflare when proxied (the throttle's client address is
+# trusted from there alone); 80 stays open for ACME HTTP-01.
+- name: Allow HTTP for ACME
   community.general.ufw:
     rule: allow
-    port: "{{ item }}"
+    port: "80"
     proto: tcp
-  loop: ["80", "443"]
+
+- name: Allow HTTPS from Cloudflare only
+  community.general.ufw:
+    rule: allow
+    port: "443"
+    proto: tcp
+    src: "{{ item }}"
+  loop: "{{ cloudflare_ipv4 + cloudflare_ipv6 }}"
+  when: mnr_behind_cloudflare
+
+- name: Allow HTTPS from everywhere
+  community.general.ufw:
+    rule: allow
+    port: "443"
+    proto: tcp
+  when: not mnr_behind_cloudflare
 
 - name: Enable services
   ansible.builtin.systemd:

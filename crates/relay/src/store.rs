@@ -115,6 +115,14 @@ impl Default for UsageState {
     }
 }
 
+/// What the storefront needs to know about a token before renewing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenState {
+    pub tier: Tier,
+    pub active: bool,
+    pub valid_until: Option<u64>,
+}
+
 /// One Pro invoice (plan §5 payments). Holds no client identity: the id is
 /// random, the subaddress is ours, and `renew_hash` is a token hash.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -483,6 +491,33 @@ impl SqliteStore {
     /// `None` for an unknown token.
     pub fn valid_until(&self, hash: &[u8; 32]) -> Option<Option<u64>> {
         self.tokens.read().get(hash).map(|r| r.valid_until)
+    }
+
+    /// Tier, whether it is active (not suspended), and `valid_until` of a
+    /// current token (a previous hash in its grace window does not count).
+    pub fn token_state(&self, hash: &[u8; 32]) -> Option<TokenState> {
+        let tokens = self.tokens.read();
+        let r = tokens.get(hash)?;
+        if r.prev_hash == Some(*hash) {
+            return None;
+        }
+        Some(TokenState {
+            tier: r.tier,
+            active: r.status == TokenStatus::Active,
+            valid_until: r.valid_until,
+        })
+    }
+
+    /// A pending invoice that would renew the token with this hash, if any.
+    pub fn pending_invoice_for(&self, hash: &[u8; 32]) -> Option<Invoice> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT id, subaddr_index, address, amount, months, renew_hash, created_at, expires_at, status, received, paid_at
+             FROM invoices WHERE renew_hash = ?1 AND status = 'pending' LIMIT 1",
+            params![hash.as_slice()],
+            Self::row_to_invoice,
+        )
+        .ok()
     }
 
     // ── invoices (storefront, plan §5) ──────────────────────────────────

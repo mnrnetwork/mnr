@@ -27,7 +27,7 @@ confirmations = 10
 free_per_day = {{ mnr_free_per_day | default(2000) }}
 per_client_per_hour = 3
 months_max = 12
-client_ip_header = "{{ mnr_client_ip_header | default('X-Forwarded-For') }}"
+client_ip_header = "X-Forwarded-For"     # set by Caddy from {client_ip}; never the raw CF header
 secret_file = "/var/lib/mnr/invoice-secret"
 cors_origin = "https://mnr.network"
 

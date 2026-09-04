@@ -115,6 +115,10 @@ pub struct BillingConfig {
     /// Issuances (free tokens and invoices) per client key per hour.
     #[serde(default = "default_per_client")]
     pub per_client_per_hour: u32,
+    /// Invoice status reads per client key per hour (the page polls every
+    /// 20 s; each read is one wallet-rpc call).
+    #[serde(default = "default_status_per_client")]
+    pub status_per_client_per_hour: u32,
     /// Longest Pro purchase, in months.
     #[serde(default = "default_months_max")]
     pub months_max: u32,
@@ -142,6 +146,9 @@ fn default_free_per_day() -> u64 {
 fn default_per_client() -> u32 {
     3
 }
+fn default_status_per_client() -> u32 {
+    400
+}
 fn default_months_max() -> u32 {
     12
 }
@@ -157,6 +164,7 @@ impl Default for BillingConfig {
             confirmations: default_confirmations(),
             free_per_day: default_free_per_day(),
             per_client_per_hour: default_per_client(),
+            status_per_client_per_hour: default_status_per_client(),
             months_max: default_months_max(),
             client_ip_header: None,
             secret_file: None,
