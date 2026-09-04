@@ -6,3 +6,4 @@
 opencode.json
 # local relay config may hold upstream secrets
 /relay.toml
+dist/
