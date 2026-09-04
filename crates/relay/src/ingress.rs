@@ -27,8 +27,9 @@ use crate::auth::{self, AuthError, Principal, TokenStore};
 use crate::cache::Cache;
 use crate::chain::ChainStore;
 use crate::dispatch::{self, Outcome};
-use crate::limits::{Limiter, Verdict, LIGHT_WU};
+use crate::limits::{Limiter, StreamPermit, Verdict, LIGHT_WU};
 use crate::metrics::Metrics;
+use crate::stream::Accounted;
 use crate::upstream::{Pool, PoolStatus};
 
 /// Shared state for every handler.
@@ -170,9 +171,9 @@ async fn rpc(
     }
 
     // Concurrent streams are capped per principal (plan §5): take a permit
-    // that the RAII guard releases when this request finishes. The permit
-    // must live for the whole dispatch, so it is bound for the handler.
-    let _stream_permit = if policy.class == Class::PassthroughStream {
+    // that the RAII guard releases when the response body is done. It is
+    // handed to the accounting stream in `respond`.
+    let stream_permit = if policy.class == Class::PassthroughStream {
         match app.limiter.take_stream(&principal) {
             Some(p) => Some(p),
             None => {
@@ -228,7 +229,7 @@ async fn rpc(
         &label("Mnr-Cache"),
         outcome.status,
     );
-    respond(outcome, &principal)
+    respond(outcome, &principal, &app.limiter, stream_permit)
 }
 
 /// `sub_…/json_rpc` → (token, "/json_rpc"); `json_rpc` → (None, "/json_rpc").
@@ -321,9 +322,29 @@ fn json_response<T: serde::Serialize>(
     r
 }
 
-fn respond(o: Outcome, principal: &Principal) -> Response {
+fn respond(
+    o: Outcome,
+    principal: &Principal,
+    limiter: &Arc<dyn Limiter>,
+    stream_permit: Option<StreamPermit>,
+) -> Response {
     let status = StatusCode::from_u16(o.status).unwrap_or(StatusCode::BAD_GATEWAY);
-    let mut r = (status, o.body).into_response();
+    let mut r = match o.stream {
+        Some(inner) => {
+            // The client's stream permit and the work-unit charge live with
+            // the body: released and settled when it ends or the client goes.
+            let counted =
+                Accounted::new(inner, Arc::clone(limiter), principal.clone(), stream_permit);
+            let mut r = (status, axum::body::Body::from_stream(counted)).into_response();
+            if let Some(n) = o.content_length {
+                if let Ok(v) = HeaderValue::from_str(&n.to_string()) {
+                    r.headers_mut().insert(header::CONTENT_LENGTH, v);
+                }
+            }
+            r
+        }
+        None => (status, o.body).into_response(),
+    };
     if let Ok(ct) = HeaderValue::from_str(&o.content_type) {
         r.headers_mut().insert(header::CONTENT_TYPE, ct);
     }

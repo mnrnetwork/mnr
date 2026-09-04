@@ -24,6 +24,7 @@ mod ingress;
 mod limits;
 mod metrics;
 mod store;
+mod stream;
 mod upstream;
 mod verify;
 

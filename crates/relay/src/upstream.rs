@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
+use futures_util::stream::{BoxStream, StreamExt, TryStreamExt};
 use mnr_core::hash::Hash;
 use mnr_core::verify::{quorum_tip, QuorumTip, TipReport};
 use mnr_core::wire::{GetInfoResult, JsonRpcRequest, JsonRpcResponse};
@@ -27,6 +28,7 @@ use serde::Serialize;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::config::{Config, Kind, Transport, UpstreamConfig};
+use crate::stream::{throttled, ByteBucket, Throttled};
 
 /// EMA smoothing for RTT (gateway plan §3.5: alpha 0.3).
 const RTT_ALPHA: f64 = 0.3;
@@ -40,14 +42,10 @@ const FAULT_LIMIT: usize = 3;
 const EJECT_FOR: Duration = Duration::from_secs(24 * 3600);
 /// Newest fault events kept for the public log.
 const FAULT_LOG_MAX: usize = 1000;
-/// Largest upstream response we buffer. monerod caps `get_blocks.bin`
-/// chunks well below this; it bounds the work units a single stream
-/// request can charge after admission.
+/// Largest *buffered* upstream response (light calls). Streams are not
+/// buffered; they are paced by the bandwidth cap and bounded by
+/// `stream::MAX_STREAM_BYTES`.
 const MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
-// NOT YET ENFORCED (plan §7 week 4): the per-upstream `caps.mbps` bandwidth
-// ceiling. Light rps and stream slots are enforced here; bytes per second
-// are only published, not throttled, until the stream path streams instead
-// of buffering.
 
 /// What kind of work a caller wants an upstream for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,6 +114,9 @@ pub struct Upstream {
     light: Mutex<LightBucket>,
     /// Rule 3: concurrent `get_blocks.bin` streams against this node.
     streams: Arc<Semaphore>,
+    /// Rule 3: bytes per second we allow ourselves to pull from this node,
+    /// shared by all its streams.
+    bandwidth: Arc<Mutex<ByteBucket>>,
 }
 
 /// Token bucket for the per-upstream light-call cap. Capacity equals one
@@ -155,6 +156,16 @@ pub struct Forwarded {
     pub status: u16,
     pub content_type: Option<String>,
     pub body: Bytes,
+}
+
+/// A streamed upstream response: headers now, body as it arrives, paced by
+/// the upstream's bandwidth cap and holding its stream slot.
+pub struct Streamed {
+    pub status: u16,
+    pub content_type: Option<String>,
+    /// The upstream's `Content-Length`, when it sent one.
+    pub content_length: Option<u64>,
+    pub body: Throttled,
 }
 
 /// Why a forward did not produce a response. `Cap` and the transport errors
@@ -244,6 +255,9 @@ impl Pool {
                     id,
                     light: Mutex::new(LightBucket::new(u.caps.rps_light)),
                     streams: Arc::new(Semaphore::new(u.caps.max_streams as usize)),
+                    bandwidth: Arc::new(Mutex::new(ByteBucket::new(
+                        u64::from(u.caps.mbps) * 1_000_000,
+                    ))),
                     cfg: u,
                     client,
                     timeout,
@@ -559,6 +573,49 @@ impl Upstream {
             status,
             content_type,
             body,
+        })
+    }
+
+    /// Forward a client body and return the answer as a stream (the
+    /// `get_blocks.bin` family). `timeout` bounds the wait for the response
+    /// headers; the body is bounded by the idle timeout and size ceiling of
+    /// [`crate::stream`]. Rule 6 applies exactly as in [`Upstream::forward`].
+    /// `slot` is this upstream's stream permit; the returned body owns it.
+    pub async fn forward_stream(
+        &self,
+        path: &str,
+        content_type: &str,
+        body: Bytes,
+        timeout: Duration,
+        slot: OwnedSemaphorePermit,
+    ) -> Result<Streamed, ForwardError> {
+        self.requests.fetch_add(1, Ordering::Relaxed);
+        let url = format!("{}{}", self.cfg.url.trim_end_matches('/'), path);
+        let send = self
+            .client
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, content_type)
+            .header(reqwest::header::ACCEPT, content_type)
+            .body(body)
+            .send();
+        let resp = tokio::time::timeout(timeout, send)
+            .await
+            .map_err(|_| ForwardError::Timeout)?
+            .map_err(classify)?;
+        let status = resp.status().as_u16();
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let content_length = resp.content_length();
+        let inner: BoxStream<'static, Result<Bytes, ForwardError>> =
+            resp.bytes_stream().map_err(classify).boxed();
+        Ok(Streamed {
+            status,
+            content_type,
+            content_length,
+            body: throttled(inner, Arc::clone(&self.bandwidth), slot),
         })
     }
 

@@ -208,6 +208,8 @@ fn annotated(
             .clone()
             .unwrap_or_else(|| "application/json".to_owned()),
         body: f.body.clone(),
+        stream: None,
+        content_length: None,
         headers,
         extra_wu: 0,
     }

@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use futures_util::stream::{BoxStream, StreamExt};
 use mnr_core::policy::{Class, Policy, TIP_SAFETY_DEPTH};
 use mnr_core::wire::{GetTransactionsResult, JsonRpcResponse};
 use serde_json::{json, Value};
@@ -34,7 +35,6 @@ use crate::auth::Tier;
 use crate::cache::{Cache, Cached, Status};
 use crate::chain::ChainStore;
 use crate::consensus;
-use crate::limits::{stream_wu, LIGHT_WU};
 use crate::upstream::{ForwardError, Forwarded, Pool, Work};
 use crate::verify::{self, batch_label, Fault, TxCheck, Verify};
 
@@ -72,15 +72,34 @@ pub struct Request {
 }
 
 /// What the ingress turns into an HTTP response.
-#[derive(Debug, Clone)]
 pub struct Outcome {
     pub status: u16,
     pub content_type: String,
+    /// The whole body, unless `stream` is set.
     pub body: Bytes,
+    /// A streamed body (the `get_blocks.bin` family): the ingress sends it
+    /// through as it arrives, counting bytes for the work-unit charge.
+    pub stream: Option<BoxStream<'static, Result<Bytes, std::io::Error>>>,
+    /// The upstream's `Content-Length` for a streamed body, when known.
+    pub content_length: Option<u64>,
     /// `Mnr-*` headers to add.
     pub headers: Vec<(&'static str, String)>,
-    /// Work units this request cost beyond the one charged at admission.
+    /// Work units this request cost beyond the one charged at admission
+    /// (buffered bodies only; streams are charged as they flow).
     pub extra_wu: u64,
+}
+
+impl std::fmt::Debug for Outcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Outcome")
+            .field("status", &self.status)
+            .field("content_type", &self.content_type)
+            .field("body_len", &self.body.len())
+            .field("stream", &self.stream.is_some())
+            .field("headers", &self.headers)
+            .field("extra_wu", &self.extra_wu)
+            .finish()
+    }
 }
 
 impl Outcome {
@@ -94,6 +113,8 @@ impl Outcome {
             status,
             content_type: "application/json".into(),
             body: Bytes::from(body.to_string()),
+            stream: None,
+            content_length: None,
             headers: vec![
                 ("Mnr-Verify", verify.label().into()),
                 ("Mnr-Cache", Status::Bypass.label().into()),
@@ -107,6 +128,8 @@ impl Outcome {
             status: 200,
             content_type: "application/json".into(),
             body: Bytes::from(body),
+            stream: None,
+            content_length: None,
             headers,
             extra_wu: 0,
         }
@@ -546,6 +569,9 @@ pub(crate) async fn read(
     )
 }
 
+/// Streams take a stream slot, prefer the owned node, and are sent through
+/// as they arrive (see [`crate::stream`]): paced by the upstream's
+/// bandwidth cap, cut on a 15 s upstream silence, never buffered.
 async fn stream(
     pool: &Pool,
     path: &str,
@@ -559,13 +585,29 @@ async fn stream(
     }
     for id in ranked {
         let u = pool.upstream(id);
-        let Some(_slot) = u.try_take_stream() else {
+        let Some(slot) = u.try_take_stream() else {
             continue;
         };
-        match u.forward(path, content_type, body.clone(), timeout).await {
-            Ok(f) if f.status < 500 => {
-                let wu = stream_wu(f.body.len() as u64).saturating_sub(LIGHT_WU);
-                return passthrough(f, id, wu);
+        match u
+            .forward_stream(path, content_type, body.clone(), timeout, slot)
+            .await
+        {
+            Ok(s) if s.status < 500 => {
+                return Outcome {
+                    status: s.status,
+                    content_type: s
+                        .content_type
+                        .unwrap_or_else(|| "application/octet-stream".to_owned()),
+                    body: Bytes::new(),
+                    stream: Some(s.body.boxed()),
+                    content_length: s.content_length,
+                    headers: vec![
+                        ("Mnr-Verify", Verify::None.label().into()),
+                        ("Mnr-Cache", Status::Bypass.label().into()),
+                        ("Mnr-Upstream", id.to_string()),
+                    ],
+                    extra_wu: 0,
+                };
             }
             Ok(_) | Err(_) => continue,
         }
@@ -650,6 +692,8 @@ fn passthrough(f: Forwarded, upstream: usize, extra_wu: u64) -> Outcome {
             .content_type
             .unwrap_or_else(|| "application/json".to_owned()),
         body: f.body,
+        stream: None,
+        content_length: None,
         headers: vec![
             ("Mnr-Verify", Verify::None.label().into()),
             ("Mnr-Cache", Status::Bypass.label().into()),
@@ -1079,6 +1123,39 @@ mod tests {
             .await;
         assert_eq!(header(&o, "Mnr-Cache"), Some("miss"));
         assert_eq!(hits.load(Ordering::SeqCst), 4, "bad, good, bad, good");
+    }
+
+    #[tokio::test]
+    async fn streams_are_sent_through_and_release_the_slot_when_dropped() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let big = mock_with(
+            Arc::new(|_, _| (200, "x".repeat(300_000))),
+            Arc::clone(&hits),
+        )
+        .await;
+        let env = Env::new(pool_over(&[big]));
+        let mut o = env
+            .legacy("/get_blocks.bin", json!({"start_height": 0}))
+            .await;
+        assert_eq!(o.status, 200);
+        assert_eq!(header(&o, "Mnr-Verify"), Some("none"));
+        assert_eq!(header(&o, "Mnr-Cache"), Some("bypass"));
+        assert_eq!(o.content_length, Some(300_000));
+        assert_eq!(o.extra_wu, 0, "streams are charged as they flow");
+        let mut s = o.stream.take().expect("a streamed body");
+        let u = env.pool.upstream(0);
+        let held = u.try_take_stream().expect("one of two slots is free");
+        assert!(u.try_take_stream().is_none(), "the stream holds the other");
+        let mut total = 0;
+        while let Some(c) = s.next().await {
+            total += c.unwrap().len();
+        }
+        assert_eq!(total, 300_000);
+        drop(s);
+        drop(held);
+        let a = u.try_take_stream();
+        let b = u.try_take_stream();
+        assert!(a.is_some() && b.is_some(), "both slots free again");
     }
 
     #[tokio::test]
