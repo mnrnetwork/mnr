@@ -334,13 +334,13 @@ Capacity ceiling for the 3-node mesh (to be replaced by measured numbers at M6):
 
 ---
 
-## 11. Open decisions (need an owner, not a reviewer)
+## 11. Decisions (closed 2026-09-04)
 
-1. Domain and brand name confirmation ("Monero RPC Gateway" as product; domain TBD).
-2. Provider choice for node-b and node-c (OVH vs Vultr vs Latitude) — decide by NVMe IOPS and ASN diversity, not price alone.
-3. Whether Free tier survives launch or becomes a zero-amount 7-day trial.
-4. Business SLA number: this plan proposes 99.9% (see Ops doc) instead of the original 99.95%; confirm.
-5. Language for the Basic-auth tenant id (random id vs derived from token hash prefix).
+1. **Brand and domain:** mnr, at `mnr.network`. "Monero RPC Gateway" is the descriptor of the Stage 1 product, not its name; the offering is sold as mnr's paid tier with an SLA.
+2. **Providers for node-b and node-c:** OVH and Vultr, as in the §2 diagram, giving three ASNs with Hetzner for node-a. Revisit only if an NVMe IOPS benchmark on the chosen box fails the LMDB sync test; price alone does not reopen this.
+3. **Free tier:** survives launch as a permanent tier, not a trial. It is the Stage 0 product, the funnel to Pro, and the reason the public-node rules exist.
+4. **Business SLA:** 99.9%, as this plan proposes. 99.95% is not credible with three nodes and one edge.
+5. **Basic-auth tenant id:** derived from the token, the 8-character prefix of its SHA-256 (the same handle used in error samples and the `token` CLI). No second identifier to store or leak; the username field is free-form for wallets that require one.
 
 ---
 

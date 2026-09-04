@@ -3,7 +3,7 @@ name = "mnr-core"
 description = "mnr — an RPC network for Monero: wire types, hashing, verification, method policy, header chain. No I/O."
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license = "MIT OR Apache-2.0"
 repository.workspace = true
 rust-version.workspace = true
 

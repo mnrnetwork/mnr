@@ -31,6 +31,7 @@ The method policy table is code: `mnr-core::policy` is canonical, checked in tes
 
 ## Conventions
 
+- Licenses: AGPL-3.0-only for the workspace, MIT OR Apache-2.0 for `crates/core` (`mnr-core` must stay embeddable by wallets; keep it free of AGPL dependencies).
 - Rust 2021, stable toolchain, `cargo fmt` + `cargo clippy -D warnings` clean before commit. tokio + axum + rustls; `moka` for cache; `rusqlite` for state; `governor` for rate limiting.
 - Monero serialization/hashing: prefer the `monero-serai` family of crates; wrap them behind `mnr-core::hash` so a crate swap never touches the relay. Every hashing function has fixture tests from real mainnet + stagenet blocks (include hard-fork boundary blocks, coinbase-only blocks, pruned and unpruned tx forms).
 - Tests: `cargo test` for units; `sim/` for integration; differential tests against a real `monerod` for `wire`/`hash`.
@@ -55,4 +56,4 @@ The method policy table is code: `mnr-core::policy` is canonical, checked in tes
 
 `docs/` holds the engineering history; the original aggregator doc, the business plans and the profit model live in the private `mnrnetwork/internal` repo (local: `../internal`). Three independent reviews shaped Stage 1; Stage 2 adds the operator network with mechanisms borrowed from THORChain (probation lane, payout splits, affiliate share, work-weighted votes). When a question is "why is it like this", the answer is in those documents; when a question is "what do I build next", the answer is `docs/stage0-mvp-plan.md` §7.
 
-Open decisions the founders have not made yet are listed at the end of each plan; do not resolve them silently in code — flag them.
+Decisions are recorded at the end of each plan (the former open-question lists, closed 2026-09-04). A new open question goes there as an item, not into code; do not resolve one silently.

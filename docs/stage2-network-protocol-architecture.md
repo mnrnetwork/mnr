@@ -293,16 +293,16 @@ The plan assumes two engineers. If it is one person, P3 slips beyond month 18 an
 
 ---
 
-## 7. Open questions for the founders
+## 7. Decisions (closed 2026-09-04)
 
-1. ~~Name and domain.~~ Decided 2026-09: **mnr**, at `mnr.network`, org `mnrnetwork` on GitHub.
-2. License confirmation: AGPL-3.0 for agent/relay, MIT/Apache for `mnr-core` and `mnr-client` (so wallets can embed them) — recommended split.
-3. Whether the reference relayer's `.onion` is the *primary* advertised endpoint or the clearnet one (affects marketing more than engineering).
-4. Whether to seek spec review from specific Monero developers before P1, and whether to submit `mnr-core` hashing tests upstream to the crates it depends on.
-5. Which 10 operators to invite for the P2 beta (community node runners with a track record).
-6. Counsel jurisdiction for §6.12 — the same open item as the gateway direction's ops doc.
-7. Which THORChain interfaces and bot operators to approach in week 1 for the P1-min track (their requirements shape the `get_outs` agreement rule and the burst limits).
-8. Affiliate default (15%) and probation weight (10%) — both are snapshot parameters, but the initial values set expectations.
+1. **Name and domain:** mnr, at `mnr.network`, org `mnrnetwork` on GitHub.
+2. **Licenses:** AGPL-3.0 for `mnr-agent` and `mnr-relay`; `mnr-core` and `mnr-client` dual-licensed MIT OR Apache-2.0 so wallets can embed them. Applied to `mnr-core` in the workspace.
+3. **Primary endpoint:** clearnet, `rpc.mnr.network`, is the advertised endpoint; the `.onion` is published beside it as an equal alternative, never as the headline. Most wallets and all backends reach clearnet first.
+4. **External review:** yes to both. Seek spec review from Monero developers before P1, after the Stage 0 beta has real traffic to show; submit `mnr-core`'s hashing fixtures upstream to `monero-oxide` as a test-only PR once the fixture set includes stagenet.
+5. **P2 beta operators:** chosen by rule, not by list: the ten Stage 0 upstream operators with the longest verified uptime on the public upstreams page who answered the operator notice. B produces the list at P2 from the status history.
+6. **Counsel jurisdiction:** the jurisdiction of the founders' operating entity. Counsel is engaged before the first paid invoice, not for Stage 0.
+7. **P1-min track:** deferred until the Stage 0 gate in `stage0-mvp-plan.md` §9 is met. First approach is to swap interfaces that already run their own `monerod`, since they are the ones with a `get_outs` agreement requirement and measured burst needs.
+8. **Parameters:** affiliate share 15%, probation weight 10%, as proposed. Both are snapshot parameters and can move by governance vote later.
 
 ---
 

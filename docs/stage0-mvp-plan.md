@@ -151,10 +151,12 @@ Collect three numbers weekly from week 6: **paying Pro tokens**, **WU served per
 
 ---
 
-## 10. Decisions for the two of you this week
+## 10. Decisions (closed 2026-09-04)
 
-1. Confirm the $9 Pro price and Free allowance (500k WU/month).
-2. Provider for the owned node (different from the relayer VPS's provider).
-3. Whether to require two-upstream `get_outs` agreement for Free as well (safer, roughly halves Free capacity).
-4. Who signs the upstream-operator notices (B, in their own name or the project's).
-5. Whether to include `.onion` upstreams at launch or in week 5 (they add Tor plumbing to week 4).
+Recorded here so nothing in the code resolves them silently. Changing one is a plan edit, not a code edit.
+
+1. **Pricing:** Pro is $9/month, Free is 500k WU/month. Confirmed; the tier table in §5 is the contract and `mnr-relay` enforces it.
+2. **Owned node provider:** a Hetzner dedicated box with NVMe (auction line), per the gateway plan's provider guidance. The relayer VPS goes to a different provider and ASN (Vultr or OVH), so the two boxes never share a failure domain.
+3. **`get_outs` for Free:** single upstream, owned node preferred. Two-upstream agreement stays a Pro feature; Free capacity is the reason. Encoded as `Agreement { free: 1, pro: 2 }` in `mnr-core::policy`.
+4. **Operator notices:** signed in the project's name, "mnr (mnr.network)", with B's name as the human contact and the opt-out link. Operators should know who to answer to, and the project name is what they will see in the `User-Agent`.
+5. **`.onion` upstreams:** week 5, after the public beta. Launch is clearnet upstreams only; the relay already accepts `transport = "onion"` and `tor_socks`, so adding them is a config change once Tor is on the box.

@@ -14,9 +14,8 @@
 //!   (`Mnr-Relayed: k/n`, `Mnr-Verify: none`, `Mnr-Upstream: <n>`).
 //! - `/get_outs.bin` uses **two-upstream agreement for Pro tokens** and a single
 //!   upstream (the owned node preferred) for Free. This is modelled here as a
-//!   per-tier [`Verification`] rule ([`Verification::Agreement`]). Whether Free
-//!   also gets two-upstream agreement is an **open decision**
-//!   (`stage0-mvp-plan.md` §10 item 3) — flagged, not silently resolved.
+//!   per-tier [`Verification`] rule ([`Verification::Agreement`]). Decided
+//!   2026-09-04 (`stage0-mvp-plan.md` §10 item 3): Free stays single-upstream.
 //!
 //! This is an **allow-list**: a method not in [`TABLE`] is denied. [`lookup`]
 //! returns `None` for it and [`lookup_or_deny`] returns the deny fallback.
@@ -461,7 +460,7 @@ static TABLE: &[Policy] = &[
     outputs_conditional(
         "/get_outs.bin",
         Transport::LegacyPath,
-        "Ring construction; correctness > hit rate. Stage 0: two-upstream agreement for Pro tokens, single upstream (owned node preferred) for Free. Free-tier two-upstream agreement is an open decision (plan §10 item 3).",
+        "Ring construction; correctness > hit rate. Stage 0: two-upstream agreement for Pro tokens, single upstream (owned node preferred) for Free (plan §10 item 3, decided).",
     ),
     outputs_conditional("/get_outs", Transport::LegacyPath, "JSON twin of /get_outs.bin; same per-tier agreement."),
     outputs_conditional(
