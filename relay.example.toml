@@ -8,6 +8,18 @@ listen = "127.0.0.1:18089"          # TLS is terminated in front of this
 # user_agent = "mnr-relay/0.1 (+https://mnr.network/upstreams)"  # must identify mnr
 # tor_socks = "127.0.0.1:9050"      # required if any upstream is transport = "onion"
 
+# Operators who asked to be removed (rule 5). An upstream on this list is
+# refused at load, not merely deprioritised. The list is public. The relay
+# also reads https://<host>/.well-known/mnr-optout on every upstream host at
+# start and daily: an HTTP 200 there takes the host out of rotation at once
+# and logs an error asking for it to be added here.
+opt_out = []
+
+# Not configurable, stated for the record (rule 3): a read queues up to
+# 250 ms for a light-call token on the best-ranked public upstream (1 s on
+# the owned node) before trying the next one; streams are paced to `mbps`
+# and cut after 15 s of upstream silence or 1 GiB.
+
 [probe]
 interval_secs = 15
 clearnet_timeout_ms = 2000
@@ -40,18 +52,6 @@ max_bytes = 1073741824               # 1 GiB for the immutable tier
 # address). Bind it to a private interface; leave unset to disable.
 [metrics]
 listen = "127.0.0.1:9187"
-
-# Operators who asked to be removed (rule 5). An upstream on this list is
-# refused at load, not merely deprioritised. The list is public. The relay
-# also reads https://<host>/.well-known/mnr-optout on every upstream host at
-# start and daily: an HTTP 200 there takes the host out of rotation at once
-# and logs an error asking for it to be added here.
-opt_out = []
-
-# Not configurable, stated for the record (rule 3): a read queues up to
-# 250 ms for a light-call token on the best-ranked public upstream (1 s on
-# the owned node) before trying the next one; streams are paced to `mbps`
-# and cut after 15 s of upstream silence or 1 GiB.
 
 [[upstreams]]
 name = "own-1"

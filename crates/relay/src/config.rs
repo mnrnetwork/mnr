@@ -397,6 +397,19 @@ transport = "https"
         assert!(c.user_agent().contains(UA_LINK));
     }
 
+    /// The shipped example must always parse: a section added above a
+    /// top-level key once swallowed `opt_out` into `[metrics]`.
+    #[test]
+    fn example_config_parses() {
+        let text = include_str!("../../../relay.example.toml");
+        let c = Config::parse(text).unwrap();
+        assert_eq!(c.upstreams.len(), 5);
+        assert!(c.opt_out.is_empty());
+        assert_eq!(c.metrics.listen.map(|a| a.port()), Some(9187));
+        assert_eq!(c.chain.path.as_deref(), Some(Path::new("headers.mnrh")));
+        assert_eq!(c.cache.max_bytes, 1 << 30);
+    }
+
     #[test]
     fn opt_out_url_is_the_host_web_root() {
         let c = Config::parse(&format!("{PROBE1}{MINIMAL}")).unwrap();
