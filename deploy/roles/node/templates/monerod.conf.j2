@@ -1,0 +1,22 @@
+# {{ ansible_managed }}
+# Restricted RPC for everyone (rule 2: our node is a public node like any
+# other); the unrestricted RPC stays on loopback for the operator only.
+data-dir=/var/lib/monero/.bitmonero
+log-level=0
+max-log-file-size=0
+
+p2p-bind-ip=0.0.0.0
+p2p-bind-port={{ monerod_p2p_port }}
+public-node=1
+out-peers=32
+in-peers=64
+
+rpc-bind-ip=127.0.0.1
+rpc-bind-port=18081
+rpc-restricted-bind-ip=0.0.0.0
+rpc-restricted-bind-port={{ monerod_public_rpc_port }}
+confirm-external-bind=1
+
+enable-dns-blocklist=1
+prune-blockchain=0
+db-sync-mode=safe

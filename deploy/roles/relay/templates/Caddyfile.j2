@@ -1,0 +1,25 @@
+# {{ ansible_managed }}
+# TLS for the public name; everything proxied to the relay on loopback.
+# No access log (invariant 6). Behind Cloudflare, the client address for the
+# storefront throttle arrives in CF-Connecting-IP and is passed on as
+# X-Forwarded-For only from Cloudflare's ranges (trusted_proxies).
+{
+	email {{ mnr_contact }}
+	servers {
+		trusted_proxies cloudflare
+	}
+}
+
+{{ mnr_domain }} {
+	log {
+		output discard
+	}
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:18089 {
+		header_up X-Forwarded-For {http.request.header.CF-Connecting-IP}
+		flush_interval -1
+		transport http {
+			read_timeout 120s
+		}
+	}
+}

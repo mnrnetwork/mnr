@@ -1,0 +1,24 @@
+# mnr — Stage 0 deployment (docs/stage0-mvp-plan.md §6, §7 column B).
+#
+#   ansible-playbook -i ../../internal/deploy/inventory.yml site.yml
+#
+# Two hosts: the relayer VPS (`relay` group) and the owned node (`node`
+# group), on different providers. Inventory, vault and secrets live in the
+# private `internal` repo; `inventory.example.yml` shows the shape.
+- name: Every box
+  hosts: all
+  become: true
+  roles:
+    - common
+
+- name: Owned Monero node
+  hosts: node
+  become: true
+  roles:
+    - node
+
+- name: Relayer
+  hosts: relay
+  become: true
+  roles:
+    - relay

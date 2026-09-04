@@ -1,0 +1,22 @@
+- name: restart mnr-relay
+  ansible.builtin.systemd:
+    name: mnr-relay
+    state: restarted
+    daemon_reload: true
+- name: restart wallet-rpc
+  ansible.builtin.systemd:
+    name: monero-wallet-rpc
+    state: restarted
+    daemon_reload: true
+- name: reload caddy
+  ansible.builtin.systemd:
+    name: caddy
+    state: reloaded
+- name: restart tor
+  ansible.builtin.systemd:
+    name: tor
+    state: restarted
+- name: restart prometheus
+  ansible.builtin.systemd:
+    name: prometheus
+    state: restarted

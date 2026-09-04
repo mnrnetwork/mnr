@@ -1,0 +1,225 @@
+# The relayer box (plan §6): mnr-relay on loopback, Caddy in front for TLS,
+# Tor for the .onion, a view-only monero-wallet-rpc for invoices, Prometheus
+# scraping the private /metrics listener. No request logs anywhere: Caddy's
+# access log is off, the relay never writes one.
+- name: Packages
+  ansible.builtin.apt:
+    name: [tor, prometheus, prometheus-node-exporter, debian-keyring, debian-archive-keyring, apt-transport-https, gnupg]
+    state: present
+    update_cache: true
+
+- name: Caddy apt key
+  ansible.builtin.get_url:
+    url: https://dl.cloudsmith.io/public/caddy/stable/gpg.key
+    dest: /usr/share/keyrings/caddy-stable-archive-keyring.asc
+    mode: "0644"
+
+- name: Caddy apt repo
+  ansible.builtin.apt_repository:
+    repo: "deb [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.asc] https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main"
+    state: present
+    filename: caddy-stable
+
+- name: Caddy
+  ansible.builtin.apt:
+    name: caddy
+    state: present
+    update_cache: true
+
+- name: mnr user
+  ansible.builtin.user:
+    name: mnr
+    system: true
+    home: /var/lib/mnr
+    create_home: true
+    shell: /usr/sbin/nologin
+
+- name: Config directory
+  ansible.builtin.file:
+    path: /etc/mnr
+    state: directory
+    owner: root
+    group: mnr
+    mode: "0750"
+
+- name: Release binary (from the GitHub release, checksum verified)
+  ansible.builtin.get_url:
+    url: "https://github.com/mnrnetwork/mnr/releases/download/{{ mnr_release }}/mnr-relay-{{ mnr_release }}-{{ mnr_target | default('x86_64-unknown-linux-gnu') }}.tar.gz"
+    dest: "/var/lib/mnr/mnr-relay-{{ mnr_release }}.tar.gz"
+    checksum: "sha256:https://github.com/mnrnetwork/mnr/releases/download/{{ mnr_release }}/SHA256SUMS"
+    mode: "0644"
+  register: mnr_download
+
+- name: Unpack the binary
+  ansible.builtin.unarchive:
+    src: "/var/lib/mnr/mnr-relay-{{ mnr_release }}.tar.gz"
+    dest: /usr/local/bin
+    remote_src: true
+    include: [mnr-relay]
+    mode: "0755"
+  when: mnr_download.changed
+  notify: restart mnr-relay
+
+- name: Relay config
+  ansible.builtin.template:
+    src: relay.toml.j2
+    dest: /etc/mnr/relay.toml
+    owner: root
+    group: mnr
+    mode: "0640"
+  notify: restart mnr-relay
+
+- name: Relay service
+  ansible.builtin.template:
+    src: mnr-relay.service.j2
+    dest: /etc/systemd/system/mnr-relay.service
+    mode: "0644"
+  notify: restart mnr-relay
+
+# ── view-only wallet for invoices ──
+- name: monero CLI tools for wallet-rpc
+  ansible.builtin.get_url:
+    url: "https://downloads.getmonero.org/cli/monero-linux-x64-{{ monero_cli_version | default('v0.18.5.0') }}.tar.bz2"
+    dest: "/var/lib/mnr/monero-cli.tar.bz2"
+    mode: "0644"
+
+- name: Unpack wallet-rpc
+  ansible.builtin.unarchive:
+    src: /var/lib/mnr/monero-cli.tar.bz2
+    dest: /var/lib/mnr
+    remote_src: true
+    creates: "/var/lib/mnr/monero-x86_64-linux-gnu-{{ monero_cli_version | default('v0.18.5.0') }}/monero-wallet-rpc"
+
+- name: Link monero-wallet-rpc
+  ansible.builtin.file:
+    src: "/var/lib/mnr/monero-x86_64-linux-gnu-{{ monero_cli_version | default('v0.18.5.0') }}/monero-wallet-rpc"
+    dest: /usr/local/bin/monero-wallet-rpc
+    state: link
+
+- name: Wallet directory
+  ansible.builtin.file:
+    path: /var/lib/mnr/wallet
+    state: directory
+    owner: mnr
+    group: mnr
+    mode: "0700"
+
+# The view-only wallet is generated once from the address and the private
+# view key (from the vault) through a temporary wallet-rpc on another port;
+# the spend key never comes near this box.
+- name: Does the wallet exist
+  ansible.builtin.stat:
+    path: /var/lib/mnr/wallet/invoices.keys
+  register: invoices_keys
+
+- name: Generate the view-only wallet (first run only)
+  when: not invoices_keys.stat.exists
+  block:
+    - name: Temporary wallet-rpc for generation
+      ansible.builtin.shell: >
+        setsid /usr/local/bin/monero-wallet-rpc
+        --daemon-address {{ mnr_wallet_daemon | default('https://node.kyc.rip') }} --trusted-daemon
+        --wallet-dir /var/lib/mnr/wallet --rpc-bind-ip 127.0.0.1 --rpc-bind-port 18083
+        --disable-rpc-login --log-level 0 --max-log-file-size 0
+        > /dev/null 2>&1 < /dev/null &
+      become_user: mnr
+      changed_when: true
+
+    - name: generate_from_keys (view key only)
+      ansible.builtin.uri:
+        url: http://127.0.0.1:18083/json_rpc
+        method: POST
+        body_format: json
+        body:
+          jsonrpc: "2.0"
+          id: "0"
+          method: generate_from_keys
+          params:
+            filename: invoices
+            address: "{{ mnr_wallet_address }}"
+            viewkey: "{{ mnr_wallet_viewkey }}"
+            password: ""
+            restore_height: "{{ mnr_wallet_restore_height | default(0) | int }}"
+            autosave_current: true
+      register: gen
+      retries: 10
+      delay: 3
+      until: gen.status == 200
+      no_log: true
+
+    - name: Close and stop the temporary wallet-rpc
+      ansible.builtin.uri:
+        url: http://127.0.0.1:18083/json_rpc
+        method: POST
+        body_format: json
+        body: { jsonrpc: "2.0", id: "0", method: close_wallet }
+      failed_when: false
+
+    - name: Kill the temporary wallet-rpc
+      ansible.builtin.shell: pkill -u mnr -f 'rpc-bind-port 18083' || true
+      changed_when: true
+
+- name: Wallet-rpc service
+  ansible.builtin.template:
+    src: monero-wallet-rpc.service.j2
+    dest: /etc/systemd/system/monero-wallet-rpc.service
+    mode: "0644"
+  notify: restart wallet-rpc
+
+# ── Caddy: TLS on the domain, proxy to loopback, no access log ──
+- name: Caddyfile
+  ansible.builtin.template:
+    src: Caddyfile.j2
+    dest: /etc/caddy/Caddyfile
+    mode: "0644"
+  notify: reload caddy
+
+# ── Tor hidden service → .onion for the same relay ──
+- name: torrc
+  ansible.builtin.template:
+    src: torrc.j2
+    dest: /etc/tor/torrc
+    mode: "0644"
+  notify: restart tor
+
+# ── Prometheus scrapes the private listener only ──
+- name: Prometheus config
+  ansible.builtin.template:
+    src: prometheus.yml.j2
+    dest: /etc/prometheus/prometheus.yml
+    mode: "0644"
+  notify: restart prometheus
+
+- name: Allow HTTPS (and HTTP for ACME)
+  community.general.ufw:
+    rule: allow
+    port: "{{ item }}"
+    proto: tcp
+  loop: ["80", "443"]
+
+- name: Enable services
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    enabled: true
+    state: started
+    daemon_reload: true
+  loop: [monero-wallet-rpc, mnr-relay, caddy, tor, prometheus, prometheus-node-exporter]
+
+- name: Wait for the relay
+  ansible.builtin.uri:
+    url: http://127.0.0.1:18089/healthz
+    status_code: [200, 503]
+  register: healthz
+  retries: 12
+  delay: 5
+  until: healthz.status in [200, 503]
+
+- name: Read the onion address
+  ansible.builtin.slurp:
+    src: /var/lib/tor/mnr/hostname
+  register: onion
+  failed_when: false
+
+- name: Report
+  ansible.builtin.debug:
+    msg: "relay {{ mnr_domain }} healthz={{ healthz.status }} onion={{ (onion.content | default('') | b64decode) | trim }}"

@@ -1,0 +1,7 @@
+# {{ ansible_managed }}
+# The .onion serves the same relay on port 80 (Tor carries the encryption).
+SocksPort 127.0.0.1:9050
+HiddenServiceDir /var/lib/tor/mnr/
+HiddenServiceVersion 3
+HiddenServicePort 80 127.0.0.1:18089
+Log notice syslog

@@ -1,0 +1,47 @@
+# {{ ansible_managed }} — see relay.example.toml in the repo for every key.
+listen = "127.0.0.1:18089"            # Caddy terminates TLS in front
+# tor_socks = "127.0.0.1:9050"        # enable when onion upstreams are added (plan §10 item 5)
+
+opt_out = {{ mnr_opt_out | default([]) | to_json }}
+
+[probe]
+interval_secs = 15
+clearnet_timeout_ms = {{ mnr_clearnet_timeout_ms | default(2000) }}
+onion_timeout_ms = 8000
+min_agree = {{ mnr_min_agree | default(3) }}
+
+[auth]
+database = "/var/lib/mnr/relay.db"
+
+[chain]
+path = "/var/lib/mnr/headers.mnrh"
+batch = 1000
+
+[cache]
+max_bytes = {{ mnr_cache_bytes | default(1073741824) }}
+
+[billing]
+wallet_rpc = "http://127.0.0.1:18082/json_rpc"
+pro_price_atomic = {{ mnr_pro_price_atomic | default(60000000000) }}
+confirmations = 10
+free_per_day = {{ mnr_free_per_day | default(2000) }}
+per_client_per_hour = 3
+months_max = 12
+client_ip_header = "{{ mnr_client_ip_header | default('X-Forwarded-For') }}"
+secret_file = "/var/lib/mnr/invoice-secret"
+cors_origin = "https://mnr.network"
+
+[metrics]
+listen = "127.0.0.1:9187"
+
+{% for u in mnr_upstreams %}
+[[upstreams]]
+name = "{{ u.name }}"
+url = "{{ u.url }}"
+kind = "{{ u.kind }}"
+transport = "{{ u.transport }}"
+{% if u.caps is defined %}
+caps = { rps_light = {{ u.caps.rps_light }}, max_streams = {{ u.caps.max_streams }}, mbps = {{ u.caps.mbps }} }
+{% endif %}
+
+{% endfor %}

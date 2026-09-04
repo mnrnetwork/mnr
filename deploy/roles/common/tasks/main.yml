@@ -1,0 +1,44 @@
+# Baseline for every box: patched, firewalled, quiet.
+- name: Packages
+  ansible.builtin.apt:
+    name: [unattended-upgrades, ufw, curl, ca-certificates, jq]
+    state: present
+    update_cache: true
+
+- name: Unattended security upgrades
+  ansible.builtin.copy:
+    dest: /etc/apt/apt.conf.d/20auto-upgrades
+    mode: "0644"
+    content: |
+      APT::Periodic::Update-Package-Lists "1";
+      APT::Periodic::Unattended-Upgrade "1";
+
+- name: Firewall default deny
+  community.general.ufw:
+    state: enabled
+    policy: deny
+    direction: incoming
+
+- name: Allow SSH
+  community.general.ufw:
+    rule: limit
+    port: "22"
+    proto: tcp
+
+# No request logs anywhere (invariant 6): journald keeps the relay's own
+# aggregate log lines only, and not forever.
+- name: journald retention
+  ansible.builtin.copy:
+    dest: /etc/systemd/journald.conf.d/mnr.conf
+    mode: "0644"
+    content: |
+      [Journal]
+      SystemMaxUse=500M
+      MaxRetentionSec=14day
+  notify: restart journald
+
+- name: Ensure journald drop-in directory exists
+  ansible.builtin.file:
+    path: /etc/systemd/journald.conf.d
+    state: directory
+    mode: "0755"

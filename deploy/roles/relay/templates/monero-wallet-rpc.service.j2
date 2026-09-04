@@ -1,0 +1,28 @@
+# {{ ansible_managed }}
+# View-only wallet for invoices: loopback only, no RPC login (the relay is
+# the only client on this box), never holds a spend key.
+[Unit]
+Description=monero-wallet-rpc (view-only, mnr invoices)
+After=network-online.target
+
+[Service]
+User=mnr
+Group=mnr
+ExecStart=/usr/local/bin/monero-wallet-rpc \
+  --daemon-address {{ mnr_wallet_daemon | default('https://node.kyc.rip') }} \
+  --trusted-daemon \
+  --wallet-file /var/lib/mnr/wallet/invoices \
+  --password '' \
+  --rpc-bind-ip 127.0.0.1 --rpc-bind-port 18082 \
+  --disable-rpc-login \
+  --log-level 0 --max-log-file-size 0
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/mnr/wallet
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

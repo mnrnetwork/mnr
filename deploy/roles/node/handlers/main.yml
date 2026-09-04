@@ -1,0 +1,5 @@
+- name: restart monerod
+  ansible.builtin.systemd:
+    name: monerod
+    state: restarted
+    daemon_reload: true

@@ -52,3 +52,10 @@ jobs:
           for t in parse_block tx_hash pruned_tx_hash headerchain_from_bytes wire_json epee_parse; do
             cargo fuzz run "$t" -- -max_total_time=60 -max_len=65536
           done
+  deploy-syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: pipx install ansible-core
+      - run: ansible-galaxy collection install community.general
+      - run: ansible-playbook -i deploy/inventory.example.yml deploy/site.yml --syntax-check

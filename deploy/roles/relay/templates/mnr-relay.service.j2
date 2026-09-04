@@ -1,0 +1,28 @@
+# {{ ansible_managed }}
+[Unit]
+Description=mnr-relay — verified Monero RPC relay
+After=network-online.target monero-wallet-rpc.service
+Wants=network-online.target
+
+[Service]
+User=mnr
+Group=mnr
+WorkingDirectory=/var/lib/mnr
+ExecStart=/usr/local/bin/mnr-relay --config /etc/mnr/relay.toml
+Environment=RUST_LOG=info,reqwest=warn,hyper_util=warn
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/mnr
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryMax={{ mnr_memory_max | default('3G') }}
+
+[Install]
+WantedBy=multi-user.target

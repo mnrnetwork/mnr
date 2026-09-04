@@ -1,0 +1,35 @@
+# Copy to internal/deploy/inventory.yml and fill in. Secrets go through
+# ansible-vault (`ansible-vault encrypt_string`), never in plaintext.
+all:
+  vars:
+    ansible_user: root
+    mnr_release: v0.1.0                     # tag of mnrnetwork/mnr to deploy
+    mnr_domain: rpc.mnr.network
+    mnr_contact: dev@mnr.network            # ACME account for Caddy
+  children:
+    relay:
+      hosts:
+        relay-1:
+          ansible_host: 203.0.113.10
+          # The relay config is rendered from roles/relay/templates/relay.toml.j2;
+          # these override its defaults.
+          mnr_upstreams:
+            - { name: own-1, url: "https://node.kyc.rip", kind: owned, transport: https,
+                caps: { rps_light: 500, max_streams: 32, mbps: 200 } }
+            - { name: cakewallet, url: "https://xmr-node.cakewallet.com:18081", kind: public, transport: https }
+            - { name: sethforprivacy, url: "https://node.sethforprivacy.com", kind: public, transport: https }
+            - { name: monerodevs-1, url: "http://node.monerodevs.org:18089", kind: public, transport: http }
+            - { name: hashvault, url: "http://nodes.hashvault.pro:18081", kind: public, transport: http }
+          mnr_opt_out: []
+          mnr_pro_price_atomic: 60000000000
+          # View-only wallet for invoices: the *view key* and address, never a spend key.
+          mnr_wallet_address: "4…"
+          mnr_wallet_viewkey: "{{ vault_wallet_viewkey }}"
+          mnr_wallet_restore_height: 3700000
+    node:
+      hosts:
+        node-1:
+          ansible_host: 203.0.113.20
+          monerod_version: v0.18.5.0
+          monerod_public_rpc_port: 18089     # restricted RPC, public
+          monerod_p2p_port: 18080

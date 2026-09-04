@@ -1,0 +1,21 @@
+# {{ ansible_managed }}
+[Unit]
+Description=Monero full node (mnr owned node)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=monero
+Group=monero
+ExecStart=/usr/local/bin/monerod --config-file /etc/monerod.conf --non-interactive
+Restart=always
+RestartSec=10
+LimitNOFILE=65536
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/monero
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,60 @@
+# The owned full node (plan §3): restricted RPC on the public port, the
+# unrestricted RPC on loopback only, listed as a public node.
+- name: monerod user
+  ansible.builtin.user:
+    name: monero
+    system: true
+    home: /var/lib/monero
+    create_home: true
+    shell: /usr/sbin/nologin
+
+- name: Download monerod release
+  ansible.builtin.get_url:
+    url: "https://downloads.getmonero.org/cli/monero-linux-x64-{{ monerod_version }}.tar.bz2"
+    dest: "/var/lib/monero/monero-{{ monerod_version }}.tar.bz2"
+    checksum: "{{ monerod_sha256 | default(omit) }}"
+    mode: "0644"
+
+- name: Unpack monerod
+  ansible.builtin.unarchive:
+    src: "/var/lib/monero/monero-{{ monerod_version }}.tar.bz2"
+    dest: /var/lib/monero
+    remote_src: true
+    creates: "/var/lib/monero/monero-x86_64-linux-gnu-{{ monerod_version }}/monerod"
+
+- name: Link monerod into PATH
+  ansible.builtin.file:
+    src: "/var/lib/monero/monero-x86_64-linux-gnu-{{ monerod_version }}/monerod"
+    dest: /usr/local/bin/monerod
+    state: link
+
+- name: monerod config
+  ansible.builtin.template:
+    src: monerod.conf.j2
+    dest: /etc/monerod.conf
+    owner: monero
+    mode: "0640"
+  notify: restart monerod
+
+- name: monerod service
+  ansible.builtin.template:
+    src: monerod.service.j2
+    dest: /etc/systemd/system/monerod.service
+    mode: "0644"
+  notify: restart monerod
+
+- name: Allow P2P and the restricted RPC port
+  community.general.ufw:
+    rule: allow
+    port: "{{ item }}"
+    proto: tcp
+  loop:
+    - "{{ monerod_p2p_port }}"
+    - "{{ monerod_public_rpc_port }}"
+
+- name: Enable monerod
+  ansible.builtin.systemd:
+    name: monerod
+    enabled: true
+    state: started
+    daemon_reload: true
