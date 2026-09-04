@@ -250,6 +250,20 @@ pub struct UpstreamConfig {
 }
 
 impl UpstreamConfig {
+    /// Where rule 5's opt-out signal lives: `/.well-known/mnr-optout` on the
+    /// upstream's host (its web port, not the RPC port), over the scheme
+    /// the transport implies.
+    pub fn opt_out_url(&self) -> Option<String> {
+        let scheme = match self.transport {
+            Transport::Https => "https",
+            Transport::Http | Transport::Onion => "http",
+        };
+        Some(format!(
+            "{scheme}://{}/.well-known/mnr-optout",
+            self.host()?
+        ))
+    }
+
     /// Host part of the URL, for opt-out matching.
     pub fn host(&self) -> Option<&str> {
         let rest = self.url.split_once("://")?.1;
@@ -381,6 +395,26 @@ transport = "https"
         assert_eq!(u.host(), Some("xmr-node.cakewallet.com"));
         assert!(c.user_agent().starts_with("mnr-relay/"));
         assert!(c.user_agent().contains(UA_LINK));
+    }
+
+    #[test]
+    fn opt_out_url_is_the_host_web_root() {
+        let c = Config::parse(&format!("{PROBE1}{MINIMAL}")).unwrap();
+        assert_eq!(
+            c.upstreams[0].opt_out_url().as_deref(),
+            Some("https://xmr-node.cakewallet.com/.well-known/mnr-optout")
+        );
+        let http = MINIMAL
+            .replace(
+                "https://xmr-node.cakewallet.com:18081",
+                "http://node.example:18089",
+            )
+            .replace("transport = \"https\"", "transport = \"http\"");
+        let c = Config::parse(&format!("{PROBE1}{http}")).unwrap();
+        assert_eq!(
+            c.upstreams[0].opt_out_url().as_deref(),
+            Some("http://node.example/.well-known/mnr-optout")
+        );
     }
 
     #[test]

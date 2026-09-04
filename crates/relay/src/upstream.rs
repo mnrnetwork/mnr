@@ -42,6 +42,10 @@ const FAULT_LIMIT: usize = 3;
 const EJECT_FOR: Duration = Duration::from_secs(24 * 3600);
 /// Newest fault events kept for the public log.
 const FAULT_LOG_MAX: usize = 1000;
+/// Rule 5: how often each upstream host's `/.well-known/mnr-optout` is read.
+pub const OPT_OUT_CHECK_EVERY: Duration = Duration::from_secs(24 * 3600);
+/// Timeout for one opt-out check (a web host, possibly over Tor).
+const OPT_OUT_TIMEOUT: Duration = Duration::from_secs(8);
 /// Rule 3: how long a read queues for a light token on the best-ranked
 /// public upstream before falling through to the next.
 pub const PUBLIC_QUEUE_WAIT: Duration = Duration::from_millis(250);
@@ -73,6 +77,10 @@ pub struct Health {
     pub rtt_ema_ms: Option<f64>,
     pub last_probe: Option<SystemTime>,
     pub last_error: Option<String>,
+    /// Rule 5: the host published `/.well-known/mnr-optout`. Out of
+    /// rotation for the life of this process; the operator moves it to the
+    /// config's `opt_out` list.
+    pub opted_out: bool,
     faults: Vec<Instant>,
     ejected_until: Option<Instant>,
 }
@@ -94,6 +102,14 @@ impl Health {
     fn ejected(&self, now: Instant) -> bool {
         self.ejected_until.is_some_and(|t| t > now)
     }
+}
+
+/// An upstream that asked to be removed, for the public log.
+#[derive(Debug, Clone, Serialize)]
+pub struct OptOutEvent {
+    pub at_unix: u64,
+    pub upstream: String,
+    pub host: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -202,6 +218,7 @@ pub struct Pool {
     health: RwLock<Vec<Health>>,
     quorum: RwLock<Option<QuorumTip>>,
     faults: RwLock<VecDeque<FaultEvent>>,
+    opt_outs: RwLock<Vec<OptOutEvent>>,
     min_agree: usize,
     interval: Duration,
 }
@@ -218,6 +235,7 @@ pub struct UpstreamStatus {
     pub height: Option<u64>,
     pub rtt_ms: Option<u64>,
     pub synchronized: bool,
+    pub opted_out: bool,
     pub requests: u64,
     pub verified: u64,
     pub faults: u64,
@@ -233,6 +251,8 @@ pub struct PoolStatus {
     pub quorum_agreeing: usize,
     pub upstreams: Vec<UpstreamStatus>,
     pub faults: Vec<FaultEvent>,
+    /// Hosts that published the opt-out signal since this process started.
+    pub opt_outs: Vec<OptOutEvent>,
 }
 
 impl Pool {
@@ -280,6 +300,7 @@ impl Pool {
             health: RwLock::new(vec![Health::default(); n]),
             quorum: RwLock::new(None),
             faults: RwLock::new(VecDeque::new()),
+            opt_outs: RwLock::new(Vec::new()),
             min_agree: cfg.probe.min_agree,
             interval: Duration::from_secs(cfg.probe.interval_secs),
         })
@@ -402,7 +423,7 @@ impl Pool {
             .filter(|u| work != Work::Stream || u.cfg.transport != Transport::Onion)
             .filter_map(|u| {
                 let h = &health[u.id];
-                if !h.ok || !h.synchronized || h.ejected(now) {
+                if !h.ok || !h.synchronized || h.ejected(now) || h.opted_out {
                     return None;
                 }
                 let owned = u.cfg.kind == Kind::Owned;
@@ -493,6 +514,7 @@ impl Pool {
                     height: (h.block_count > 0).then(|| h.block_count - 1),
                     rtt_ms: h.rtt_ema_ms.map(|r| r.round() as u64),
                     synchronized: h.synchronized,
+                    opted_out: h.opted_out,
                     requests: u.requests.load(Ordering::Relaxed),
                     verified: u.verified.load(Ordering::Relaxed),
                     faults: u.faults.load(Ordering::Relaxed),
@@ -508,7 +530,56 @@ impl Pool {
             quorum_agreeing: q.as_ref().map_or(0, |q| q.agreeing.len()),
             upstreams,
             faults: self.faults.read().iter().cloned().collect(),
+            opt_outs: self.opt_outs.read().clone(),
         }
+    }
+
+    /// Rule 5, forever: read every host's opt-out signal now, then daily.
+    pub async fn run_opt_out_checker(self: Arc<Self>) {
+        loop {
+            self.check_opt_outs().await;
+            tokio::time::sleep(OPT_OUT_CHECK_EVERY).await;
+        }
+    }
+
+    /// One round of opt-out checks across all upstreams.
+    pub async fn check_opt_outs(&self) {
+        let checks = self.upstreams.iter().filter_map(|u| {
+            let url = u.cfg.opt_out_url()?;
+            Some(async move { (u.id, u.opt_out_signal(&url).await) })
+        });
+        for (id, signal) in futures_util::future::join_all(checks).await {
+            if signal == Some(true) {
+                self.mark_opted_out(id);
+            }
+        }
+    }
+
+    /// Record that the host behind `id` asked to be removed: out of
+    /// rotation now, in the public log, and an operator action logged.
+    pub fn mark_opted_out(&self, id: usize) {
+        let first_time = {
+            let mut health = self.health.write();
+            let h = &mut health[id];
+            let first = !h.opted_out;
+            h.opted_out = true;
+            first
+        };
+        if !first_time {
+            return;
+        }
+        let u = &self.upstreams[id];
+        let host = u.cfg.host().unwrap_or("").to_owned();
+        tracing::error!(
+            upstream = %u.cfg.name,
+            host = %host,
+            "host published /.well-known/mnr-optout: removed from rotation; add it to opt_out in the config"
+        );
+        self.opt_outs.write().push(OptOutEvent {
+            at_unix: unix_now(),
+            upstream: u.cfg.name.clone(),
+            host,
+        });
     }
 }
 
@@ -649,6 +720,22 @@ impl Upstream {
             content_length,
             body: throttled(inner, Arc::clone(&self.bandwidth), slot),
         })
+    }
+
+    /// Read the host's opt-out signal: `Some(true)` on HTTP 200, `Some(false)`
+    /// on any other status, `None` when the host did not answer (no answer
+    /// today; checked again tomorrow). A dedicated call: it takes no light
+    /// token and is not counted in the public request figure, which is
+    /// about RPC load.
+    pub async fn opt_out_signal(&self, url: &str) -> Option<bool> {
+        let resp = self
+            .client
+            .get(url)
+            .timeout(OPT_OUT_TIMEOUT)
+            .send()
+            .await
+            .ok()?;
+        Some(resp.status().as_u16() == 200)
     }
 
     /// `get_info` with the identifying User-Agent and nothing else.
@@ -930,6 +1017,71 @@ transport = "onion"
             assert!(b.try_take(t1));
         }
         assert!(!b.try_take(t1));
+    }
+
+    #[tokio::test]
+    async fn opted_out_host_leaves_rotation_and_is_logged_without_counting() {
+        use axum::routing::get;
+        use std::sync::atomic::AtomicUsize;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h2 = Arc::clone(&hits);
+        let app = axum::Router::new().route(
+            "/.well-known/mnr-optout",
+            get(move || {
+                let h = Arc::clone(&h2);
+                async move {
+                    h.fetch_add(1, Ordering::SeqCst);
+                    "please remove us"
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let p = pool();
+        set(
+            &p,
+            [
+                healthy(101, 30.0),
+                healthy(101, 15.0),
+                healthy(101, 20.0),
+                healthy(101, 1.0),
+            ],
+            Some(100),
+        );
+        let before = p.status().upstreams[1].requests;
+        let u = p.upstream(1);
+        // 200 → opted out; 404 → nothing; unreachable → no answer today.
+        let yes = u
+            .opt_out_signal(&format!("http://{addr}/.well-known/mnr-optout"))
+            .await;
+        assert_eq!(yes, Some(true));
+        let no = u.opt_out_signal(&format!("http://{addr}/other")).await;
+        assert_eq!(no, Some(false));
+        let none = u
+            .opt_out_signal("http://127.0.0.1:1/.well-known/mnr-optout")
+            .await;
+        assert_eq!(none, None);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            p.status().upstreams[1].requests,
+            before,
+            "not an RPC request"
+        );
+        assert!(p.ranked(Work::Light).contains(&1));
+        p.mark_opted_out(1);
+        p.mark_opted_out(1);
+        assert!(!p.ranked(Work::Light).contains(&1));
+        let s = p.status();
+        assert!(s.upstreams[1].opted_out);
+        assert_eq!(s.opt_outs.len(), 1, "logged once");
+        assert_eq!(s.opt_outs[0].upstream, "pub-fast");
+        assert_eq!(s.opt_outs[0].host, "fast.example");
+        // The derived URL for a real upstream is the host's web root.
+        assert_eq!(
+            u.cfg.opt_out_url().as_deref(),
+            Some("https://fast.example/.well-known/mnr-optout")
+        );
     }
 
     #[tokio::test]

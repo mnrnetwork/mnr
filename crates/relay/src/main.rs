@@ -121,6 +121,7 @@ async fn main() {
     // First probe round before serving so the status feed is never empty.
     pool.probe_all().await;
     tokio::spawn(Arc::clone(&pool).run_prober());
+    tokio::spawn(Arc::clone(&pool).run_opt_out_checker());
     tokio::spawn(Arc::clone(&chain).run_sync(Arc::clone(&pool), cfg.chain.batch));
 
     let cache = Arc::new(Cache::new(cfg.cache.max_bytes));
