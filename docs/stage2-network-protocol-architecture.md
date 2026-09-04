@@ -295,7 +295,7 @@ The plan assumes two engineers. If it is one person, P3 slips beyond month 18 an
 
 ## 7. Open questions for the founders
 
-1. Name and domain (mnr is a placeholder).
+1. ~~Name and domain.~~ Decided 2026-09: **mnr**, at `mnr.network`, org `mnrnetwork` on GitHub.
 2. License confirmation: AGPL-3.0 for agent/relay, MIT/Apache for `mnr-core` and `mnr-client` (so wallets can embed them) — recommended split.
 3. Whether the reference relayer's `.onion` is the *primary* advertised endpoint or the clearnet one (affects marketing more than engineering).
 4. Whether to seek spec review from specific Monero developers before P1, and whether to submit `mnr-core` hashing tests upstream to the crates it depends on.
