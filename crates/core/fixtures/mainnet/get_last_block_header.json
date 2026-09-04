@@ -1,0 +1,34 @@
+{
+  "id": "0",
+  "jsonrpc": "2.0",
+  "result": {
+    "block_header": {
+      "block_size": 40049,
+      "block_weight": 40049,
+      "cumulative_difficulty": 686514699367082678,
+      "cumulative_difficulty_top64": 0,
+      "depth": 0,
+      "difficulty": 692881107637,
+      "difficulty_top64": 0,
+      "hash": "401f00ede03d0ad64f2dc2f8dd79807874cfcb40ea98e2d395e30961bd2b74f8",
+      "height": 3754775,
+      "long_term_weight": 176470,
+      "major_version": 16,
+      "miner_tx_hash": "9a396c6d4ebc4427507e1392d19a4f0ded8f4a0beae912972ac9c5c42cd66280",
+      "minor_version": 16,
+      "nonce": 6229106,
+      "num_txes": 21,
+      "orphan_status": false,
+      "pow_hash": "",
+      "prev_hash": "d9a43a019f07553e55dbd1905a2718a5f856f031bd68f67566ac2996b92153f9",
+      "reward": 602894540000,
+      "timestamp": 1788490472,
+      "wide_cumulative_difficulty": "0x986fd7b54dbeab6",
+      "wide_difficulty": "0xa152eeaab5"
+    },
+    "credits": 0,
+    "status": "OK",
+    "top_hash": "",
+    "untrusted": false
+  }
+}
