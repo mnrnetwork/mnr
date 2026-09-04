@@ -21,6 +21,7 @@
 //! answer carries `Mnr-Upstream` (an opaque pool index, never a name).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -31,6 +32,7 @@ use serde_json::{json, Value};
 use crate::auth::Tier;
 use crate::cache::{Cache, Cached, Status};
 use crate::chain::ChainStore;
+use crate::consensus;
 use crate::limits::{stream_wu, LIGHT_WU};
 use crate::upstream::{ForwardError, Forwarded, Pool, Work};
 use crate::verify::{self, batch_label, Fault, TxCheck, Verify};
@@ -43,12 +45,13 @@ const BROADCAST_CAP_WAIT: Duration = Duration::from_secs(1);
 /// How many ranked upstreams a read may try before giving up.
 const MAX_ATTEMPTS: usize = 3;
 
-/// What dispatch needs besides the request.
-#[derive(Clone, Copy)]
-pub struct Ctx<'a> {
-    pub pool: &'a Pool,
-    pub chain: &'a ChainStore,
-    pub cache: &'a Cache,
+/// What dispatch needs besides the request. Shared handles, so a
+/// background cache refresh can outlive the request that triggered it.
+#[derive(Clone)]
+pub struct Ctx {
+    pub pool: Arc<Pool>,
+    pub chain: Arc<ChainStore>,
+    pub cache: Arc<Cache>,
 }
 
 /// One client request, already authenticated and admitted.
@@ -80,7 +83,7 @@ pub struct Outcome {
 }
 
 impl Outcome {
-    fn json_error(status: u16, message: &str, verify: Verify) -> Self {
+    pub(crate) fn json_error(status: u16, message: &str, verify: Verify) -> Self {
         let body = json!({
             "error": { "code": -32603, "message": message },
             "status": message,
@@ -98,7 +101,7 @@ impl Outcome {
         }
     }
 
-    fn json_ok(body: String, headers: Vec<(&'static str, String)>) -> Self {
+    pub(crate) fn json_ok(body: String, headers: Vec<(&'static str, String)>) -> Self {
         Self {
             status: 200,
             content_type: "application/json".into(),
@@ -110,12 +113,12 @@ impl Outcome {
 }
 
 /// Route one request by its policy class.
-pub async fn dispatch(ctx: Ctx<'_>, policy: &'static Policy, req: Request) -> Outcome {
+pub async fn dispatch(ctx: Ctx, policy: &'static Policy, req: Request) -> Outcome {
     let timeout = Duration::from_millis(u64::from(policy.timeout_ms.max(1000)));
     match policy.class {
-        Class::Broadcast => broadcast(ctx.pool, req.path, req.content_type, req.body).await,
+        Class::Broadcast => broadcast(&ctx.pool, req.path, req.content_type, req.body).await,
         Class::PassthroughStream => {
-            stream(ctx.pool, req.path, req.content_type, req.body, timeout).await
+            stream(&ctx.pool, req.path, req.content_type, req.body, timeout).await
         }
         Class::Deny | Class::NotDaemon => {
             Outcome::json_error(403, "method not allowed", Verify::None)
@@ -124,25 +127,26 @@ pub async fn dispatch(ctx: Ctx<'_>, policy: &'static Policy, req: Request) -> Ou
         Class::ImmutableConditional if verify::canonical(&req.method) == "/get_transactions" => {
             transactions(ctx, req, timeout).await
         }
-        _ => read(ctx.pool, req.path, req.content_type, req.body, timeout).await,
+        Class::Swr => consensus::swr(ctx, req, timeout).await,
+        _ => read(&ctx.pool, req.path, req.content_type, req.body, timeout).await,
     }
 }
 
 /// The tip safety line: the highest height that may be cached, or `None`
 /// in degraded mode (no quorum → no cache writes).
-fn safety_line(pool: &Pool) -> Option<u64> {
+pub(crate) fn safety_line(pool: &Pool) -> Option<u64> {
     pool.quorum()
         .map(|q| q.height.saturating_sub(TIP_SAFETY_DEPTH))
 }
 
 /// `serde_json::Value` objects serialise with sorted keys, so this is a
 /// canonical form of the params for cache keys.
-fn params_key(params: Option<&Value>) -> String {
+pub(crate) fn params_key(params: Option<&Value>) -> String {
     params.map_or_else(String::new, Value::to_string)
 }
 
 /// A cached `result`, re-wrapped with the client's id.
-fn jsonrpc_body(id: &Value, result: &[u8]) -> String {
+pub(crate) fn jsonrpc_body(id: &Value, result: &[u8]) -> String {
     format!(
         "{{\"id\":{},\"jsonrpc\":\"2.0\",\"result\":{}}}",
         id,
@@ -231,7 +235,7 @@ async fn fetch_verified<T>(
 }
 
 /// Immutable JSON-RPC methods: cache, fetch, verify, fault-and-retry, cache.
-async fn immutable(ctx: Ctx<'_>, req: Request, timeout: Duration) -> Outcome {
+async fn immutable(ctx: Ctx, req: Request, timeout: Duration) -> Outcome {
     let method = verify::canonical(&req.method).to_owned();
     let key = Cache::immutable_key(ctx.chain.epoch(), &method, &params_key(req.params.as_ref()));
     if let Some(c) = ctx.cache.immutable_get(&key).await {
@@ -245,9 +249,9 @@ async fn immutable(ctx: Ctx<'_>, req: Request, timeout: Duration) -> Outcome {
             verified_headers(&v, None, Status::Hit),
         );
     }
-    let line = safety_line(ctx.pool);
+    let line = safety_line(&ctx.pool);
     let fetched = fetch_verified(
-        ctx.pool,
+        &ctx.pool,
         req.path,
         req.content_type,
         req.body,
@@ -301,13 +305,13 @@ struct TxCached {
 }
 
 /// `/get_transactions`: per-tx cache, batch split, verification.
-async fn transactions(ctx: Ctx<'_>, req: Request, timeout: Duration) -> Outcome {
+async fn transactions(ctx: Ctx, req: Request, timeout: Duration) -> Outcome {
     let request: Value = match serde_json::from_slice(&req.body) {
         Ok(v) => v,
-        Err(_) => return read(ctx.pool, req.path, req.content_type, req.body, timeout).await,
+        Err(_) => return read(&ctx.pool, req.path, req.content_type, req.body, timeout).await,
     };
     let Some(hashes) = request.get("txs_hashes").and_then(Value::as_array) else {
-        return read(ctx.pool, req.path, req.content_type, req.body, timeout).await;
+        return read(&ctx.pool, req.path, req.content_type, req.body, timeout).await;
     };
     let hashes: Vec<String> = hashes
         .iter()
@@ -362,9 +366,9 @@ async fn transactions(ctx: Ctx<'_>, req: Request, timeout: Duration) -> Outcome 
     let mut upstream_req = request.clone();
     upstream_req["txs_hashes"] = json!(misses);
     let tip = ctx.pool.quorum().map(|q| q.height);
-    let line = safety_line(ctx.pool);
+    let line = safety_line(&ctx.pool);
     let fetched = fetch_verified(
-        ctx.pool,
+        &ctx.pool,
         req.path,
         req.content_type,
         Bytes::from(upstream_req.to_string()),
@@ -720,9 +724,9 @@ mod tests {
     }
 
     struct Env {
-        pool: Pool,
-        chain: ChainStore,
-        cache: Cache,
+        pool: Arc<Pool>,
+        chain: Arc<ChainStore>,
+        cache: Arc<Cache>,
     }
 
     impl Env {
@@ -737,17 +741,17 @@ mod tests {
             }
             chain.set_for_test(c);
             Self {
-                pool,
-                chain,
-                cache: Cache::new(1 << 20),
+                pool: Arc::new(pool),
+                chain: Arc::new(chain),
+                cache: Arc::new(Cache::new(1 << 20)),
             }
         }
 
-        fn ctx(&self) -> Ctx<'_> {
+        fn ctx(&self) -> Ctx {
             Ctx {
-                pool: &self.pool,
-                chain: &self.chain,
-                cache: &self.cache,
+                pool: Arc::clone(&self.pool),
+                chain: Arc::clone(&self.chain),
+                cache: Arc::clone(&self.cache),
             }
         }
 
@@ -1120,7 +1124,7 @@ mod tests {
         let bad = mock(502, "gateway", Arc::clone(&hits)).await;
         let good = mock(200, r#"{"height":101,"status":"OK"}"#, Arc::clone(&hits)).await;
         let env = Env::new(pool_over(&[bad, good]));
-        let o = env.legacy("/get_height", json!({})).await;
+        let o = env.legacy("/get_transaction_pool_stats", json!({})).await;
         assert_eq!(o.status, 200);
         assert!(o.headers.contains(&("Mnr-Upstream", "1".to_owned())));
         assert!(o.headers.contains(&("Mnr-Verify", "none".to_owned())));
@@ -1135,7 +1139,11 @@ mod tests {
         let env = Env::new(pool_over(&[only]));
         let mut statuses = Vec::new();
         for _ in 0..7 {
-            statuses.push(env.legacy("/get_height", json!({})).await.status);
+            statuses.push(
+                env.legacy("/get_transaction_pool_stats", json!({}))
+                    .await
+                    .status,
+            );
         }
         // Default cap is 5 rps: the sixth and seventh calls within the same
         // second are refused by us, never sent to the public node.

@@ -16,6 +16,7 @@ mod auth;
 mod cache;
 mod chain;
 mod config;
+mod consensus;
 mod dispatch;
 mod ingress;
 mod limits;

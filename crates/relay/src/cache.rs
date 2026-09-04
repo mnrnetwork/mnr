@@ -48,7 +48,6 @@ const TX_SHARE: u64 = 4;
 
 /// What the `Mnr-Cache` header says about an answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // `Stale` is produced by the SWR path (consensus, next commit)
 pub enum Status {
     /// Served from cache, fresh.
     Hit,
@@ -73,7 +72,6 @@ impl Status {
 
 /// How an SWR entry may be used right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // consumed by the SWR path (consensus, next commit)
 pub enum Freshness {
     /// Under `max-age`: serve as is.
     Fresh,
@@ -95,7 +93,6 @@ pub struct Cached {
 
 /// A consensus answer with its provenance.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // consumed by the SWR path (consensus, next commit)
 pub struct SwrEntry {
     pub body: Bytes,
     pub verify: &'static str,
@@ -104,7 +101,6 @@ pub struct SwrEntry {
     pub fetched: Instant,
 }
 
-#[allow(dead_code)] // consumed by the SWR path (consensus, next commit)
 impl SwrEntry {
     pub fn freshness_at(&self, now: Instant) -> Freshness {
         let age = now.saturating_duration_since(self.fetched);
@@ -120,7 +116,6 @@ impl SwrEntry {
     }
 }
 
-#[allow(dead_code)] // the SWR tier is consumed by consensus (next commit)
 pub struct Cache {
     immutable: Moka<String, Arc<Cached>>,
     txs: Moka<String, Arc<Bytes>>,
@@ -129,7 +124,6 @@ pub struct Cache {
     refreshing: Mutex<HashSet<String>>,
 }
 
-#[allow(dead_code)] // SWR accessors and `stats` (metrics) are wired next
 impl Cache {
     pub fn new(max_bytes: u64) -> Self {
         let weigh_cached = |k: &String, v: &Arc<Cached>| -> u32 {
@@ -202,6 +196,21 @@ impl Cache {
         self.swr.insert(key, Arc::new(entry)).await;
     }
 
+    /// The entry for `key`, or the result of `init`, which runs once for
+    /// all concurrent callers of the same key (moka coalesces them).
+    pub async fn swr_get_or_fetch<F>(
+        &self,
+        key: String,
+        init: F,
+    ) -> Result<Arc<SwrEntry>, Arc<String>>
+    where
+        F: std::future::Future<Output = Result<SwrEntry, String>>,
+    {
+        self.swr
+            .try_get_with(key, async { init.await.map(Arc::new) })
+            .await
+    }
+
     /// Claim the refresh of `key`. `false` means one is already running.
     pub fn begin_refresh(&self, key: &str) -> bool {
         self.refreshing.lock().insert(key.to_owned())
@@ -212,6 +221,7 @@ impl Cache {
     }
 
     /// `(entries, bytes)` per tier for metrics, after pending housekeeping.
+    #[allow(dead_code)] // metrics (next commit)
     pub async fn stats(&self) -> [(&'static str, u64, u64); 3] {
         self.immutable.run_pending_tasks().await;
         self.txs.run_pending_tasks().await;

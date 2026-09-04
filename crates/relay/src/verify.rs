@@ -105,6 +105,10 @@ pub fn canonical(method: &str) -> &str {
         "get_block_headers_range",
         "on_get_block_hash",
         "/get_transactions",
+        "/get_height",
+        "/get_info",
+        "get_last_block_header",
+        "get_block_count",
     ];
     let bare: String = method.chars().filter(|c| *c != '_').collect();
     CANONICAL
@@ -522,6 +526,8 @@ mod tests {
             "get_block_header_by_hash"
         );
         assert_eq!(canonical("/gettransactions"), "/get_transactions");
+        assert_eq!(canonical("/getheight"), "/get_height");
+        assert_eq!(canonical("getlastblockheader"), "get_last_block_header");
         assert_eq!(canonical("get_info"), "get_info");
     }
 

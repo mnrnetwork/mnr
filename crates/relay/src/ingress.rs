@@ -181,9 +181,9 @@ async fn rpc(
         "application/json"
     };
     let ctx = dispatch::Ctx {
-        pool: &app.pool,
-        chain: &app.chain,
-        cache: &app.cache,
+        pool: Arc::clone(&app.pool),
+        chain: Arc::clone(&app.chain),
+        cache: Arc::clone(&app.cache),
     };
     let request = dispatch::Request {
         path: rpc_path,
