@@ -146,7 +146,8 @@ pub struct Caps {
     /// Concurrent `get_blocks.bin` streams.
     #[serde(default = "default_max_streams")]
     pub max_streams: u32,
-    /// Stream bandwidth, MB/s.
+    /// Stream bandwidth, MB/s. Published in the status feed; enforcement
+    /// lands with the streaming rewrite (plan §7 week 4), see `upstream`.
     #[serde(default = "default_mbps")]
     pub mbps: u32,
 }

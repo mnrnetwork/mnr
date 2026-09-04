@@ -40,6 +40,14 @@ const FAULT_LIMIT: usize = 3;
 const EJECT_FOR: Duration = Duration::from_secs(24 * 3600);
 /// Newest fault events kept for the public log.
 const FAULT_LOG_MAX: usize = 1000;
+/// Largest upstream response we buffer. monerod caps `get_blocks.bin`
+/// chunks well below this; it bounds the work units a single stream
+/// request can charge after admission.
+const MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
+// NOT YET ENFORCED (plan §7 week 4): the per-upstream `caps.mbps` bandwidth
+// ceiling. Light rps and stream slots are enforced here; bytes per second
+// are only published, not throttled, until the stream path streams instead
+// of buffering.
 
 /// What kind of work a caller wants an upstream for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +73,19 @@ pub struct Health {
 }
 
 impl Health {
+    /// A synchronized, on-tip, healthy record for tests in other modules.
+    #[cfg(test)]
+    pub fn healthy_for_test(block_count: u64, top_hash: Hash) -> Self {
+        Self {
+            ok: true,
+            block_count,
+            top_hash: Some(top_hash),
+            synchronized: true,
+            rtt_ema_ms: Some(10.0),
+            ..Self::default()
+        }
+    }
+
     fn ejected(&self, now: Instant) -> bool {
         self.ejected_until.is_some_and(|t| t > now)
     }
@@ -295,6 +316,18 @@ impl Pool {
         &self.upstreams[id]
     }
 
+    /// Install synthetic health and quorum so dispatch tests can run
+    /// against mock upstreams without probing.
+    #[cfg(test)]
+    pub fn set_for_test(&self, health: Vec<Health>, tip: Option<(u64, Hash)>) {
+        *self.health.write() = health;
+        *self.quorum.write() = tip.map(|(height, hash)| QuorumTip {
+            height,
+            hash,
+            agreeing: (0..self.upstreams.len()).collect(),
+        });
+    }
+
     pub fn quorum(&self) -> Option<QuorumTip> {
         self.quorum.read().clone()
     }
@@ -480,7 +513,21 @@ impl Upstream {
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
-        let body = resp.bytes().await.map_err(classify)?;
+        if resp
+            .content_length()
+            .is_some_and(|n| n > MAX_RESPONSE_BYTES)
+        {
+            return Err(ForwardError::Other("response too large".into()));
+        }
+        let mut body = Vec::new();
+        let mut resp = resp;
+        while let Some(chunk) = resp.chunk().await.map_err(classify)? {
+            if body.len() + chunk.len() > MAX_RESPONSE_BYTES as usize {
+                return Err(ForwardError::Other("response too large".into()));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let body = Bytes::from(body);
         Ok(Forwarded {
             status,
             content_type,
