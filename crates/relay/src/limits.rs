@@ -6,9 +6,12 @@
 //!
 //! [`Limiter`] is the persistence seam. [`MemoryLimiter`] keeps everything
 //! in process and is what tests and `--dev-token` runs use; the SQLite
-//! limiter persists the allowance so a restart does not reset quotas.
+//! limiter (see `store`) persists the allowance so a restart does not reset
+//! quotas. Burst buckets and stream slots are process-local in both: only the
+//! work-unit allowance needs to survive a restart.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 use parking_lot::Mutex;
@@ -42,9 +45,60 @@ pub trait Limiter: Send + Sync {
     /// Charge work discovered after admission (stream bytes). Never refuses;
     /// the next `admit` will.
     fn charge(&self, principal: &Principal, wu: u64);
+    /// Take one concurrent `get_blocks.bin` stream slot for this principal,
+    /// returning an RAII permit that frees it on drop, or `None` when the
+    /// tier's stream cap is already reached.
+    fn take_stream(&self, principal: &Principal) -> Option<StreamPermit>;
     /// Work units used by this principal in the current period.
     #[cfg(test)]
     fn used(&self, principal: &Principal) -> u64;
+}
+
+/// Concurrent-stream slots, shared by every limiter so a permit from one
+/// releases against the same counter it was taken from.
+#[derive(Default)]
+pub(crate) struct StreamCounters {
+    counts: Mutex<HashMap<i64, u32>>,
+}
+
+impl StreamCounters {
+    fn take(&self, id: i64, max: u32) -> bool {
+        let mut counts = self.counts.lock();
+        let c = counts.entry(id).or_insert(0);
+        if *c < max {
+            *c += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn release(&self, id: i64) {
+        let mut counts = self.counts.lock();
+        if let Some(c) = counts.get_mut(&id) {
+            *c = c.saturating_sub(1);
+            if *c == 0 {
+                counts.remove(&id);
+            }
+        }
+    }
+}
+
+/// RAII permit for one concurrent stream: the slot is returned when the
+/// permit drops, so the caller never needs to remember to release it.
+pub struct StreamPermit {
+    counters: Arc<StreamCounters>,
+    id: i64,
+    armed: bool,
+}
+
+impl Drop for StreamPermit {
+    fn drop(&mut self) {
+        if self.armed {
+            self.counters.release(self.id);
+            self.armed = false;
+        }
+    }
 }
 
 struct Bucket {
@@ -56,6 +110,7 @@ struct Bucket {
 pub struct MemoryLimiter {
     buckets: Mutex<HashMap<i64, Bucket>>,
     used: Mutex<HashMap<i64, u64>>,
+    streams: Arc<StreamCounters>,
 }
 
 impl MemoryLimiter {
@@ -63,7 +118,10 @@ impl MemoryLimiter {
         Self::default()
     }
 
-    fn take_burst(&self, principal: &Principal, now: Instant) -> Result<(), u32> {
+    /// Take one token from the principal's burst bucket. `Err(retry)` when
+    /// the bucket is empty. Kept `pub(crate)` so the SQLite limiter reuses
+    /// the exact same burst behaviour.
+    pub(crate) fn take_burst(&self, principal: &Principal, now: Instant) -> Result<(), u32> {
         let rate = f64::from(principal.tier.burst_rps());
         let capacity = 2.0 * rate;
         let mut buckets = self.buckets.lock();
@@ -103,6 +161,15 @@ impl Limiter for MemoryLimiter {
 
     fn charge(&self, principal: &Principal, wu: u64) {
         *self.used.lock().entry(principal.id).or_insert(0) += wu;
+    }
+
+    fn take_stream(&self, principal: &Principal) -> Option<StreamPermit> {
+        let max = principal.tier.max_streams();
+        self.streams.take(principal.id, max).then(|| StreamPermit {
+            counters: Arc::clone(&self.streams),
+            id: principal.id,
+            armed: true,
+        })
     }
 
     #[cfg(test)]
@@ -167,5 +234,26 @@ mod tests {
         // A different principal is unaffected.
         let other = Principal { id: 2, ..free() };
         assert_eq!(l.admit_at(&other, 1, t0), Verdict::Allow);
+    }
+
+    #[test]
+    fn stream_permits_enforce_the_tier_cap_and_free_on_drop() {
+        let l = MemoryLimiter::new();
+        let p = free();
+        let a = l.take_stream(&p).expect("free tier allows one stream");
+        assert!(l.take_stream(&p).is_none(), "free tier cap is one");
+        drop(a);
+        assert!(l.take_stream(&p).is_some(), "slot is free again after drop");
+
+        let pro = Principal {
+            tier: Tier::Pro,
+            ..free()
+        };
+        let s1 = l.take_stream(&pro).unwrap();
+        let s2 = l.take_stream(&pro).unwrap();
+        let s3 = l.take_stream(&pro).unwrap();
+        assert!(l.take_stream(&pro).is_none(), "pro tier cap is three");
+        drop((s1, s2, s3));
+        assert!(l.take_stream(&pro).is_some());
     }
 }

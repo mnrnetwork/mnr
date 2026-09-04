@@ -14,6 +14,14 @@ clearnet_timeout_ms = 2000
 onion_timeout_ms = 8000
 min_agree = 3                        # upstreams that must agree on a tip hash
 
+# Persistent token store and work-unit limiter. When set, tokens are managed
+# with `mnr-relay token issue|rotate|suspend|list --config relay.toml`, and
+# `--dev-token` is refused (no mixing). Raw tokens are never stored — only
+# their SHA-256. The path is relative to the working directory, as with the
+# other config paths. Leave unset to use `--dev-token` in memory.
+[auth]
+database = "relay.db"
+
 # Operators who asked to be removed (rule 5). An upstream on this list is
 # refused at load, not merely deprioritised. The list is public.
 opt_out = []

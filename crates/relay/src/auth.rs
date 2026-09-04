@@ -38,9 +38,7 @@ impl Tier {
         }
     }
 
-    /// Concurrent `get_blocks.bin` streams (enforced by the limiter once
-    /// the SQLite store lands).
-    #[allow(dead_code)]
+    /// Concurrent `get_blocks.bin` streams (enforced by the limiter).
     pub const fn max_streams(self) -> u32 {
         match self {
             Self::Free => 1,

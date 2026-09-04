@@ -146,6 +146,26 @@ async fn rpc(
         }
     }
 
+    // Concurrent streams are capped per principal (plan §5): take a permit
+    // that the RAII guard releases when this request finishes. The permit
+    // must live for the whole dispatch, so it is bound for the handler.
+    let _stream_permit = if policy.class == Class::PassthroughStream {
+        match app.limiter.take_stream(&principal) {
+            Some(p) => Some(p),
+            None => {
+                return json_rpc_error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    id,
+                    MNR_RATE_LIMITED,
+                    "too many concurrent streams",
+                    &[("Retry-After", "1".into())],
+                )
+            }
+        }
+    } else {
+        None
+    };
+
     let content_type = if rpc_path.ends_with(".bin") {
         "application/octet-stream"
     } else {

@@ -9,7 +9,7 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -55,11 +55,21 @@ pub struct Config {
     pub tor_socks: Option<SocketAddr>,
     #[serde(default)]
     pub probe: ProbeConfig,
+    #[serde(default)]
+    pub auth: AuthConfig,
     /// Hosts that asked to be removed (rule 5). Any upstream whose host is
     /// listed here is refused at load.
     #[serde(default)]
     pub opt_out: Vec<String>,
     pub upstreams: Vec<UpstreamConfig>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthConfig {
+    /// Path to the SQLite token/usage database. When set, tokens are managed
+    /// with `mnr-relay token ...` and `--dev-token` is refused.
+    pub database: Option<PathBuf>,
 }
 
 fn default_listen() -> SocketAddr {
@@ -371,5 +381,20 @@ transport = "onion"
     fn too_few_upstreams_for_min_agree_is_refused() {
         let err = Config::parse(MINIMAL).unwrap_err().to_string();
         assert!(err.contains("min_agree"), "{err}");
+    }
+
+    #[test]
+    fn auth_database_is_optional_and_strict() {
+        let c = Config::parse(&format!(
+            "[auth]\ndatabase = \"relay.db\"\n{PROBE1}{MINIMAL}"
+        ))
+        .unwrap();
+        assert_eq!(c.auth.database.as_deref(), Some(Path::new("relay.db")));
+        let c = Config::parse(&format!("{PROBE1}{MINIMAL}")).unwrap();
+        assert_eq!(c.auth.database, None);
+        let err = Config::parse(&format!("[auth]\npath = \"x.db\"\n{PROBE1}{MINIMAL}"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown field"), "{err}");
     }
 }
