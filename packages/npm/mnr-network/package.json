@@ -1,6 +1,6 @@
 {
   "name": "mnr-network",
-  "version": "0.0.3",
+  "version": "0.0.2",
   "description": "mnr \u2014 an RPC network for Monero. Name holder; real packages are published under @mnrnetwork (mnr-core, mnr-client). https://mnr.network",
   "license": "Apache-2.0",
   "homepage": "https://mnr.network",
