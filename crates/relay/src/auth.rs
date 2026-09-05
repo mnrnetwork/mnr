@@ -102,24 +102,62 @@ pub fn looks_like_token(s: &str) -> bool {
 }
 
 /// Pull a token out of a request: the path segment if present, else the
-/// password of a Basic auth header (username is free-form, wallets send
-/// whatever `--daemon-login` was given; a token in the username slot is
-/// accepted too).
+/// `Authorization` header.
+///
+/// - **Basic**: the token may be the password or the username.
+/// - **Digest**: the token must be the **username** (`--daemon-login
+///   <token>:x`). Stock Monero wallets speak only Digest, and Digest cannot
+///   be verified against a stored hash without the server holding a
+///   password-equivalent, which invariant 6 forbids. With the token as the
+///   username it travels in clear over TLS exactly as Basic would, the relay
+///   hashes and looks it up, and the digest `response` (over an arbitrary
+///   password) is not what authenticates. The nonce in the challenge is
+///   random so clients that insist on freshness are satisfied.
 pub fn extract_token(path_token: Option<&str>, authorization: Option<&str>) -> Option<String> {
     if let Some(t) = path_token {
         return looks_like_token(t).then(|| t.to_owned());
     }
-    let creds = authorization?.strip_prefix("Basic ")?;
-    let decoded = base64_decode(creds.trim())?;
-    let decoded = String::from_utf8(decoded).ok()?;
-    let (user, pass) = decoded.split_once(':').unwrap_or((&decoded, ""));
-    if looks_like_token(pass) {
-        Some(pass.to_owned())
-    } else if looks_like_token(user) {
-        Some(user.to_owned())
-    } else {
-        None
+    let authz = authorization?.trim();
+    if let Some(creds) = authz.strip_prefix("Basic ") {
+        let decoded = base64_decode(creds.trim())?;
+        let decoded = String::from_utf8(decoded).ok()?;
+        let (user, pass) = decoded.split_once(':').unwrap_or((&decoded, ""));
+        return if looks_like_token(pass) {
+            Some(pass.to_owned())
+        } else if looks_like_token(user) {
+            Some(user.to_owned())
+        } else {
+            None
+        };
     }
+    if let Some(params) = authz.strip_prefix("Digest ") {
+        let user = digest_param(params, "username")?;
+        return looks_like_token(&user).then_some(user);
+    }
+    None
+}
+
+/// The value of `name` in a Digest parameter list (`k="v", k=v, …`).
+fn digest_param(params: &str, name: &str) -> Option<String> {
+    let mut rest = params;
+    while !rest.is_empty() {
+        let rest_trim = rest.trim_start_matches([' ', ',']);
+        let eq = rest_trim.find('=')?;
+        let key = rest_trim[..eq].trim();
+        let after = &rest_trim[eq + 1..];
+        let (value, remaining) = if let Some(q) = after.strip_prefix('"') {
+            let end = q.find('"')?;
+            (&q[..end], &q[end + 1..])
+        } else {
+            let end = after.find(',').unwrap_or(after.len());
+            (after[..end].trim(), &after[end..])
+        };
+        if key.eq_ignore_ascii_case(name) {
+            return Some(value.to_owned());
+        }
+        rest = remaining;
+    }
+    None
 }
 
 /// In-memory store for tests and local runs (`--dev-token` in `main`).

@@ -73,7 +73,7 @@ Verified request counts and fault counts per upstream are the numbers on the pub
 
 - **Method policy:** the gateway plan §3.3 table as-is, compiled into `mnr-core::policy`.
 - **Cache:** in-memory (`moka`, 1 GB cap) for SWR and immutable-below-tip−10; on-disk store deferred to Stage 1.
-- **Auth:** path token `/v1/<token>/…` and Basic auth alternative, 256-bit, hashed at rest in SQLite; rotation endpoint with 24 h grace. Free tokens are issued instantly from the site; no email.
+- **Auth:** 256-bit token, hashed at rest in SQLite; rotation endpoint with 24 h grace. Stock wallets use `--daemon-login <token>:x` (they speak Digest only and drop any path, found in the beta; the token is the Digest username, the password is ignored); the path form `/v1/<token>/…` and Basic auth serve curl, scripts and URL-taking clients. Free tokens are issued instantly from the site; no email.
 - **Limits:** in-process token bucket per token; daily WU quota in SQLite.
 
 | | Free | Pro |

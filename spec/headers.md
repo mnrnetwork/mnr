@@ -70,6 +70,15 @@ and only when verified; consensus state `max-age=1, stale-while-revalidate=5,
 stale-if-error=15` seconds. A reorg bumps the cache epoch, which is part of
 every immutable key, so nothing from the abandoned branch can be served.
 
+## Authentication (not a header the client sets)
+
+A 401 carries two `WWW-Authenticate` challenges: `Digest realm="mnr", qop="auth",
+algorithm=MD5, nonce=…` first, then `Basic realm="mnr"`. Stock Monero wallets
+speak Digest only; the relay reads the token from the Digest **username** and
+ignores the digest response, since it holds no password to check it against.
+Basic accepts the token as password or username. The path form
+`/v1/<token>/…` needs no header.
+
 ## `Mnr-Tier`
 
 `free` or `pro`: the tier of the token the request was accepted under.

@@ -293,6 +293,10 @@ fn denied(is_jsonrpc: bool, id: Value, requested: &str) -> Response {
     }
 }
 
+/// 401 with two challenges. Digest first: stock Monero wallets speak only
+/// Digest for `--daemon-login`, and they expect the token as the username
+/// (see [`auth::extract_token`]). The nonce is random per challenge. Basic
+/// second, for everything else.
 fn unauthorized() -> Response {
     let mut r = json_rpc_error(
         StatusCode::UNAUTHORIZED,
@@ -301,7 +305,16 @@ fn unauthorized() -> Response {
         "unknown token",
         &[],
     );
-    r.headers_mut().insert(
+    let mut nonce = [0u8; 16];
+    getrandom::fill(&mut nonce).expect("operating system random source");
+    let nonce: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
+    let digest = format!(
+        "Digest realm=\"mnr\", qop=\"auth\", algorithm=MD5, nonce=\"{nonce}\", opaque=\"mnr\""
+    );
+    if let Ok(v) = HeaderValue::from_str(&digest) {
+        r.headers_mut().append(header::WWW_AUTHENTICATE, v);
+    }
+    r.headers_mut().append(
         header::WWW_AUTHENTICATE,
         HeaderValue::from_static("Basic realm=\"mnr\""),
     );
@@ -389,6 +402,32 @@ mod tests {
     use super::*;
 
     const TOKEN: &str = "sub_4k9ZQ2pQ7wq1sDhBfT8zPxT5Y3v7g9jN2mR6cLbVwXyU";
+
+    #[test]
+    fn unauthorized_offers_digest_then_basic() {
+        let r = unauthorized();
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+        let challenges: Vec<&str> = r
+            .headers()
+            .get_all(header::WWW_AUTHENTICATE)
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(challenges.len(), 2);
+        assert!(
+            challenges[0].starts_with("Digest realm=\"mnr\""),
+            "{}",
+            challenges[0]
+        );
+        assert!(challenges[0].contains("qop=\"auth\"") && challenges[0].contains("algorithm=MD5"));
+        assert_eq!(challenges[1], "Basic realm=\"mnr\"");
+        let r2 = unauthorized();
+        assert_ne!(
+            r.headers().get_all(header::WWW_AUTHENTICATE).iter().next(),
+            r2.headers().get_all(header::WWW_AUTHENTICATE).iter().next(),
+            "nonce is fresh per challenge"
+        );
+    }
 
     #[test]
     fn path_token_is_split_from_the_rpc_path() {

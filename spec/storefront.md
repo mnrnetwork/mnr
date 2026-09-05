@@ -21,6 +21,7 @@ Issues a Free token immediately.
   "allowance_wu": 500000,
   "burst_rps": 5,
   "daemon_address": "https://rpc.mnr.network/v1/<token>",
+  "wallet_login": "rpc.mnr.network:443 with username <token>, any password, SSL on",
   "docs": "https://mnr.network/docs/connect-wallets/"
 }
 ```

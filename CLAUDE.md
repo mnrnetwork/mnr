@@ -16,7 +16,7 @@ Explicitly **out of scope** for Stage 0: operator agent, directory, settlement/p
 4. **Writes fan out.** `send_raw_transaction` goes to every healthy upstream in parallel; success if any accepts; `Mnr-Relayed: k/n`.
 5. **Public-node rules** (`.claude/rules/public-nodes.md`): per-upstream caps, identifying `User-Agent`, opt-out honoured, no client identity forwarded, restricted methods only. These are ethics, not tuning knobs.
 6. **No request logs.** No path, no token, no client IP is ever written. Tokens are stored hashed. Error samples carry only an 8-char token-hash prefix.
-7. **Stock wallets must work** with nothing but `--daemon-address` (path token) or `--daemon-login` (Basic auth). Never require a custom header.
+7. **Stock wallets must work** with nothing but `--daemon-address rpc.mnr.network:443 --daemon-login <token>:x`. Stock wallets speak HTTP Digest only and keep just host and port of the address, so the token rides in the Digest **username** (the password is ignored; Digest cannot be checked against a stored hash) and the path-token form (`/v1/<token>/…`) is for curl, scripts and URL-taking clients. The relay offers Digest and Basic challenges. Never require a custom header.
 
 ## Architecture (Stage 0)
 
