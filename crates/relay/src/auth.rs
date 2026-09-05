@@ -118,7 +118,10 @@ pub fn extract_token(path_token: Option<&str>, authorization: Option<&str>) -> O
         return looks_like_token(t).then(|| t.to_owned());
     }
     let authz = authorization?.trim();
-    if let Some(creds) = authz.strip_prefix("Basic ") {
+    // Auth scheme names are case-insensitive (RFC 7235).
+    let (scheme, rest) = authz.split_once(' ')?;
+    if scheme.eq_ignore_ascii_case("Basic") {
+        let creds = rest;
         let decoded = base64_decode(creds.trim())?;
         let decoded = String::from_utf8(decoded).ok()?;
         let (user, pass) = decoded.split_once(':').unwrap_or((&decoded, ""));
@@ -130,8 +133,8 @@ pub fn extract_token(path_token: Option<&str>, authorization: Option<&str>) -> O
             None
         };
     }
-    if let Some(params) = authz.strip_prefix("Digest ") {
-        let user = digest_param(params, "username")?;
+    if scheme.eq_ignore_ascii_case("Digest") {
+        let user = digest_param(rest, "username")?;
         return looks_like_token(&user).then_some(user);
     }
     None
@@ -232,6 +235,23 @@ mod tests {
 
     const TOKEN: &str = "sub_4k9ZQ2pQ7wq1sDhBfT8zPxT5Y3v7g9jN2mR6cLbVwXyU"; // 44 chars body
 
+    fn base64_encode(bytes: &[u8]) -> String {
+        const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let n = chunk.iter().fold(0u32, |acc, b| (acc << 8) | u32::from(*b))
+                << (8 * (3 - chunk.len()));
+            for i in 0..4 {
+                if i <= chunk.len() {
+                    out.push(T[((n >> (18 - 6 * i)) & 63) as usize] as char);
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out
+    }
+
     #[test]
     fn token_shape_is_checked_before_lookup() {
         assert!(looks_like_token(TOKEN));
@@ -254,6 +274,44 @@ mod tests {
         let junk = format!("Basic {}", b64("user:password"));
         assert_eq!(extract_token(None, Some(&junk)), None);
         assert_eq!(extract_token(None, Some("Bearer x")), None);
+    }
+
+    /// What monero's epee client sends after our Digest challenge.
+    #[test]
+    fn digest_authorization_carries_the_token_as_username() {
+        let h = format!(
+            "Digest username=\"{TOKEN}\", realm=\"mnr\", nonce=\"3f9c0a1b\", uri=\"/json_rpc\", algorithm=MD5, qop=auth, nc=00000001, cnonce=\"9f8e\", response=\"5d41402abc4b2a76b9719d911017c592\", opaque=\"mnr\""
+        );
+        assert_eq!(extract_token(None, Some(&h)).as_deref(), Some(TOKEN));
+        // Unquoted username, another parameter order, lowercase scheme.
+        let h = format!("digest realm=\"mnr\", username={TOKEN}, response=x");
+        assert_eq!(extract_token(None, Some(&h)).as_deref(), Some(TOKEN));
+        let h = format!("BASIC {}", base64_encode(format!("{TOKEN}:x").as_bytes()));
+        assert_eq!(extract_token(None, Some(&h)).as_deref(), Some(TOKEN));
+        // A wallet that put the token in the password slot: nothing to read.
+        let h = "Digest username=\"mnr\", realm=\"mnr\", response=\"abc\"";
+        assert_eq!(extract_token(None, Some(h)), None);
+        // Malformed variants never panic and never authenticate.
+        for bad in [
+            "Digest",
+            "Digest ",
+            "Digest username=",
+            "Digest username=\"unterminated",
+            "Digest realm=\"mnr\"",
+            "Digest username=\"sub_short\", response=x",
+            "Bearer sub_4k9ZQ2pQ7wq1sDhBfT8zPxT5Y3v7g9jN2mR6cLbVwXyU",
+        ] {
+            assert_eq!(extract_token(None, Some(bad)), None, "{bad}");
+        }
+        assert_eq!(
+            digest_param("a=1, b=\"two, still\", c=3", "b").as_deref(),
+            Some("two, still")
+        );
+        assert_eq!(
+            digest_param("a=1, b=\"two, still\", c=3", "c").as_deref(),
+            Some("3")
+        );
+        assert_eq!(digest_param("a=1", "z"), None);
     }
 
     #[test]

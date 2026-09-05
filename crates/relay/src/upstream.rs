@@ -350,6 +350,7 @@ impl Pool {
                 }
             }
         }
+        store.prune_faults(FAULT_LOG_MAX);
         *self.faults.write() = store.load_faults(FAULT_LOG_MAX).into();
         *self.opt_outs.write() = store.load_opt_outs();
         for o in self.opt_outs.read().iter() {
@@ -391,6 +392,7 @@ impl Pool {
         if let Err(e) = store.save_upstream_stats(&rows) {
             tracing::error!(error = %e, "cannot persist upstream stats");
         }
+        store.prune_faults(FAULT_LOG_MAX);
     }
 
     /// Persist the counters every few seconds, forever.

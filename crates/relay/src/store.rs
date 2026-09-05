@@ -617,6 +617,16 @@ impl SqliteStore {
         .map_err(|e| e.to_string())
     }
 
+    /// Drop everything but the newest `keep` faults, so the table does not
+    /// grow without bound over months.
+    pub fn prune_faults(&self, keep: usize) {
+        let conn = self.conn.lock();
+        let _ = conn.execute(
+            "DELETE FROM fault_log WHERE id NOT IN (SELECT id FROM fault_log ORDER BY id DESC LIMIT ?1)",
+            params![keep as i64],
+        );
+    }
+
     /// The newest `limit` faults, oldest first.
     pub fn load_faults(&self, limit: usize) -> Vec<FaultEvent> {
         let conn = self.conn.lock();
@@ -1144,6 +1154,53 @@ mod tests {
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn schema_v2_database_migrates_to_v3_with_empty_stats_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v2.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            // A v2 file: tokens, usage and invoices, nothing else.
+            conn.execute_batch(
+                "CREATE TABLE tokens(id INTEGER PRIMARY KEY, token_hash BLOB UNIQUE NOT NULL, prev_token_hash BLOB, prev_grace_until INTEGER, tier TEXT NOT NULL, status TEXT NOT NULL, valid_until INTEGER, created_at INTEGER NOT NULL);
+                 CREATE TABLE usage(token_id INTEGER NOT NULL, day INTEGER NOT NULL, wu INTEGER NOT NULL, PRIMARY KEY(token_id, day));
+                 CREATE TABLE invoices(id TEXT PRIMARY KEY, subaddr_index INTEGER NOT NULL, address TEXT NOT NULL, amount INTEGER NOT NULL, months INTEGER NOT NULL, renew_hash BLOB, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, status TEXT NOT NULL, received INTEGER NOT NULL DEFAULT 0, paid_at INTEGER);
+                 INSERT INTO tokens VALUES (1, X'0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20', NULL, NULL, 'free', 'active', NULL, 1);
+                 PRAGMA user_version = 2;",
+            )
+            .unwrap();
+        }
+        let store = SqliteStore::open(Some(&path)).unwrap();
+        let v: i64 = store
+            .conn()
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 3);
+        assert!(store.load_upstream_stats().is_empty());
+        assert!(store.load_faults(10).is_empty());
+        assert!(store.load_opt_outs().is_empty());
+        let hash: [u8; 32] = (1..=32u8).collect::<Vec<_>>().try_into().unwrap();
+        assert_eq!(store.authenticate(&hash).unwrap().tier, Tier::Free);
+        // Pruning keeps the newest rows.
+        for i in 0..20u64 {
+            store
+                .append_fault(&FaultEvent {
+                    at_unix: i,
+                    upstream: "u".into(),
+                    method: "m".into(),
+                    detail: i.to_string(),
+                    ejected: false,
+                    ejected_until: None,
+                })
+                .unwrap();
+        }
+        store.prune_faults(5);
+        let kept = store.load_faults(100);
+        assert_eq!(kept.len(), 5);
+        assert_eq!(kept[0].detail, "15");
+        assert_eq!(kept[4].detail, "19");
     }
 
     #[test]

@@ -42,6 +42,15 @@ the restricted port opened.
   add the wallet vars and re-run the play to turn Pro on.
 - Prometheus and node_exporter scraping the relay's private `/metrics`.
 
+## Re-admitting an opted-out host
+
+An opt-out is deliberately sticky: it survives restarts (it is in the
+database's `opt_out_log`) and the daily check only re-marks on a 200, never
+un-marks. To re-admit a host whose operator has changed their mind, remove it
+from `opt_out` in the config if it is there, delete its rows with
+`sqlite3 /var/lib/mnr/relay.db "DELETE FROM opt_out_log WHERE upstream='<name>'"`,
+and restart the relay.
+
 ## Back up the invoice secret
 
 `/var/lib/mnr/invoice-secret` (32 bytes, created on the first start) is what
