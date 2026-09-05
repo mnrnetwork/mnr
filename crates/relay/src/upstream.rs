@@ -28,6 +28,7 @@ use serde::Serialize;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::config::{Config, Kind, Transport, UpstreamConfig};
+use crate::store::{SqliteStore, UpstreamStats};
 use crate::stream::{throttled, ByteBucket, Throttled};
 
 /// EMA smoothing for RTT (gateway plan §3.5: alpha 0.3).
@@ -230,7 +231,13 @@ pub struct Pool {
     opt_outs: RwLock<Vec<OptOutEvent>>,
     min_agree: usize,
     interval: Duration,
+    /// Where the public numbers persist across restarts (plan §4), when the
+    /// relay has a database.
+    store: RwLock<Option<Arc<SqliteStore>>>,
 }
+
+/// How often persisted counters are written.
+const STATS_FLUSH_EVERY: Duration = Duration::from_secs(10);
 
 /// Public view of one upstream, for `mnr.network/upstreams`.
 #[derive(Debug, Clone, Serialize)]
@@ -317,7 +324,81 @@ impl Pool {
             opt_outs: RwLock::new(Vec::new()),
             min_agree: cfg.probe.min_agree,
             interval: Duration::from_secs(cfg.probe.interval_secs),
+            store: RwLock::new(None),
         })
+    }
+
+    /// Restore the public numbers from the database and keep them there:
+    /// request, verified and fault counts, ejections in force, the fault
+    /// log and the opt-out log. "We caught node X serving a wrong header on
+    /// Tuesday" must survive a restart.
+    pub fn attach_store(&self, store: Arc<SqliteStore>) {
+        let saved = store.load_upstream_stats();
+        let now = Instant::now();
+        let unix = unix_now();
+        {
+            let mut health = self.health.write();
+            for (u, h) in self.upstreams.iter().zip(health.iter_mut()) {
+                if let Some(st) = saved.get(&u.cfg.name) {
+                    u.requests.store(st.requests, Ordering::Relaxed);
+                    u.verified.store(st.verified, Ordering::Relaxed);
+                    u.faults.store(st.faults, Ordering::Relaxed);
+                    if let Some(until) = st.ejected_until.filter(|t| *t > unix) {
+                        h.ejected_until = Some(now + Duration::from_secs(until - unix));
+                        h.was_ejected = true;
+                    }
+                }
+            }
+        }
+        *self.faults.write() = store.load_faults(FAULT_LOG_MAX).into();
+        *self.opt_outs.write() = store.load_opt_outs();
+        for o in self.opt_outs.read().iter() {
+            if let Some(u) = self.upstreams.iter().find(|u| u.cfg.name == o.upstream) {
+                self.health.write()[u.id].opted_out = true;
+            }
+        }
+        *self.store.write() = Some(store);
+    }
+
+    /// Write the counters and ejections to the database.
+    pub fn save_stats(&self) {
+        let Some(store) = self.store.read().clone() else {
+            return;
+        };
+        let now = Instant::now();
+        let unix = unix_now();
+        let health = self.health.read();
+        let rows: Vec<(String, UpstreamStats)> = self
+            .upstreams
+            .iter()
+            .map(|u| {
+                let h = &health[u.id];
+                (
+                    u.cfg.name.clone(),
+                    UpstreamStats {
+                        requests: u.requests.load(Ordering::Relaxed),
+                        verified: u.verified.load(Ordering::Relaxed),
+                        faults: u.faults.load(Ordering::Relaxed),
+                        ejected_until: h
+                            .ejected_until
+                            .filter(|t| *t > now)
+                            .map(|t| unix + t.saturating_duration_since(now).as_secs()),
+                    },
+                )
+            })
+            .collect();
+        drop(health);
+        if let Err(e) = store.save_upstream_stats(&rows) {
+            tracing::error!(error = %e, "cannot persist upstream stats");
+        }
+    }
+
+    /// Persist the counters every few seconds, forever.
+    pub async fn run_stats_flusher(self: Arc<Self>) {
+        loop {
+            tokio::time::sleep(STATS_FLUSH_EVERY).await;
+            self.save_stats();
+        }
     }
 
     /// Run probe rounds forever. The caller runs the first round itself
@@ -505,18 +586,29 @@ impl Pool {
         let ejected_until = ejected.then(|| unix_at(now + EJECT_FOR, now));
         let name = &self.upstreams[id].cfg.name;
         tracing::warn!(upstream = %name, method, %detail, ejected, "verification fault");
-        let mut log = self.faults.write();
-        if log.len() >= FAULT_LOG_MAX {
-            log.pop_front();
-        }
-        log.push_back(FaultEvent {
+        let event = FaultEvent {
             at_unix: unix_now(),
             upstream: name.clone(),
             method: method.to_owned(),
             detail,
             ejected,
             ejected_until,
-        });
+        };
+        {
+            let mut log = self.faults.write();
+            if log.len() >= FAULT_LOG_MAX {
+                log.pop_front();
+            }
+            log.push_back(event.clone());
+        }
+        if let Some(store) = self.store.read().clone() {
+            if let Err(e) = store.append_fault(&event) {
+                tracing::error!(error = %e, "cannot persist fault");
+            }
+            if ejected {
+                self.save_stats();
+            }
+        }
     }
 
     pub fn status(&self) -> PoolStatus {
@@ -611,11 +703,17 @@ impl Pool {
             host = %host,
             "host published /.well-known/mnr-optout: removed from rotation; add it to opt_out in the config"
         );
-        self.opt_outs.write().push(OptOutEvent {
+        let event = OptOutEvent {
             at_unix: unix_now(),
             upstream: u.cfg.name.clone(),
             host,
-        });
+        };
+        self.opt_outs.write().push(event.clone());
+        if let Some(store) = self.store.read().clone() {
+            if let Err(e) = store.append_opt_out(&event) {
+                tracing::error!(error = %e, "cannot persist opt-out");
+            }
+        }
     }
 }
 
@@ -1247,6 +1345,64 @@ transport = "onion"
         assert!(u.try_take_stream().is_none(), "default cap is 2");
         drop(a);
         assert!(u.try_take_stream().is_some());
+    }
+
+    #[test]
+    fn public_numbers_survive_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteStore::open(Some(&dir.path().join("relay.db"))).unwrap());
+        let p = pool();
+        set(
+            &p,
+            [
+                healthy(101, 30.0),
+                healthy(101, 15.0),
+                healthy(101, 20.0),
+                healthy(101, 1.0),
+            ],
+            Some(100),
+        );
+        p.attach_store(Arc::clone(&store));
+        p.upstream(1).requests.fetch_add(40, Ordering::Relaxed);
+        p.record_verified(1);
+        p.record_verified(1);
+        for _ in 0..3 {
+            p.record_fault(2, "get_block", "hash mismatch".into());
+        }
+        p.mark_opted_out(3);
+        p.save_stats();
+
+        // A new process: same config, same database.
+        let again = pool();
+        set(
+            &again,
+            [
+                healthy(101, 30.0),
+                healthy(101, 15.0),
+                healthy(101, 20.0),
+                healthy(101, 1.0),
+            ],
+            Some(100),
+        );
+        assert_eq!(
+            again.status().upstreams[1].verified,
+            0,
+            "nothing before attach"
+        );
+        again.attach_store(store);
+        let s = again.status();
+        assert_eq!(s.upstreams[1].requests, 40);
+        assert_eq!(s.upstreams[1].verified, 2);
+        assert_eq!(s.upstreams[2].faults, 3);
+        assert!(s.upstreams[2].ejected, "the ejection is still in force");
+        assert!(s.upstreams[2].ejected_until.is_some());
+        assert_eq!(s.faults.len(), 3);
+        assert_eq!(s.faults[2].upstream, "pub-slow");
+        assert!(s.faults[2].ejected);
+        assert_eq!(s.opt_outs.len(), 1);
+        assert!(s.upstreams[3].opted_out);
+        assert!(!again.ranked(Work::Light).contains(&2));
+        assert!(!again.ranked(Work::Light).contains(&3));
     }
 
     #[test]

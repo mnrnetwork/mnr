@@ -29,11 +29,12 @@ use rusqlite::{params, Connection};
 
 use crate::auth::{handle, token_hash, AuthError, Principal, Tier, TokenStore};
 use crate::limits::{Limiter, MemoryLimiter, StreamPermit, Verdict};
+use crate::upstream::{FaultEvent, OptOutEvent};
 
 /// Seconds the previous token stays valid after a rotation (gateway plan §3.1).
 const GRACE_SECS: u64 = 24 * 3600;
 /// Schema version, stored in `PRAGMA user_version`.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 /// How often the relay re-reads the token table to pick up CLI changes.
 const TOKEN_RELOAD_EVERY: Duration = Duration::from_secs(30);
 
@@ -53,6 +54,27 @@ CREATE TABLE IF NOT EXISTS usage(
   day INTEGER NOT NULL,
   wu INTEGER NOT NULL,
   PRIMARY KEY(token_id, day)
+);
+CREATE TABLE IF NOT EXISTS upstream_stats(
+  name TEXT PRIMARY KEY,
+  requests INTEGER NOT NULL,
+  verified INTEGER NOT NULL,
+  faults INTEGER NOT NULL,
+  ejected_until INTEGER
+);
+CREATE TABLE IF NOT EXISTS fault_log(
+  id INTEGER PRIMARY KEY,
+  at_unix INTEGER NOT NULL,
+  upstream TEXT NOT NULL,
+  method TEXT NOT NULL,
+  detail TEXT NOT NULL,
+  ejected INTEGER NOT NULL,
+  ejected_until INTEGER
+);
+CREATE TABLE IF NOT EXISTS opt_out_log(
+  at_unix INTEGER NOT NULL,
+  upstream TEXT NOT NULL,
+  host TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS invoices(
   id TEXT PRIMARY KEY,
@@ -113,6 +135,16 @@ impl Default for UsageState {
             map: HashMap::new(),
         }
     }
+}
+
+/// The persisted counters of one upstream (the public numbers).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct UpstreamStats {
+    pub requests: u64,
+    pub verified: u64,
+    pub faults: u64,
+    /// Unix seconds; `Some` while an ejection is in force.
+    pub ejected_until: Option<u64>,
 }
 
 /// What the storefront needs to know about a token before renewing it.
@@ -518,6 +550,126 @@ impl SqliteStore {
             Self::row_to_invoice,
         )
         .ok()
+    }
+
+    // ── upstream stats and public logs (plan §4: the numbers on the
+    //    upstreams page survive a restart) ─────────────────────────────
+
+    /// Persisted `(requests, verified, faults, ejected_until)` per upstream name.
+    pub fn load_upstream_stats(&self) -> HashMap<String, UpstreamStats> {
+        let conn = self.conn.lock();
+        let mut stmt = match conn
+            .prepare("SELECT name, requests, verified, faults, ejected_until FROM upstream_stats")
+        {
+            Ok(s) => s,
+            Err(_) => return HashMap::new(),
+        };
+        stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                UpstreamStats {
+                    requests: r.get::<_, i64>(1)? as u64,
+                    verified: r.get::<_, i64>(2)? as u64,
+                    faults: r.get::<_, i64>(3)? as u64,
+                    ejected_until: r.get::<_, Option<i64>>(4)?.map(|v| v as u64),
+                },
+            ))
+        })
+        .map(|rows| rows.filter_map(Result::ok).collect())
+        .unwrap_or_default()
+    }
+
+    pub fn save_upstream_stats(&self, stats: &[(String, UpstreamStats)]) -> Result<(), String> {
+        let conn = self.conn.lock();
+        for (name, st) in stats {
+            conn.execute(
+                "INSERT INTO upstream_stats (name, requests, verified, faults, ejected_until)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(name) DO UPDATE SET requests = excluded.requests, verified = excluded.verified,
+                   faults = excluded.faults, ejected_until = excluded.ejected_until",
+                params![
+                    name,
+                    st.requests as i64,
+                    st.verified as i64,
+                    st.faults as i64,
+                    st.ejected_until.map(|v| v as i64)
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    pub fn append_fault(&self, f: &FaultEvent) -> Result<(), String> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO fault_log (at_unix, upstream, method, detail, ejected, ejected_until) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                f.at_unix as i64,
+                f.upstream,
+                f.method,
+                f.detail,
+                i64::from(f.ejected),
+                f.ejected_until.map(|v| v as i64)
+            ],
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    }
+
+    /// The newest `limit` faults, oldest first.
+    pub fn load_faults(&self, limit: usize) -> Vec<FaultEvent> {
+        let conn = self.conn.lock();
+        let mut stmt = match conn.prepare(
+            "SELECT at_unix, upstream, method, detail, ejected, ejected_until FROM fault_log ORDER BY id DESC LIMIT ?1",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let mut v: Vec<FaultEvent> = stmt
+            .query_map(params![limit as i64], |r| {
+                Ok(FaultEvent {
+                    at_unix: r.get::<_, i64>(0)? as u64,
+                    upstream: r.get(1)?,
+                    method: r.get(2)?,
+                    detail: r.get(3)?,
+                    ejected: r.get::<_, i64>(4)? != 0,
+                    ejected_until: r.get::<_, Option<i64>>(5)?.map(|v| v as u64),
+                })
+            })
+            .map(|rows| rows.filter_map(Result::ok).collect())
+            .unwrap_or_default();
+        v.reverse();
+        v
+    }
+
+    pub fn append_opt_out(&self, o: &OptOutEvent) -> Result<(), String> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO opt_out_log (at_unix, upstream, host) VALUES (?1, ?2, ?3)",
+            params![o.at_unix as i64, o.upstream, o.host],
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn load_opt_outs(&self) -> Vec<OptOutEvent> {
+        let conn = self.conn.lock();
+        let mut stmt = match conn
+            .prepare("SELECT at_unix, upstream, host FROM opt_out_log ORDER BY at_unix")
+        {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map([], |r| {
+            Ok(OptOutEvent {
+                at_unix: r.get::<_, i64>(0)? as u64,
+                upstream: r.get(1)?,
+                host: r.get(2)?,
+            })
+        })
+        .map(|rows| rows.filter_map(Result::ok).collect())
+        .unwrap_or_default()
     }
 
     // ── invoices (storefront, plan §5) ──────────────────────────────────

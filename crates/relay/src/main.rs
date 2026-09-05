@@ -67,6 +67,10 @@ async fn main() {
                 std::process::exit(1);
             }));
             s.clone().run_flusher();
+            // The public numbers (requests, verified, faults, ejections,
+            // the fault and opt-out logs) live in the same database.
+            pool.attach_store(Arc::clone(&s));
+            tokio::spawn(Arc::clone(&pool).run_stats_flusher());
             let b = Arc::new(
                 Billing::new(cfg.billing.clone(), Arc::clone(&s)).unwrap_or_else(|e| {
                     eprintln!("{e}");

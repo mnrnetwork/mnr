@@ -47,7 +47,9 @@ HTTP 502 with `Mnr-Verify: failed`.
 fault log entry that caused it and the upstreams feed both carry
 `ejected_until`; when the ejection lapses the upstream re-enters the ranking on
 the next probe round and the lapse is logged once. Faults, ejections and the
-`verified` count per upstream are public.
+`verified` count per upstream are public, and they persist across relay
+restarts in the relay's database (the fault log keeps its newest thousand
+entries), so "node X served a wrong header on Tuesday" stays on the page.
 
 Verified answers whose height is at or below `quorum_tip − 10` are cached under
 the current chain epoch; the alias forms (`getblock`, …) share the entry.
