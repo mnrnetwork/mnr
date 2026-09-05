@@ -33,8 +33,21 @@ use crate::metrics::Metrics;
 use crate::stream::Accounted;
 use crate::upstream::Pool;
 
+/// What this build reports about itself. Information for operators and the
+/// upstreams page, never proof: a modified relay can say anything here.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const GIT_SHA: &str = env!("MNR_GIT_SHA");
+pub const TARGET: &str = env!("MNR_TARGET");
+
+/// `Mnr-Relay: mnr-relay/<version>+<commit>` on every answer.
+fn relay_header() -> String {
+    format!("mnr-relay/{VERSION}+{GIT_SHA}")
+}
+
 /// Shared state for every handler.
 pub struct App {
+    /// When this process started (unix seconds), for the status feed.
+    pub started_at: u64,
     pub pool: Arc<Pool>,
     pub chain: Arc<ChainStore>,
     pub cache: Arc<Cache>,
@@ -72,7 +85,15 @@ async fn healthz(State(app): State<Arc<App>>) -> (StatusCode, &'static str) {
 /// data, so any origin may read it; cached briefly since it changes once a
 /// probe round.
 async fn upstreams(State(app): State<Arc<App>>) -> Response {
-    let mut r = Json(app.pool.status()).into_response();
+    let mut body = serde_json::to_value(app.pool.status()).unwrap_or(Value::Null);
+    body["relay"] = serde_json::json!({
+        "version": VERSION,
+        "commit": GIT_SHA,
+        "target": TARGET,
+        "started_at": app.started_at,
+        "self_reported": true,
+    });
+    let mut r = Json(body).into_response();
     let h = r.headers_mut();
     h.insert("access-control-allow-origin", HeaderValue::from_static("*"));
     h.insert(
@@ -392,7 +413,13 @@ fn respond(
         r.headers_mut().insert(header::CONTENT_TYPE, ct);
     }
     set_headers(&mut r, &o.headers);
-    set_headers(&mut r, &[("Mnr-Tier", principal.tier.label().to_owned())]);
+    set_headers(
+        &mut r,
+        &[
+            ("Mnr-Tier", principal.tier.label().to_owned()),
+            ("Mnr-Relay", relay_header()),
+        ],
+    );
     r
 }
 

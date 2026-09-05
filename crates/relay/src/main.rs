@@ -130,6 +130,7 @@ async fn main() {
     }
 
     let app = Arc::new(App {
+        started_at: now_secs(),
         pool,
         chain,
         cache,

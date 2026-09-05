@@ -136,6 +136,30 @@ impl Outcome {
     }
 }
 
+/// Methods whose request body says something about the wallet: which
+/// outputs it is building a ring from, which transactions it looks up,
+/// which key images it checks. These go to our own node first
+/// ([`Work::Sensitive`]); a public node sees them only as the fallback.
+const SENSITIVE: &[&str] = &[
+    "/get_transactions",
+    "/get_outs",
+    "/get_outs.bin",
+    "/get_o_indexes.bin",
+    "/get_output_distribution.bin",
+    "get_output_distribution",
+    "get_output_histogram",
+    "/is_key_image_spent",
+];
+
+/// Which ranking a method's requests use.
+pub(crate) fn work_for(method: &str) -> Work {
+    if SENSITIVE.contains(&verify::canonical(method)) {
+        Work::Sensitive
+    } else {
+        Work::Light
+    }
+}
+
 /// Route one request by its policy class.
 pub async fn dispatch(ctx: Ctx, policy: &'static Policy, req: Request) -> Outcome {
     let timeout = Duration::from_millis(u64::from(policy.timeout_ms.max(1000)));
@@ -153,7 +177,18 @@ pub async fn dispatch(ctx: Ctx, policy: &'static Policy, req: Request) -> Outcom
         }
         Class::ImmutableConditional => agreement::agreement(ctx, policy, req, timeout).await,
         Class::Swr => consensus::swr(ctx, req, timeout).await,
-        _ => read(&ctx.pool, req.path, req.content_type, req.body, timeout).await,
+        _ => {
+            let work = work_for(&req.method);
+            read(
+                &ctx.pool,
+                req.path,
+                req.content_type,
+                req.body,
+                timeout,
+                work,
+            )
+            .await
+        }
     }
 }
 
@@ -225,7 +260,7 @@ async fn fetch_verified<T>(
     method: &str,
     mut check: impl FnMut(&Forwarded) -> Result<T, Fault>,
 ) -> Result<(Forwarded, usize, T), Box<Outcome>> {
-    let ranked = pool.ranked(Work::Light);
+    let ranked = pool.ranked(work_for(method));
     if ranked.is_empty() {
         return Err(Box::new(Outcome::json_error(
             503,
@@ -344,10 +379,28 @@ struct TxCached {
 async fn transactions(ctx: Ctx, req: Request, timeout: Duration) -> Outcome {
     let request: Value = match serde_json::from_slice(&req.body) {
         Ok(v) => v,
-        Err(_) => return read(&ctx.pool, req.path, req.content_type, req.body, timeout).await,
+        Err(_) => {
+            return read(
+                &ctx.pool,
+                req.path,
+                req.content_type,
+                req.body,
+                timeout,
+                Work::Sensitive,
+            )
+            .await
+        }
     };
     let Some(hashes) = request.get("txs_hashes").and_then(Value::as_array) else {
-        return read(&ctx.pool, req.path, req.content_type, req.body, timeout).await;
+        return read(
+            &ctx.pool,
+            req.path,
+            req.content_type,
+            req.body,
+            timeout,
+            Work::Sensitive,
+        )
+        .await;
     };
     let hashes: Vec<String> = hashes
         .iter()
@@ -552,8 +605,9 @@ pub(crate) async fn read(
     content_type: &str,
     body: Bytes,
     timeout: Duration,
+    work: Work,
 ) -> Outcome {
-    let ranked = pool.ranked(Work::Light);
+    let ranked = pool.ranked(work);
     if ranked.is_empty() {
         return Outcome::json_error(503, "no healthy upstream", Verify::None);
     }
@@ -1282,6 +1336,29 @@ mod tests {
         assert!(o.headers.contains(&("Mnr-Verify", "none".to_owned())));
         let v: Value = serde_json::from_slice(&o.body).unwrap();
         assert_eq!(v["error"]["code"], -32603);
+    }
+
+    #[test]
+    fn sensitive_methods_are_routed_to_the_owned_node_first() {
+        for m in [
+            "/get_transactions",
+            "/gettransactions",
+            "/get_outs.bin",
+            "/get_o_indexes.bin",
+            "get_output_distribution",
+            "get_output_histogram",
+            "/is_key_image_spent",
+        ] {
+            assert_eq!(work_for(m), Work::Sensitive, "{m}");
+        }
+        for m in [
+            "get_block",
+            "get_info",
+            "/get_transaction_pool_stats",
+            "/get_height",
+        ] {
+            assert_eq!(work_for(m), Work::Light, "{m}");
+        }
     }
 
     #[test]

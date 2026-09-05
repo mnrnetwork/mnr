@@ -66,6 +66,11 @@ pub enum Work {
     Light,
     /// `get_blocks.bin` stream: owned first, clearnet public second, never onion.
     Stream,
+    /// A request whose *content* says something about the wallet (which
+    /// outputs, which transactions, which key images): our own node first,
+    /// always, so no third party sees it while our node is up; public nodes
+    /// by rank only as the fallback.
+    Sensitive,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -548,8 +553,8 @@ impl Pool {
                 let mut score = h.rtt_ema_ms.unwrap_or(f64::MAX / 2.0);
                 if owned {
                     score -= OWNED_BONUS_MS;
-                    if work == Work::Stream {
-                        score -= 1e6; // owned first for streams, always
+                    if matches!(work, Work::Stream | Work::Sensitive) {
+                        score -= 1e6; // owned first, always
                     }
                 }
                 Some((u.id, score))
@@ -1037,6 +1042,37 @@ transport = "onion"
         // own (30-20=10) beats pub-fast (15); pub-slow is one block behind
         // the quorum tip and is excluded; onion is last but allowed.
         assert_eq!(p.ranked(Work::Light), vec![0, 1, 3]);
+    }
+
+    #[test]
+    fn sensitive_requests_go_to_the_owned_node_first_even_when_slower() {
+        let p = pool();
+        set(
+            &p,
+            [
+                healthy(101, 900.0),
+                healthy(101, 15.0),
+                healthy(101, 20.0),
+                healthy(101, 1.0),
+            ],
+            Some(100),
+        );
+        // Light: fastest first (the onion node at 1 ms); sensitive: ours first,
+        // then the same public order as light.
+        assert_eq!(p.ranked(Work::Light), vec![3, 1, 2, 0]);
+        assert_eq!(p.ranked(Work::Sensitive), vec![0, 3, 1, 2]);
+        // Owned node down: the fallback is the normal ranking.
+        set(
+            &p,
+            [
+                Health::default(),
+                healthy(101, 15.0),
+                healthy(101, 20.0),
+                healthy(101, 1.0),
+            ],
+            Some(100),
+        );
+        assert_eq!(p.ranked(Work::Sensitive), vec![3, 1, 2]);
     }
 
     #[test]

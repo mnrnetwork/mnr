@@ -1136,6 +1136,7 @@ mod tests {
         .unwrap();
         let limiter: Arc<dyn Limiter> = Arc::clone(&store) as Arc<dyn Limiter>;
         let app = Arc::new(App {
+            started_at: 0,
             pool: Arc::new(Pool::from_config(&cfg).unwrap()),
             chain: Arc::new(ChainStore::open(None).unwrap()),
             cache: Arc::new(Cache::new(1 << 20)),

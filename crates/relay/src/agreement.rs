@@ -52,7 +52,17 @@ pub async fn agreement(
         _ => 1,
     } as usize;
     if need <= 1 {
-        return dispatch::read(&ctx.pool, req.path, req.content_type, req.body, timeout).await;
+        // Free: one upstream, our own node first (plan §10 item 3, and the
+        // request says which outputs a wallet is looking at).
+        return dispatch::read(
+            &ctx.pool,
+            req.path,
+            req.content_type,
+            req.body,
+            timeout,
+            Work::Sensitive,
+        )
+        .await;
     }
 
     let cache_key = distribution_key(&ctx, &req);
@@ -68,7 +78,8 @@ pub async fn agreement(
         }
     }
 
-    let ranked = ctx.pool.ranked(Work::Light);
+    // Pro: our node plus the best public node, compared.
+    let ranked = ctx.pool.ranked(Work::Sensitive);
     let mut chosen = Vec::with_capacity(need);
     let mut spares = Vec::new();
     for id in ranked.into_iter().take(CANDIDATES) {

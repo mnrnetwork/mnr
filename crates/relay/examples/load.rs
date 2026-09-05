@@ -275,6 +275,7 @@ async fn main() {
     let limiter: Arc<dyn Limiter> = Arc::new(MemoryLimiter::new());
     let metrics = Arc::new(Metrics::new());
     let app = Arc::new(App {
+        started_at: 0,
         pool: Arc::clone(&pool),
         chain: Arc::new(ChainStore::open(None).unwrap()),
         cache: Arc::new(Cache::new(1 << 28)),
