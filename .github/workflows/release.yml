@@ -30,11 +30,14 @@ jobs:
           cp target/release/mnr-relay relay.example.toml LICENSE "dist/$name/"
           cp crates/relay/README.md "dist/$name/README.md"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
-          (cd dist && sha256sum "$name.tar.gz" > "$name.sha256")
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
-          path: dist/*.tar.gz*
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
   publish:
     needs: build
     runs-on: ubuntu-latest
