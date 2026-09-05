@@ -31,7 +31,7 @@ use crate::dispatch::{self, Outcome};
 use crate::limits::{Limiter, StreamPermit, Verdict, LIGHT_WU};
 use crate::metrics::Metrics;
 use crate::stream::Accounted;
-use crate::upstream::{Pool, PoolStatus};
+use crate::upstream::Pool;
 
 /// Shared state for every handler.
 pub struct App {
@@ -68,8 +68,18 @@ async fn healthz(State(app): State<Arc<App>>) -> (StatusCode, &'static str) {
     }
 }
 
-async fn upstreams(State(app): State<Arc<App>>) -> Json<PoolStatus> {
-    Json(app.pool.status())
+/// The public status feed behind `mnr.network/upstreams` (rule 1). Public
+/// data, so any origin may read it; cached briefly since it changes once a
+/// probe round.
+async fn upstreams(State(app): State<Arc<App>>) -> Response {
+    let mut r = Json(app.pool.status()).into_response();
+    let h = r.headers_mut();
+    h.insert("access-control-allow-origin", HeaderValue::from_static("*"));
+    h.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=10"),
+    );
+    r
 }
 
 /// Every RPC path lands here. `rest` is everything after `/` or `/v1/`.
