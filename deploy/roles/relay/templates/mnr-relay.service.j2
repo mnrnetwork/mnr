@@ -1,7 +1,7 @@
 # {{ ansible_managed }}
 [Unit]
 Description=mnr-relay — verified Monero RPC relay
-After=network-online.target monero-wallet-rpc.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]

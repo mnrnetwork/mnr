@@ -22,10 +22,11 @@ all:
             - { name: hashvault, url: "http://nodes.hashvault.pro:18081", kind: public, transport: http }
           mnr_opt_out: []
           mnr_pro_price_atomic: 60000000000
-          # View-only wallet for invoices: the *view key* and address, never a spend key.
-          mnr_wallet_address: "4…"
-          mnr_wallet_viewkey: "{{ vault_wallet_viewkey }}"
-          mnr_wallet_restore_height: 3700000
+          # View-only wallet for Pro invoices: the *view key* and address, never a
+          # spend key. Leave these three out to run Free-only for now.
+          # mnr_wallet_address: "4…"
+          # mnr_wallet_viewkey: "{{ vault_wallet_viewkey }}"
+          # mnr_wallet_restore_height: 3700000
     node:
       hosts:
         node-1:

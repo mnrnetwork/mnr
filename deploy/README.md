@@ -35,9 +35,11 @@ the restricted port opened.
   opens to everyone and the socket peer is the client.
 - Tor with a v3 hidden service on the same relay; the address is printed at
   the end of the play and lives in `/var/lib/tor/mnr/hostname`.
-- `monero-wallet-rpc` **view-only** on loopback for invoices. The wallet is
-  restored on first run from `mnr_wallet_address` and the vaulted view key;
-  the spend key never touches this box.
+- `monero-wallet-rpc` **view-only** on loopback for invoices, only when
+  `mnr_wallet_viewkey` is set. The wallet is restored on first run from
+  `mnr_wallet_address` and the vaulted view key; the spend key never touches
+  this box. Without it the relay runs Free-only and Pro invoices answer 503;
+  add the wallet vars and re-run the play to turn Pro on.
 - Prometheus and node_exporter scraping the relay's private `/metrics`.
 
 ## Back up the invoice secret
