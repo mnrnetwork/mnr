@@ -168,9 +168,10 @@ pub(crate) async fn compose(ctx: Ctx, req: Request, timeout: Duration) -> Outcom
             None => misses.push(h.clone()),
         }
     }
-    // Entries from the tier and from fully verified batches count as
-    // verified (k); dropped entries and entries of a partial batch count
-    // toward n only.
+    // An entry counts as verified (k) when the relay itself parsed its full
+    // blob and the recomputed hash is one it asked for; the verified path
+    // has already faulted any node whose blob did not hash to its id.
+    // Entries with no parseable full blob count toward n only.
     let mut verified = entries.len();
     let mut total = entries.len();
 
@@ -193,7 +194,6 @@ pub(crate) async fn compose(ctx: Ctx, req: Request, timeout: Duration) -> Outcom
         if fetched.status != 200 {
             return fetched;
         }
-        let all_verified = header(&fetched, "Mnr-Verify") == Some(Verify::Hash.label());
         let answer: Value = match serde_json::from_slice(&fetched.body) {
             Ok(v) => v,
             Err(_) => return Outcome::json_error(502, "transactions are not JSON", Verify::None),
@@ -226,13 +226,11 @@ pub(crate) async fn compose(ctx: Ctx, req: Request, timeout: Duration) -> Outcom
                 continue;
             }
             let tx = PoolTx::from_entry(entry, &parsed, blob_hex, now);
-            if all_verified {
-                verified += 1;
-                if let Ok(bytes) = serde_json::to_vec(&tx) {
-                    ctx.cache
-                        .pool_put(Cache::pool_key(&id), Bytes::from(bytes))
-                        .await;
-                }
+            verified += 1;
+            if let Ok(bytes) = serde_json::to_vec(&tx) {
+                ctx.cache
+                    .pool_put(Cache::pool_key(&id), Bytes::from(bytes))
+                    .await;
             }
             entries.insert(id, tx);
         }
@@ -303,6 +301,8 @@ mod tests {
     const TXS_A: &str = include_str!("../../core/fixtures/mainnet/txs-3754000-prune-false.json");
     const TXS_B: &str = include_str!("../../core/fixtures/mainnet/txs-2689608-prune-false.json");
     const POOL_ENTRY: &str = include_str!("../../core/fixtures/mainnet/pool-entries.json");
+    /// A pruned v1 transaction: no hashable form, so *unverifiable*.
+    const PRUNED_V1: &str = include_str!("../../core/fixtures/mainnet/txs-1009827-prune-true.json");
 
     /// `txid → (as_hex, as_json)` of every full fixture transaction, posing
     /// as pool transactions.
@@ -335,6 +335,8 @@ mod tests {
         mined: Vec<String>,
         /// Flip a byte of every blob (a lying node).
         tamper: bool,
+        /// Also answer the pruned-v1 fixture entry (unverifiable) when asked.
+        pruned_v1: bool,
         calls: Arc<AtomicUsize>,
         tx_calls: Arc<AtomicUsize>,
     }
@@ -363,7 +365,22 @@ mod tests {
                     let mut as_hex = Vec::new();
                     let mut as_json = Vec::new();
                     let mut missed = Vec::new();
+                    let pv1: Value = serde_json::from_str(PRUNED_V1).unwrap();
+                    let pv1 = &pv1["txs"][0];
                     for h in &want {
+                        if n.pruned_v1 && pv1["tx_hash"] == *h {
+                            let mut e = pv1.clone();
+                            e["in_pool"] = json!(true);
+                            e["relayed"] = json!(true);
+                            e["received_timestamp"] = json!(0);
+                            for k in ["block_height", "block_timestamp", "confirmations", "output_indices"] {
+                                e.as_object_mut().unwrap().remove(k);
+                            }
+                            txs.push(e);
+                            as_hex.push(Value::String(String::new()));
+                            as_json.push(pv1["as_json"].clone());
+                            continue;
+                        }
                         match known.iter().find(|(id, ..)| id == h) {
                             Some((id, hex, js)) => {
                                 let mut hex = hex.clone();
@@ -418,6 +435,7 @@ mod tests {
             listing,
             mined: Vec::new(),
             tamper: false,
+            pruned_v1: false,
             calls: Arc::new(AtomicUsize::new(0)),
             tx_calls: Arc::new(AtomicUsize::new(0)),
         })
@@ -547,6 +565,7 @@ mod tests {
             listing: listing.clone(),
             mined: vec![known[0].0.clone()],
             tamper: false,
+            pruned_v1: false,
             calls: Arc::new(AtomicUsize::new(0)),
             tx_calls: Arc::new(AtomicUsize::new(0)),
         };
@@ -577,6 +596,7 @@ mod tests {
             listing: listing.clone(),
             mined: Vec::new(),
             tamper: true,
+            pruned_v1: false,
             calls: Arc::new(AtomicUsize::new(0)),
             tx_calls: Arc::new(AtomicUsize::new(0)),
         });
@@ -614,6 +634,52 @@ mod tests {
             known.len()
         );
         assert_eq!(o.extra_wu, 150);
+    }
+
+    #[tokio::test]
+    async fn an_unverifiable_entry_makes_the_listing_partial_and_is_not_kept() {
+        let known = blobs();
+        let pv1: Value = serde_json::from_str(PRUNED_V1).unwrap();
+        let odd = pv1["txs"][0]["tx_hash"].as_str().unwrap().to_owned();
+        let mut listing: Vec<String> = known.iter().map(|(id, ..)| id.clone()).collect();
+        listing.push(odd.clone());
+        let n = Arc::new(Node {
+            listing: listing.clone(),
+            mined: Vec::new(),
+            tamper: false,
+            pruned_v1: true,
+            calls: Arc::new(AtomicUsize::new(0)),
+            tx_calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let ctx = env(&[Arc::clone(&n)]).await;
+        let o = call(&ctx).await;
+        assert_eq!(o.status, 200, "{}", String::from_utf8_lossy(&o.body));
+        assert_eq!(header(&o, "Mnr-Verify"), Some("partial"));
+        assert_eq!(
+            header(&o, "Mnr-Verified"),
+            Some(format!("{}/{}", known.len(), listing.len()).as_str()),
+            "every parsed entry is verified; the pruned one is not"
+        );
+        let v = body(&o);
+        let ids: Vec<&str> = v["transactions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id_hash"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids.len(), known.len(), "the unparseable entry is dropped");
+        assert!(!ids.contains(&odd.as_str()));
+        assert!(
+            ctx.pool.status().faults.is_empty(),
+            "unverifiable is not a fault"
+        );
+        // The verified entries are kept; only the odd one is asked for again.
+        let o = call(&ctx).await;
+        assert_eq!(header(&o, "Mnr-Verify"), Some("partial"));
+        assert_eq!(o.extra_wu, 1);
+        assert_eq!(n.tx_calls.load(Ordering::SeqCst), 2);
+        let [_, _, _, (_, entries, _)] = ctx.cache.stats().await;
+        assert_eq!(entries, known.len() as u64);
     }
 
     #[tokio::test]
