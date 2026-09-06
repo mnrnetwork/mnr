@@ -103,7 +103,12 @@ it for 30 days × months from the moment of payment.
 Answers `{"token": "sub_…", "previous_valid_secs": 86400}`. The new token is
 current from now; the old one keeps working for 24 hours so a wallet can be
 switched without a gap. A rotated purchase token can no longer be recovered
-from its invoice.
+from its invoice. A renewal invoice that was open when the token was rotated
+is still the token's: paying it extends the rotated token, and a second
+renewal request from the new token is refused while it is pending. Rotating
+twice while an invoice is open drops the link (only one previous hash is
+kept); such an invoice expires unpaid after 24 hours and the relay logs the
+handle each time the watcher tries it.
 
 ## What the relay never has
 

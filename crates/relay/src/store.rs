@@ -527,7 +527,38 @@ impl SqliteStore {
     /// The `valid_until` of a current token, `Some(None)` for "never",
     /// `None` for an unknown token.
     pub fn valid_until(&self, hash: &[u8; 32]) -> Option<Option<u64>> {
-        self.tokens.read().get(hash).map(|r| r.valid_until)
+        let cached = self.tokens.read().get(hash).map(|r| r.valid_until);
+        // A previous hash past its grace is not cached but still names the
+        // row (a renewal invoice may carry it; see `extend`).
+        cached.or_else(|| self.lookup_db(hash).map(|r| r.valid_until))
+    }
+
+    /// `(current, previous)` hashes of the token row that `hash` names as
+    /// either, so a lookup keyed on a hash survives a rotation.
+    fn hashes_of(&self, hash: &[u8; 32]) -> Option<([u8; 32], Option<[u8; 32]>)> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT token_hash, prev_token_hash FROM tokens
+             WHERE token_hash = ?1 OR prev_token_hash = ?1",
+            params![hash.as_slice()],
+            |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Option<Vec<u8>>>(1)?)),
+        )
+        .ok()
+        .and_then(|(cur, prev)| {
+            Some((
+                cur.as_slice().try_into().ok()?,
+                prev.as_deref().and_then(|h| <[u8; 32]>::try_from(h).ok()),
+            ))
+        })
+    }
+
+    /// Both hashes of the row `hash` names, for a two-value `IN` clause;
+    /// `hash` twice when it names no row.
+    fn hash_pair(&self, hash: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
+        match self.hashes_of(hash) {
+            Some((cur, prev)) => (cur, prev.unwrap_or(cur)),
+            None => (*hash, *hash),
+        }
     }
 
     /// Tier, whether it is active (not suspended), and `valid_until` of a
@@ -546,12 +577,15 @@ impl SqliteStore {
     }
 
     /// A pending invoice that would renew the token with this hash, if any.
+    /// An invoice opened before the token was rotated is found by either
+    /// hash, so a rotation neither strands it nor lets a second one open.
     pub fn pending_invoice_for(&self, hash: &[u8; 32]) -> Option<Invoice> {
+        let (a, b) = self.hash_pair(hash);
         let conn = self.conn.lock();
         conn.query_row(
             "SELECT id, subaddr_index, address, amount, months, renew_hash, created_at, expires_at, status, received, paid_at
-             FROM invoices WHERE renew_hash = ?1 AND status = 'pending' LIMIT 1",
-            params![hash.as_slice()],
+             FROM invoices WHERE renew_hash IN (?1, ?2) AND status = 'pending' LIMIT 1",
+            params![a.as_slice(), b.as_slice()],
             Self::row_to_invoice,
         )
         .ok()
@@ -759,11 +793,12 @@ impl SqliteStore {
     /// The most recent invoice that renewed (or created) the token with
     /// this hash, so a renewal can reuse its subaddress.
     pub fn latest_invoice_for(&self, hash: &[u8; 32]) -> Option<Invoice> {
+        let (a, b) = self.hash_pair(hash);
         let conn = self.conn.lock();
         conn.query_row(
             "SELECT id, subaddr_index, address, amount, months, renew_hash, created_at, expires_at, status, received, paid_at
-             FROM invoices WHERE renew_hash = ?1 ORDER BY created_at DESC LIMIT 1",
-            params![hash.as_slice()],
+             FROM invoices WHERE renew_hash IN (?1, ?2) ORDER BY created_at DESC LIMIT 1",
+            params![a.as_slice(), b.as_slice()],
             Self::row_to_invoice,
         )
         .ok()
@@ -924,12 +959,14 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// Extend a token's `valid_until` (unix timestamp).
+    /// Extend a token's `valid_until` (unix timestamp). `hash` may be the
+    /// token's current or previous hash: a renewal invoice carries the hash
+    /// at the time it was opened, and the customer may rotate before paying.
     pub fn extend(&self, hash: &[u8; 32], valid_until: u64) -> Result<(), String> {
         let conn = self.conn.lock();
         let n = conn
             .execute(
-                "UPDATE tokens SET valid_until = ?1 WHERE token_hash = ?2",
+                "UPDATE tokens SET valid_until = ?1 WHERE token_hash = ?2 OR prev_token_hash = ?2",
                 params![valid_until as i64, hash.as_slice()],
             )
             .map_err(|e| e.to_string())?;
@@ -938,6 +975,7 @@ impl SqliteStore {
             return Err("unknown token".to_owned());
         }
         let id = self.tokens.read().get(hash).map(|r| r.id);
+        let id = id.or_else(|| self.lookup_db(hash).map(|r| r.id));
         if let Some(id) = id {
             self.update_cached(id, |r| r.valid_until = Some(valid_until));
         }
@@ -1322,6 +1360,42 @@ mod tests {
     fn open_tmp(dir: &tempfile::TempDir) -> (SqliteStore, std::path::PathBuf) {
         let db = dir.path().join("t.db");
         (SqliteStore::open(Some(&db)).unwrap(), db)
+    }
+
+    #[test]
+    fn renewal_lookups_and_extend_follow_a_rotated_token() {
+        let s = SqliteStore::open(None).unwrap();
+        let old = s.issue(Tier::Pro, Some(1));
+        let old_hash = token_hash(&old);
+        let inv = Invoice {
+            id: "renew1".into(),
+            subaddr_index: 3,
+            address: "8abc".into(),
+            amount: 1,
+            months: 1,
+            renew_hash: Some(old_hash),
+            created_at: 1_000,
+            expires_at: 9_000,
+            status: InvoiceStatus::Pending,
+            received: 0,
+            paid_at: None,
+        };
+        s.create_invoice(&inv).unwrap();
+        let new = s.rotate(&old_hash).unwrap();
+        let new_hash = token_hash(&new);
+        // The invoice is found by either hash.
+        assert_eq!(s.pending_invoice_for(&new_hash).unwrap().id, "renew1");
+        assert_eq!(s.pending_invoice_for(&old_hash).unwrap().id, "renew1");
+        assert_eq!(s.latest_invoice_for(&new_hash).unwrap().id, "renew1");
+        // Paying it extends the rotated token, whichever hash the invoice holds.
+        let later = unix_now() + 5_000;
+        s.extend(&old_hash, later).unwrap();
+        assert_eq!(s.valid_until(&new_hash), Some(Some(later)));
+        assert_eq!(s.valid_until(&old_hash), Some(Some(later)));
+        assert_eq!(s.authenticate(&new_hash).unwrap().tier, Tier::Pro);
+        // A hash that names no row is still unknown.
+        assert_eq!(s.extend(&[1; 32], 1), Err("unknown token".to_owned()));
+        assert_eq!(s.pending_invoice_for(&[1; 32]), None);
     }
 
     #[test]

@@ -1046,6 +1046,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn renewal_paid_after_a_rotation_extends_the_rotated_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteStore::open(Some(&dir.path().join("b.db"))).unwrap());
+        let w = Arc::new(Wallet {
+            next_index: AtomicU64::new(1),
+            transfers: Mutex::new(Vec::new()),
+            calls: AtomicU64::new(0),
+        });
+        let url = wallet(Arc::clone(&w)).await;
+        let b = Billing::new(cfg(Some(url), dir.path()), Arc::clone(&store)).unwrap();
+        let h = HeaderMap::new();
+        let old = store.issue(Tier::Pro, Some(1));
+        let v = b
+            .create_invoice(
+                &h,
+                peer(),
+                InvoiceRequest {
+                    months: Some(1),
+                    renew: Some(old.clone()),
+                },
+            )
+            .await
+            .unwrap();
+        let id = v["invoice_id"].as_str().unwrap().to_owned();
+        // The customer rotates before paying.
+        let new = store.rotate(&token_hash(&old)).unwrap();
+        // The pending invoice is still the token's: no second one opens.
+        assert!(matches!(
+            b.create_invoice(&h, peer(), InvoiceRequest { months: Some(1), renew: Some(new.clone()) }).await,
+            Err(Refusal::BadRequest(m)) if m.contains("already pending")
+        ));
+        w.transfers.lock().push((1, 60_000_000_000, 10, unix_now()));
+        b.check_invoices().await;
+        assert_eq!(store.invoice(&id).unwrap().status, InvoiceStatus::Paid);
+        let until = store.valid_until(&token_hash(&new)).unwrap().unwrap();
+        assert!(
+            until >= unix_now() + MONTH_SECS - 5,
+            "the rotated token runs on"
+        );
+        assert!(store.pending_invoices().is_empty());
+    }
+
+    #[tokio::test]
     async fn wallet_failures_leave_invoices_pending_and_expiry_closes_them() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(SqliteStore::open(Some(&dir.path().join("b.db"))).unwrap());
