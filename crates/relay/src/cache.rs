@@ -45,6 +45,12 @@ const IMMUTABLE_TTL: Duration = Duration::from_secs(30 * 24 * 3600);
 const SWR_ENTRIES: u64 = 1000;
 /// Tx-tier weight is bounded alongside the immutable tier.
 const TX_SHARE: u64 = 4;
+/// The pool tier's share of the cache budget (1/64: a busy mempool is a few
+/// hundred transactions of a few KB each).
+const POOL_SHARE: u64 = 64;
+/// How long a verified mempool transaction is kept for the composed
+/// listing. Membership is re-read every time; this only bounds refetching.
+const POOL_TTL: Duration = Duration::from_secs(10 * 60);
 
 /// What the `Mnr-Cache` header says about an answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +126,11 @@ pub struct Cache {
     immutable: Moka<String, Arc<Cached>>,
     txs: Moka<String, Arc<Bytes>>,
     swr: Moka<String, Arc<SwrEntry>>,
+    /// Verified mempool transactions by txid, for the composed
+    /// `/get_transaction_pool` (plan decision 8). Membership in the pool is
+    /// never read from here, only from a fresh listing; the tier saves
+    /// refetching a blob that already hashed to its id.
+    pool: Moka<String, Arc<Bytes>>,
     /// SWR keys with a refresh in flight (single-flight). A claim that is
     /// never released (a panicking refresh task) only blocks background
     /// refreshes; the entry itself expires with the tier's TTL and the
@@ -149,6 +160,11 @@ impl Cache {
             swr: Moka::builder()
                 .max_capacity(SWR_ENTRIES)
                 .time_to_live(SWR_MAX_AGE + SWR_REVALIDATE + SWR_IF_ERROR)
+                .build(),
+            pool: Moka::builder()
+                .max_capacity(max_bytes / POOL_SHARE)
+                .weigher(weigh_bytes)
+                .time_to_live(POOL_TTL)
                 .build(),
             refreshing: Mutex::new(HashSet::new()),
         }
@@ -191,6 +207,20 @@ impl Cache {
         format!("{method}|{params}")
     }
 
+    /// Key for one verified mempool transaction (no epoch: a blob that
+    /// hashes to its id is the same on every chain).
+    pub fn pool_key(tx_hash: &str) -> String {
+        format!("pool|{tx_hash}")
+    }
+
+    pub async fn pool_get(&self, key: &str) -> Option<Arc<Bytes>> {
+        self.pool.get(key).await
+    }
+
+    pub async fn pool_put(&self, key: String, entry: Bytes) {
+        self.pool.insert(key, Arc::new(entry)).await;
+    }
+
     pub async fn swr_get(&self, key: &str) -> Option<Arc<SwrEntry>> {
         self.swr.get(key).await
     }
@@ -224,10 +254,11 @@ impl Cache {
     }
 
     /// `(entries, bytes)` per tier for metrics, after pending housekeeping.
-    pub async fn stats(&self) -> [(&'static str, u64, u64); 3] {
+    pub async fn stats(&self) -> [(&'static str, u64, u64); 4] {
         self.immutable.run_pending_tasks().await;
         self.txs.run_pending_tasks().await;
         self.swr.run_pending_tasks().await;
+        self.pool.run_pending_tasks().await;
         [
             (
                 "immutable",
@@ -236,6 +267,7 @@ impl Cache {
             ),
             ("tx", self.txs.entry_count(), self.txs.weighted_size()),
             ("swr", self.swr.entry_count(), self.swr.weighted_size()),
+            ("pool", self.pool.entry_count(), self.pool.weighted_size()),
         ]
     }
 }

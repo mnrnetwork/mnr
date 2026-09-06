@@ -473,9 +473,9 @@ mod tests {
 
     #[tokio::test]
     async fn denial_carries_the_policy_hint() {
-        let note = mnr_core::policy::lookup_or_deny("/get_transaction_pool").note;
-        assert!(note.contains("get_transaction_pool_hashes"), "{note}");
-        let legacy = denied(false, Value::Null, "/get_transaction_pool", Some(note));
+        let note = mnr_core::policy::lookup_or_deny("/get_peer_list").note;
+        assert!(!note.is_empty());
+        let legacy = denied(false, Value::Null, "/get_peer_list", Some(note));
         assert_eq!(legacy.status(), StatusCode::FORBIDDEN);
         let body = axum::body::to_bytes(legacy.into_body(), 1 << 16)
             .await

@@ -839,7 +839,7 @@ mod tests {
             assert_eq!(header(&o, "Mnr-Cache"), Some("bypass"));
         }
         assert_eq!(env.hits.load(Ordering::SeqCst), 2, "nothing was cached");
-        let [_, _, (_, swr_entries, _)] = env.ctx.cache.stats().await;
+        let [_, _, (_, swr_entries, _), _] = env.ctx.cache.stats().await;
         assert_eq!(swr_entries, 0);
         // Quorum back: the next answer is written and the one after is a hit.
         let mut h = Health::healthy_for_test(1001, [7; 32]);

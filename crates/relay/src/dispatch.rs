@@ -177,6 +177,7 @@ pub async fn dispatch(ctx: Ctx, policy: &'static Policy, req: Request) -> Outcom
         }
         Class::ImmutableConditional => agreement::agreement(ctx, policy, req, timeout).await,
         Class::Swr => consensus::swr(ctx, req, timeout).await,
+        Class::Composed => crate::pool::compose(ctx, req, timeout).await,
         _ => {
             let work = work_for(&req.method);
             read(
@@ -381,8 +382,9 @@ struct TxCached {
     as_json: String,
 }
 
-/// `/get_transactions`: per-tx cache, batch split, verification.
-async fn transactions(ctx: Ctx, req: Request, timeout: Duration) -> Outcome {
+/// `/get_transactions`: per-tx cache, batch split, verification. Also the
+/// verified source of the composed pool listing (`pool.rs`).
+pub(crate) async fn transactions(ctx: Ctx, req: Request, timeout: Duration) -> Outcome {
     let request: Value = match serde_json::from_slice(&req.body) {
         Ok(v) => v,
         Err(_) => {
