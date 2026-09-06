@@ -335,6 +335,12 @@ async fn immutable(ctx: Ctx, req: Request, timeout: Duration) -> Outcome {
         Ok(x) => x,
         Err(o) => return *o,
     };
+    // A chain- or hash-verified answer is what the public verified count
+    // records (plan §4); an unverifiable one (`none`) is served but not
+    // credited, and a cache hit asked nobody.
+    if v.verify != Verify::None {
+        ctx.pool.record_verified(id);
+    }
     let cacheable =
         v.verify != Verify::None && matches!((v.height, line), (Some(h), Some(l)) if h <= l);
     if cacheable {
@@ -998,6 +1004,23 @@ mod tests {
         let o = env.jsonrpc("getblock", json!({"height": 1})).await;
         assert_eq!(header(&o, "Mnr-Cache"), Some("hit"));
         assert_eq!(hits.load(Ordering::SeqCst), 1);
+        // One upstream answer was verified; the cache hits credit nobody.
+        assert_eq!(env.pool.status().upstreams[0].verified, 1);
+    }
+
+    #[tokio::test]
+    async fn chain_verified_answers_count_as_verified_and_unverifiable_ones_do_not() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let good = mock_with(block_server(false), Arc::clone(&hits)).await;
+        let env = Env::new(pool_at(&[good], 5));
+        let o = env.jsonrpc("get_block", json!({"height": 1})).await;
+        assert_eq!(header(&o, "Mnr-Verify"), Some("chain"));
+        assert_eq!(env.pool.status().upstreams[0].verified, 1);
+        // Height 2 is beyond the test chain: served as `none`, not credited.
+        let o = env.jsonrpc("get_block", json!({"height": 2})).await;
+        assert_eq!(header(&o, "Mnr-Verify"), Some("none"));
+        assert_eq!(env.pool.status().upstreams[0].verified, 1);
+        assert_eq!(env.pool.status().upstreams[0].faults, 0);
     }
 
     #[tokio::test]
