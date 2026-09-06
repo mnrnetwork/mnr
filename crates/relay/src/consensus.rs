@@ -21,16 +21,25 @@
 //!
 //! `get_info` is normalised (node-specific fields zeroed) so the answer
 //! describes the network, not a node.
+//!
+//! `get_last_block_header` is the one method here with a self-authenticating
+//! form: when the relay's header chain already holds the reported height,
+//! the header is checked against it and served as `chain`; a header the
+//! chain contradicts is served as `none` (a reorg in flight, which the next
+//! chain-sync round settles; not a fault, for the reason above).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use mnr_core::verify::median;
-use mnr_core::wire::{GetFeeEstimateResult, GetInfoResult, JsonRpcRequest, JsonRpcResponse};
+use mnr_core::verify::{self as rules, median, ReportedHeader, VerifyError};
+use mnr_core::wire::{
+    BlockHeader, GetFeeEstimateResult, GetInfoResult, JsonRpcRequest, JsonRpcResponse,
+};
 use serde_json::{json, Value};
 
 use crate::cache::{Cache, Freshness, Status, SwrEntry};
+use crate::chain::ChainStore;
 use crate::dispatch::{self, Ctx, Outcome, Request};
 use crate::upstream::{Pool, Work};
 use crate::verify::{self, Verify};
@@ -61,14 +70,15 @@ pub async fn swr(ctx: Ctx, req: Request, timeout: Duration) -> Outcome {
         Some(Freshness::Fresh) => (existing.expect("checked"), Status::Hit),
         Some(Freshness::Revalidate) => {
             if ctx.cache.begin_refresh(&key) {
-                let (cache, pool, key, plan) = (
+                let (cache, pool, chain, key, plan) = (
                     Arc::clone(&ctx.cache),
                     Arc::clone(&ctx.pool),
+                    Arc::clone(&ctx.chain),
                     key.clone(),
                     plan.clone(),
                 );
                 tokio::spawn(async move {
-                    if let Ok(e) = fetch(&pool, &plan).await {
+                    if let Ok(e) = fetch(&pool, &chain, &plan).await {
                         cache.swr_put(key.clone(), e).await;
                     }
                     cache.end_refresh(&key);
@@ -79,7 +89,7 @@ pub async fn swr(ctx: Ctx, req: Request, timeout: Duration) -> Outcome {
         Some(Freshness::IfError) => {
             let stale = existing.expect("checked");
             if ctx.cache.begin_refresh(&key) {
-                let fresh = fetch(&ctx.pool, &plan).await;
+                let fresh = fetch(&ctx.pool, &ctx.chain, &plan).await;
                 ctx.cache.end_refresh(&key);
                 match fresh {
                     Ok(e) => {
@@ -93,10 +103,10 @@ pub async fn swr(ctx: Ctx, req: Request, timeout: Duration) -> Outcome {
             }
         }
         Some(Freshness::Expired) | None => {
-            let pool = Arc::clone(&ctx.pool);
+            let (pool, chain) = (Arc::clone(&ctx.pool), Arc::clone(&ctx.chain));
             match ctx
                 .cache
-                .swr_get_or_fetch(key, async move { fetch(&pool, &plan).await })
+                .swr_get_or_fetch(key, async move { fetch(&pool, &chain, &plan).await })
                 .await
             {
                 Ok(e) => (e, Status::Miss),
@@ -155,7 +165,7 @@ struct Answer {
 }
 
 /// Ask up to three upstreams and reduce their answers to one entry.
-async fn fetch(pool: &Pool, plan: &FetchPlan) -> Result<SwrEntry, String> {
+async fn fetch(pool: &Pool, chain: &ChainStore, plan: &FetchPlan) -> Result<SwrEntry, String> {
     let ranked = pool.ranked(Work::Light);
     let mut chosen = Vec::with_capacity(ASK);
     for id in ranked.into_iter().take(CANDIDATES) {
@@ -206,26 +216,74 @@ async fn fetch(pool: &Pool, plan: &FetchPlan) -> Result<SwrEntry, String> {
         value,
         agreeing,
         members,
+        served,
     } = reduce(&plan.method, answers, quorum);
     let value = finish(&plan.method, value);
     let majority = agreeing.is_some_and(|k| k >= MIN_AGREE);
-    if majority {
-        // The agreeing upstreams' answers were confirmed by each other:
-        // that is what the public verified count records.
-        for id in &members {
-            pool.record_verified(*id);
+    let against_chain = if plan.method == "get_last_block_header" {
+        check_last_header(&value, chain)
+    } else {
+        ChainCheck::Unknown
+    };
+    let verify = match against_chain {
+        ChainCheck::Confirmed => Verify::Chain,
+        ChainCheck::Contradicted => Verify::None,
+        ChainCheck::Unknown if majority => Verify::Majority,
+        ChainCheck::Unknown => Verify::None,
+    };
+    // The public verified count records answers confirmed by each other
+    // (the agreeing members) or by our chain (the served answer alone,
+    // when nothing agreed).
+    match (verify, majority) {
+        (Verify::None, _) => {}
+        (_, true) => {
+            for id in &members {
+                pool.record_verified(*id);
+            }
         }
+        (_, false) => pool.record_verified(served),
     }
     Ok(SwrEntry {
         body: Bytes::from(serde_json::to_vec(&value).map_err(|e| e.to_string())?),
-        verify: if majority {
-            Verify::Majority.label()
-        } else {
-            Verify::None.label()
-        },
+        verify: verify.label(),
         agreeing: agreeing.filter(|k| *k >= MIN_AGREE).map(|k| (k, asked)),
         fetched: Instant::now(),
     })
+}
+
+/// What the header chain says about a `get_last_block_header` answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChainCheck {
+    /// The chain holds the height and the header matches it.
+    Confirmed,
+    /// The chain holds the height and the header differs.
+    Contradicted,
+    /// The chain does not reach the height (or the answer is not a header).
+    Unknown,
+}
+
+fn check_last_header(value: &Value, chain: &ChainStore) -> ChainCheck {
+    let Some(h) = value.get("block_header") else {
+        return ChainCheck::Unknown;
+    };
+    let Ok(header) = serde_json::from_value::<BlockHeader>(h.clone()) else {
+        return ChainCheck::Unknown;
+    };
+    let Ok(reported) = ReportedHeader::try_from(&header) else {
+        return ChainCheck::Unknown;
+    };
+    match rules::verify_header_by_height(reported.height, &reported, &chain.read()) {
+        Ok(()) => ChainCheck::Confirmed,
+        Err(VerifyError::UnknownHeight(_)) => ChainCheck::Unknown,
+        Err(e) => {
+            tracing::warn!(
+                height = reported.height,
+                error = %e,
+                "get_last_block_header disagrees with the header chain; served as none"
+            );
+            ChainCheck::Contradicted
+        }
+    }
 }
 
 /// The agreement key of one answer: what two honest nodes on the same
@@ -273,6 +331,8 @@ struct Reduced {
     agreeing: Option<usize>,
     /// The upstreams whose answers agreed (empty without a majority).
     members: Vec<usize>,
+    /// The upstream whose answer is served.
+    served: usize,
 }
 
 /// The value to serve: the largest group of identical keys, or the
@@ -304,25 +364,25 @@ fn reduce(method: &str, answers: Vec<Answer>, quorum: Option<u64>) -> Reduced {
                 .filter(|(k, _)| *k == key)
                 .map(|(_, a)| a.upstream)
                 .collect();
-            let value = keyed
-                .into_iter()
-                .nth(i)
-                .expect("index from iteration")
-                .1
-                .value;
+            let answer = keyed.into_iter().nth(i).expect("index from iteration").1;
             Reduced {
-                value,
+                value: answer.value,
                 agreeing: Some(count),
                 members,
+                served: answer.upstream,
             }
         }
-        _ => Reduced {
+        _ => {
             // Rank order is preserved from `chosen`: the first answer is
             // the best-ranked upstream that answered.
-            value: keyed.into_iter().next().expect("non-empty").1.value,
-            agreeing: None,
-            members: Vec::new(),
-        },
+            let answer = keyed.into_iter().next().expect("non-empty").1;
+            Reduced {
+                value: answer.value,
+                agreeing: None,
+                members: Vec::new(),
+                served: answer.upstream,
+            }
+        }
     }
 }
 
@@ -337,9 +397,10 @@ fn fee_median(answers: Vec<Answer>) -> Reduced {
     let n = parsed.len();
     let members: Vec<usize> = parsed.iter().map(|(_, a)| a.upstream).collect();
     let Some((first, first_answer)) = parsed.first() else {
-        let value = answers.into_iter().next().map_or(Value::Null, |a| a.value);
+        let first = answers.into_iter().next();
         return Reduced {
-            value,
+            served: first.as_ref().map_or(0, |a| a.upstream),
+            value: first.map_or(Value::Null, |a| a.value),
             agreeing: None,
             members: Vec::new(),
         };
@@ -371,6 +432,7 @@ fn fee_median(answers: Vec<Answer>) -> Reduced {
         value,
         agreeing: Some(n),
         members,
+        served: first_answer.upstream,
     }
 }
 
@@ -400,6 +462,8 @@ mod tests {
     use axum::extract::Path;
     use axum::routing::post;
     use axum::Router;
+    use mnr_core::headerchain::{Entry, HeaderChain};
+    use mnr_core::wire::decode_hex32;
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -655,6 +719,94 @@ mod tests {
         .await;
         let o = env.call("get_last_block_header").await;
         assert_eq!(header(&o, "Mnr-Verify"), Some("none"));
+    }
+
+    /// The fixture's last header, at test height 1000 with hash `TOP`,
+    /// linked to a synthetic chain below it.
+    const TOP: &str = "401f00ede03d0ad64f2dc2f8dd79807874cfcb40ea98e2d395e30961bd2b74f8";
+
+    fn chain_through_1000(top_hash: [u8; 32]) -> HeaderChain {
+        let fx: Value = serde_json::from_str(LAST_HEADER).unwrap();
+        let h = &fx["result"]["block_header"];
+        let prev = decode_hex32(h["prev_hash"].as_str().unwrap()).unwrap();
+        let timestamp = h["timestamp"].as_u64().unwrap();
+        let mut c = HeaderChain::new();
+        let mut last = [0u8; 32];
+        for i in 0..1000u64 {
+            let hash = if i == 999 { prev } else { [i as u8; 32] };
+            c.append(Entry {
+                height: i,
+                hash,
+                prev_hash: last,
+                timestamp: i,
+            })
+            .unwrap();
+            last = hash;
+        }
+        c.append(Entry {
+            height: 1000,
+            hash: top_hash,
+            prev_hash: prev,
+            timestamp,
+        })
+        .unwrap();
+        c
+    }
+
+    #[tokio::test]
+    async fn last_header_is_checked_against_the_chain_when_it_reaches_the_height() {
+        let nodes = || vec![node(1001, TOP, 1), node(1001, TOP, 1), node(1001, TOP, 1)];
+        let verified = |env: &Env| {
+            env.ctx
+                .pool
+                .status()
+                .upstreams
+                .iter()
+                .map(|u| u.verified)
+                .collect::<Vec<_>>()
+        };
+        // Chain stops at 999: majority only.
+        let env = Env::new(nodes()).await;
+        let mut short = chain_through_1000(decode_hex32(TOP).unwrap());
+        short.truncate(999);
+        env.ctx.chain.set_for_test(short);
+        let o = env.call("get_last_block_header").await;
+        assert_eq!(header(&o, "Mnr-Verify"), Some("majority"));
+        assert_eq!(header(&o, "Mnr-Agreeing"), Some("3/3"));
+        assert_eq!(verified(&env), vec![1, 1, 1]);
+        // Chain holds 1000 with the same header: chain, and cached as such.
+        let env = Env::new(nodes()).await;
+        env.ctx
+            .chain
+            .set_for_test(chain_through_1000(decode_hex32(TOP).unwrap()));
+        let o = env.call("get_last_block_header").await;
+        assert_eq!(header(&o, "Mnr-Verify"), Some("chain"));
+        assert_eq!(header(&o, "Mnr-Agreeing"), Some("3/3"));
+        assert_eq!(verified(&env), vec![1, 1, 1]);
+        let o = env.call("get_last_block_header").await;
+        assert_eq!(header(&o, "Mnr-Verify"), Some("chain"));
+        assert_eq!(header(&o, "Mnr-Cache"), Some("hit"));
+        // Chain holds 1000 with another hash: contradicted, served as none,
+        // nobody faulted, nobody credited.
+        let env = Env::new(nodes()).await;
+        env.ctx.chain.set_for_test(chain_through_1000([0xee; 32]));
+        let o = env.call("get_last_block_header").await;
+        assert_eq!(header(&o, "Mnr-Verify"), Some("none"));
+        assert_eq!(header(&o, "Mnr-Agreeing"), Some("3/3"));
+        assert_eq!(verified(&env), vec![0, 0, 0]);
+        assert!(env.ctx.pool.status().faults.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_single_chain_confirmed_last_header_is_chain_and_credited() {
+        let env = Env::new(vec![node(1001, TOP, 1)]).await;
+        env.ctx
+            .chain
+            .set_for_test(chain_through_1000(decode_hex32(TOP).unwrap()));
+        let o = env.call("get_last_block_header").await;
+        assert_eq!(header(&o, "Mnr-Verify"), Some("chain"));
+        assert_eq!(header(&o, "Mnr-Agreeing"), None);
+        assert_eq!(env.ctx.pool.status().upstreams[0].verified, 1);
     }
 
     #[tokio::test]

@@ -112,6 +112,14 @@ Disagreement is never a fault: a node one block ahead or behind is honest.
 `get_info` is normalised before it is served (connection counts, peer-list
 sizes, `update_available`, `start_time` zeroed).
 
+`get_last_block_header` is additionally checked against the relay's header
+chain when the chain already reaches the reported height (the usual case is
+that it does not: the chain trails the tip by one probe round). A header the
+chain confirms is served as `chain`; one the chain contradicts is served as
+`none`, since a majority disagreeing with our chain at a known height is a
+reorg in flight that the next chain-sync round settles, and no fault is
+recorded. `Mnr-Agreeing` is emitted either way.
+
 ## Outputs
 
 `/get_outs`, `/get_outs.bin`, `/get_o_indexes.bin`, `get_output_distribution`,
