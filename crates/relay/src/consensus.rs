@@ -65,9 +65,14 @@ pub async fn swr(ctx: Ctx, req: Request, timeout: Duration) -> Outcome {
         timeout,
     };
     let now = Instant::now();
+    // Without a quorum tip (plan §3, degraded mode) cache writes are
+    // suspended: what is already cached is still served for its windows,
+    // but an answer from the owned node alone is never written back.
+    let degraded = ctx.pool.degraded();
     let existing = ctx.cache.swr_get(&key).await;
     let (entry, status) = match existing.as_ref().map(|e| e.freshness_at(now)) {
         Some(Freshness::Fresh) => (existing.expect("checked"), Status::Hit),
+        Some(Freshness::Revalidate) if degraded => (existing.expect("checked"), Status::Stale),
         Some(Freshness::Revalidate) => {
             if ctx.cache.begin_refresh(&key) {
                 let (cache, pool, chain, key, plan) = (
@@ -92,6 +97,7 @@ pub async fn swr(ctx: Ctx, req: Request, timeout: Duration) -> Outcome {
                 let fresh = fetch(&ctx.pool, &ctx.chain, &plan).await;
                 ctx.cache.end_refresh(&key);
                 match fresh {
+                    Ok(e) if degraded => (Arc::new(e), Status::Bypass),
                     Ok(e) => {
                         ctx.cache.swr_put(key, e.clone()).await;
                         (Arc::new(e), Status::Miss)
@@ -100,6 +106,12 @@ pub async fn swr(ctx: Ctx, req: Request, timeout: Duration) -> Outcome {
                 }
             } else {
                 (stale, Status::Stale)
+            }
+        }
+        Some(Freshness::Expired) | None if degraded => {
+            match fetch(&ctx.pool, &ctx.chain, &plan).await {
+                Ok(e) => (Arc::new(e), Status::Bypass),
+                Err(why) => return Outcome::json_error(502, &why, Verify::None),
             }
         }
         Some(Freshness::Expired) | None => {
@@ -556,13 +568,17 @@ mod tests {
 
     impl Env {
         async fn new(nodes: Vec<Handler>) -> Self {
+            Self::with_kinds(nodes, "public").await
+        }
+
+        async fn with_kinds(nodes: Vec<Handler>, kind: &str) -> Self {
             let hits = Arc::new(AtomicUsize::new(0));
             let mut toml = String::from("[probe]\nmin_agree = 1\n");
             let mut health = Vec::new();
             for (i, h) in nodes.into_iter().enumerate() {
                 let addr = mock_with(h, Arc::clone(&hits)).await;
                 toml.push_str(&format!(
-                    "[[upstreams]]\nname = \"m{i}\"\nurl = \"http://{addr}\"\nkind = \"public\"\ntransport = \"http\"\ncaps = {{ rps_light = 100, max_streams = 2, mbps = 10 }}\n"
+                    "[[upstreams]]\nname = \"m{i}\"\nurl = \"http://{addr}\"\nkind = \"{kind}\"\ntransport = \"http\"\ncaps = {{ rps_light = 100, max_streams = 2, mbps = 10 }}\n"
                 ));
                 let mut hh = Health::healthy_for_test(1001, [7; 32]);
                 hh.rtt_ema_ms = Some(10.0 + i as f64);
@@ -807,6 +823,33 @@ mod tests {
         assert_eq!(header(&o, "Mnr-Verify"), Some("chain"));
         assert_eq!(header(&o, "Mnr-Agreeing"), None);
         assert_eq!(env.ctx.pool.status().upstreams[0].verified, 1);
+    }
+
+    #[tokio::test]
+    async fn degraded_mode_serves_the_owned_node_and_suspends_cache_writes() {
+        let env = Env::with_kinds(vec![node(1001, "aa", 1)], "owned").await;
+        // No quorum: degraded. The owned node is healthy and serves alone.
+        let mut h = Health::healthy_for_test(1001, [7; 32]);
+        h.rtt_ema_ms = Some(10.0);
+        env.ctx.pool.set_for_test(vec![h], None);
+        for _ in 0..2 {
+            let o = env.call("get_info").await;
+            assert_eq!(o.status, 200);
+            assert_eq!(header(&o, "Mnr-Verify"), Some("none"));
+            assert_eq!(header(&o, "Mnr-Cache"), Some("bypass"));
+        }
+        assert_eq!(env.hits.load(Ordering::SeqCst), 2, "nothing was cached");
+        let [_, _, (_, swr_entries, _)] = env.ctx.cache.stats().await;
+        assert_eq!(swr_entries, 0);
+        // Quorum back: the next answer is written and the one after is a hit.
+        let mut h = Health::healthy_for_test(1001, [7; 32]);
+        h.rtt_ema_ms = Some(10.0);
+        env.ctx.pool.set_for_test(vec![h], Some((1000, [7; 32])));
+        let o = env.call("get_info").await;
+        assert_eq!(header(&o, "Mnr-Cache"), Some("miss"));
+        let o = env.call("get_info").await;
+        assert_eq!(header(&o, "Mnr-Cache"), Some("hit"));
+        assert_eq!(env.hits.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]
