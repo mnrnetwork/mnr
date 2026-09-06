@@ -63,7 +63,7 @@ the first rejection verbatim when none accepted.
 | `hit` | Served from cache, fresh. |
 | `stale` | Served from cache past its `max-age` while a refresh runs, or because the refresh failed (`stale-if-error`). Consensus state only. |
 | `miss` | Fetched from an upstream on this request; may have been written to cache. |
-| `bypass` | Not a cacheable answer (stream, mempool, write, outputs, error). |
+| `bypass` | Not a cacheable answer (stream, mempool, write, outputs, error, the composed `/get_transaction_pool`). |
 
 Cache windows: immutable data 30 days but only at or below `quorum_tip − 10`
 and only when verified; consensus state `max-age=1, stale-while-revalidate=5,

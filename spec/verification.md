@@ -79,9 +79,41 @@ visible on the upstreams page but is not an ejection signal by design.
 This is how a client reads the mempool through the relay: pool hashes from
 `/get_transaction_pool_hashes(.bin)` or `/get_transaction_pool_stats`
 (pass-through, `none`, one upstream), then the transactions themselves from
-`/get_transactions`, each proven to hash to its txid. `/get_transaction_pool`
-is denied because monerod itself gates it behind unrestricted mode; the 403
-says so in `error.data.hint`.
+`/get_transactions`, each proven to hash to its txid.
+
+### The composed pool listing
+
+`/get_transaction_pool` is not forwarded: monerod refuses it on restricted RPC
+from commit 57ae55e (2026-07-25, on the 0.18 release branch, not in a shipped
+0.18.x yet), so no public node will offer it for long. The relay composes the
+same shape itself (plan decision 8). The listing comes from one upstream's
+`/get_transaction_pool_hashes`, the relay's own node first because it sees
+every broadcast the relay relays; that upstream is the `Mnr-Upstream` of the
+whole answer. Every listed transaction is then fetched through the
+`/get_transactions` path above, in batches of at most 100, and so proven to
+hash to its id; the verifying upstream may differ from the listing one. From
+the verified blob the relay recomputes `blob_size`, `weight` (with the
+bulletproof clawback), `fee` and the key images, and builds
+`spent_key_images` from those, so a key image in two pool transactions shows
+as monerod would show it. `tx_json` is the node's rendering of the verified
+blob and is passed through as such; `tx_blob` is authoritative.
+`receive_time` is the unix time the relay first saw the hash in a listing,
+never a node's claim (restricted nodes report zero). The fields a daemon fills
+from its own pool state (`max_used_block_*`, `last_failed_*`,
+`kept_by_block`, `last_relayed_time`, `do_not_relay`) are zero, false or
+empty. A transaction that was mined between the two calls, or that the node
+no longer has, is dropped from the listing; one whose blob cannot be parsed
+is dropped and counted as unverified.
+
+Label: `hash` when every served entry verified (an empty pool is `hash`),
+`partial` with `Mnr-Verified: k/n` when a batch could only partly be
+verified, `none` when nothing could. The answer itself is never cached
+(`Mnr-Cache: bypass`); verified transactions are held by txid for ten minutes
+so a poll costs the listing plus one light call per transaction the relay has
+not seen before. That is also the charge: one work unit at admission plus one
+per transaction fetched (`extra_wu`), which is one call per new pool
+transaction as decision 8 states. Membership is always read from the fresh
+listing, never from the tier.
 
 Label: `hash` when every entry verified, `partial` with `Mnr-Verified: k/n`
 when some could not be, `none` when none could. Each verified, confirmed entry
