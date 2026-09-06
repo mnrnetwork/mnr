@@ -49,6 +49,10 @@ pub enum Class {
     Passthrough,
     /// Writes fanned out to every healthy upstream; success if any accepts.
     Broadcast,
+    /// Assembled by the relay from verified parts (`/get_transaction_pool`:
+    /// the pool listing from one node, each transaction hash-verified);
+    /// never cached as a whole.
+    Composed,
     /// A wallet-RPC method, not a daemon method; rejected with `-32601` + hint.
     NotDaemon,
     /// Denied at the edge (403 / `-32601`).
@@ -66,6 +70,7 @@ impl Class {
             Self::PassthroughStream => "PASSTHROUGH-STREAM",
             Self::Passthrough => "PASSTHROUGH",
             Self::Broadcast => "BROADCAST",
+            Self::Composed => "COMPOSED",
             Self::NotDaemon => "NOT-DAEMON",
             Self::Deny => "DENY",
         }
@@ -170,6 +175,8 @@ const STREAM_QUORUM: &str =
     "Route to the healthiest full node on quorum tip (pruned node only if request has prune=true).";
 const POOL_CACHE: &str = "None (mempool is per-node by nature).";
 const POOL_QUORUM: &str = "Single node; response annotated Mnr-Upstream (opaque id).";
+const COMPOSED_POOL_CACHE: &str = "None as a whole. Verified pool transactions are held by hash for 10 min, so a poll costs the listing plus one light call per transaction not seen before (charged as extra work units).";
+const COMPOSED_POOL_QUORUM: &str = "Listing from one node (the relay's own node first: it sees every broadcast the relay relays), annotated Mnr-Upstream; each transaction hash-verified through the /get_transactions path.";
 const SPENT_CACHE: &str = "None (spent status changes with the mempool).";
 const NO_CACHE: &str = "None.";
 const SINGLE_NODE_QUORUM: &str = "Single node on quorum tip.";
@@ -573,10 +580,15 @@ static TABLE: &[Policy] = &[
     deny("/set_log_hash_rate", Transport::LegacyPath, LOGGING_NOTE),
     deny("/set_log_level", Transport::LegacyPath, LOGGING_NOTE),
     deny("/set_log_categories", Transport::LegacyPath, LOGGING_NOTE),
-    deny(
+    policy(
         "/get_transaction_pool",
         Transport::LegacyPath,
-        "Restricted-gated (!m_restricted); cannot be served from a public node. Wallets use /get_transaction_pool_hashes(.bin) and /get_transaction_pool_stats instead.",
+        Class::Composed,
+        COMPOSED_POOL_CACHE,
+        COMPOSED_POOL_QUORUM,
+        Verification::Authenticated,
+        5000,
+        "Composed from /get_transaction_pool_hashes and hash-verified /get_transactions (plan decision 8): every entry is proven to hash to its id, which no daemon offers. monerod after commit 57ae55e refuses this on restricted RPC; the relay answers it from public nodes regardless. receive_time is when the relay first saw the hash, never a node's claim; the fields a daemon fills from its own pool state (max_used_block_*, last_failed_*, kept_by_block, last_relayed_time, do_not_relay) are zero, false or empty. tx_json is the node's rendering of the verified blob; tx_blob is authoritative.",
     ),
     deny("/stop_daemon", Transport::LegacyPath, DENY_NOTE),
     deny("/get_net_stats", Transport::LegacyPath, DENY_NOTE),
@@ -703,7 +715,6 @@ mod tests {
         "/set_log_hash_rate",
         "/set_log_level",
         "/set_log_categories",
-        "/get_transaction_pool",
         "/stop_daemon",
         "/get_net_stats",
         "/set_limit",
@@ -812,9 +823,11 @@ mod tests {
     }
 
     /// Public-node rule 7: we never call a method a restricted node would
-    /// refuse. Anything monerod gates on `!m_restricted` must be `Deny`.
+    /// refuse. Anything monerod gates on `!m_restricted` must be `Deny`, or
+    /// `Composed`: a composed answer is never forwarded to an upstream under
+    /// its own name, only assembled from calls restricted nodes serve.
     #[test]
-    fn every_restricted_gated_endpoint_is_deny() {
+    fn every_restricted_gated_endpoint_is_deny_or_composed() {
         let src = include_str!("../fixtures/monerod-core_rpc_server.h");
         let gated = restricted_gated_names(src);
         assert!(
@@ -822,14 +835,16 @@ mod tests {
             "expected the restricted-gated set to be non-trivial, found {}",
             gated.len()
         );
+        let mut composed = 0;
         for name in gated {
             let p = lookup(name).unwrap_or_else(|| panic!("{name} missing from table"));
-            assert_eq!(
-                p.class,
-                Class::Deny,
-                "`{name}` is restricted-gated in monerod but not Deny"
-            );
+            match p.class {
+                Class::Deny => {}
+                Class::Composed => composed += 1,
+                other => panic!("`{name}` is restricted-gated in monerod but {other:?}"),
+            }
         }
+        assert_eq!(composed, 1, "only /get_transaction_pool is composed");
     }
 
     #[test]
@@ -908,12 +923,10 @@ mod tests {
                 "{name} is a legacy path"
             );
         }
-        assert_eq!(
-            lookup("/get_transaction_pool")
-                .expect("/get_transaction_pool in table")
-                .class,
-            Class::Deny
-        );
+        let pool = lookup("/get_transaction_pool").expect("/get_transaction_pool in table");
+        assert_eq!(pool.class, Class::Composed);
+        assert_eq!(pool.verification, Verification::Authenticated);
+        assert!(pool.note.contains("decision 8"));
     }
 
     #[test]
