@@ -95,7 +95,13 @@ pub struct Health {
     ejected_until: Option<Instant>,
     /// Ejected at the last probe round, so the lapse is logged once.
     was_ejected: bool,
+    /// Rolling 24 h of probe outcomes: one `(hour, probes, up)` bucket per
+    /// hour, where "up" means answered and on the quorum tip.
+    up_ring: Vec<(u64, u32, u32)>,
 }
+
+/// Hours kept in the rolling uptime window.
+const UP_HOURS: usize = 24;
 
 impl Health {
     /// A synchronized, on-tip, healthy record for tests in other modules.
@@ -113,6 +119,32 @@ impl Health {
 
     fn ejected(&self, now: Instant) -> bool {
         self.ejected_until.is_some_and(|t| t > now)
+    }
+
+    /// Record one probe round's outcome in the rolling window.
+    fn record_up(&mut self, up: bool, unix: u64) {
+        let hour = unix / 3600;
+        let slot = (hour % UP_HOURS as u64) as usize;
+        if self.up_ring.len() < UP_HOURS {
+            self.up_ring.resize(UP_HOURS, (0, 0, 0));
+        }
+        let b = &mut self.up_ring[slot];
+        if b.0 != hour {
+            *b = (hour, 0, 0);
+        }
+        b.1 += 1;
+        b.2 += u32::from(up);
+    }
+
+    /// `(probes, up)` over the last 24 hours.
+    fn up_24h(&self, unix: u64) -> (u64, u64) {
+        let hour = unix / 3600;
+        self.up_ring
+            .iter()
+            .filter(|(h, _, _)| hour.saturating_sub(*h) < UP_HOURS as u64)
+            .fold((0, 0), |(p, u), (_, bp, bu)| {
+                (p + u64::from(*bp), u + u64::from(*bu))
+            })
     }
 }
 
@@ -148,6 +180,10 @@ pub struct Upstream {
     pub verified: AtomicU64,
     /// Answers that failed verification, ever (the fault log is bounded).
     pub faults: AtomicU64,
+    /// Probe rounds seen, ever, and how many found the node answering and on
+    /// the quorum tip: the lifetime "up rate" on the upstreams page.
+    pub probes: AtomicU64,
+    pub up: AtomicU64,
     /// Rule 3: light calls per second we allow ourselves against this node.
     light: Mutex<LightBucket>,
     /// Rule 3: concurrent `get_blocks.bin` streams against this node.
@@ -265,6 +301,13 @@ pub struct UpstreamStatus {
     pub requests: u64,
     pub verified: u64,
     pub faults: u64,
+    /// Share of probe rounds in the last 24 h that found the node answering
+    /// and on the quorum tip (`null` before the first round).
+    pub up_24h: Option<f64>,
+    /// The same over the node's whole recorded history.
+    pub up_total: Option<f64>,
+    pub probes_24h: u64,
+    pub probes_total: u64,
     pub caps: crate::config::Caps,
     pub last_error: Option<String>,
 }
@@ -317,6 +360,8 @@ impl Pool {
                     requests: AtomicU64::new(0),
                     verified: AtomicU64::new(0),
                     faults: AtomicU64::new(0),
+                    probes: AtomicU64::new(0),
+                    up: AtomicU64::new(0),
                 }
             })
             .collect::<Vec<_>>();
@@ -348,6 +393,8 @@ impl Pool {
                     u.requests.store(st.requests, Ordering::Relaxed);
                     u.verified.store(st.verified, Ordering::Relaxed);
                     u.faults.store(st.faults, Ordering::Relaxed);
+                    u.probes.store(st.probes, Ordering::Relaxed);
+                    u.up.store(st.up, Ordering::Relaxed);
                     if let Some(until) = st.ejected_until.filter(|t| *t > unix) {
                         h.ejected_until = Some(now + Duration::from_secs(until - unix));
                         h.was_ejected = true;
@@ -385,6 +432,8 @@ impl Pool {
                         requests: u.requests.load(Ordering::Relaxed),
                         verified: u.verified.load(Ordering::Relaxed),
                         faults: u.faults.load(Ordering::Relaxed),
+                        probes: u.probes.load(Ordering::Relaxed),
+                        up: u.up.load(Ordering::Relaxed),
                         ejected_until: h
                             .ejected_until
                             .filter(|t| *t > now)
@@ -463,6 +512,19 @@ impl Pool {
                 tracing::debug!(height = q.height, agreeing = q.agreeing.len(), "quorum tip")
             }
             None => tracing::warn!(reports = reports.len(), "no quorum: degraded mode"),
+        }
+        // The round's uptime verdict per node: answered and on this tip.
+        {
+            let unix = unix_now();
+            let mut health = self.health.write();
+            for (u, h) in self.upstreams.iter().zip(health.iter_mut()) {
+                let up = h.ok && Self::on_tip(h, q.as_ref());
+                h.record_up(up, unix);
+                u.probes.fetch_add(1, Ordering::Relaxed);
+                if up {
+                    u.up.fetch_add(1, Ordering::Relaxed);
+                }
+            }
         }
         *self.quorum.write() = q;
     }
@@ -653,6 +715,16 @@ impl Pool {
                     requests: u.requests.load(Ordering::Relaxed),
                     verified: u.verified.load(Ordering::Relaxed),
                     faults: u.faults.load(Ordering::Relaxed),
+                    up_24h: {
+                        let (p, up) = h.up_24h(unix_now());
+                        (p > 0).then(|| up as f64 / p as f64)
+                    },
+                    up_total: {
+                        let p = u.probes.load(Ordering::Relaxed);
+                        (p > 0).then(|| u.up.load(Ordering::Relaxed) as f64 / p as f64)
+                    },
+                    probes_24h: h.up_24h(unix_now()).0,
+                    probes_total: u.probes.load(Ordering::Relaxed),
                     caps: u.cfg.caps,
                     last_error: h.last_error.clone(),
                 }
@@ -1194,6 +1266,22 @@ transport = "onion"
             !p.health.read()[2].was_ejected,
             "a second round does not re-log"
         );
+    }
+
+    #[test]
+    fn up_rate_counts_rounds_answering_on_the_tip() {
+        let mut h = Health::default();
+        let t0 = 1_700_000_000u64;
+        for i in 0..10 {
+            h.record_up(i % 5 != 0, t0 + i * 15);
+        }
+        assert_eq!(h.up_24h(t0 + 200), (10, 8));
+        // A round 30 hours later lands in a bucket that has aged out of the window.
+        h.record_up(true, t0 + 30 * 3600);
+        assert_eq!(h.up_24h(t0 + 30 * 3600), (1, 1));
+        // The same hour slot a day later replaces the stale bucket.
+        h.record_up(false, t0 + 24 * 3600);
+        assert_eq!(h.up_24h(t0 + 30 * 3600), (2, 1));
     }
 
     #[test]

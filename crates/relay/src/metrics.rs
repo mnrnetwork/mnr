@@ -125,6 +125,7 @@ impl Metrics {
             ("mnr_upstream_on_tip", "gauge"),
             ("mnr_upstream_ejected", "gauge"),
             ("mnr_upstream_opted_out", "gauge"),
+            ("mnr_upstream_up_permille_24h", "gauge"),
         ] {
             let _ = writeln!(out, "# TYPE {name} {help}");
             for u in &status.upstreams {
@@ -137,7 +138,8 @@ impl Metrics {
                     "mnr_upstream_healthy" => u64::from(u.ok && !u.ejected),
                     "mnr_upstream_on_tip" => u64::from(u.on_tip),
                     "mnr_upstream_ejected" => u64::from(u.ejected),
-                    _ => u64::from(u.opted_out),
+                    "mnr_upstream_opted_out" => u64::from(u.opted_out),
+                    _ => u.up_24h.map_or(0, |f| (f * 1000.0).round() as u64),
                 };
                 line(&mut out, name, &labels, value);
             }

@@ -34,7 +34,7 @@ use crate::upstream::{FaultEvent, OptOutEvent};
 /// Seconds the previous token stays valid after a rotation (gateway plan §3.1).
 const GRACE_SECS: u64 = 24 * 3600;
 /// Schema version, stored in `PRAGMA user_version`.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 /// How often the relay re-reads the token table to pick up CLI changes.
 const TOKEN_RELOAD_EVERY: Duration = Duration::from_secs(30);
 
@@ -60,7 +60,9 @@ CREATE TABLE IF NOT EXISTS upstream_stats(
   requests INTEGER NOT NULL,
   verified INTEGER NOT NULL,
   faults INTEGER NOT NULL,
-  ejected_until INTEGER
+  ejected_until INTEGER,
+  probes INTEGER NOT NULL DEFAULT 0,
+  up INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS fault_log(
   id INTEGER PRIMARY KEY,
@@ -143,6 +145,9 @@ pub struct UpstreamStats {
     pub requests: u64,
     pub verified: u64,
     pub faults: u64,
+    /// Probe rounds seen and rounds found answering on the tip (lifetime).
+    pub probes: u64,
+    pub up: u64,
     /// Unix seconds; `Some` while an ejection is in force.
     pub ejected_until: Option<u64>,
 }
@@ -559,7 +564,7 @@ impl SqliteStore {
     pub fn load_upstream_stats(&self) -> HashMap<String, UpstreamStats> {
         let conn = self.conn.lock();
         let mut stmt = match conn
-            .prepare("SELECT name, requests, verified, faults, ejected_until FROM upstream_stats")
+            .prepare("SELECT name, requests, verified, faults, ejected_until, probes, up FROM upstream_stats")
         {
             Ok(s) => s,
             Err(_) => return HashMap::new(),
@@ -572,6 +577,8 @@ impl SqliteStore {
                     verified: r.get::<_, i64>(2)? as u64,
                     faults: r.get::<_, i64>(3)? as u64,
                     ejected_until: r.get::<_, Option<i64>>(4)?.map(|v| v as u64),
+                    probes: r.get::<_, i64>(5)? as u64,
+                    up: r.get::<_, i64>(6)? as u64,
                 },
             ))
         })
@@ -583,16 +590,19 @@ impl SqliteStore {
         let conn = self.conn.lock();
         for (name, st) in stats {
             conn.execute(
-                "INSERT INTO upstream_stats (name, requests, verified, faults, ejected_until)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
+                "INSERT INTO upstream_stats (name, requests, verified, faults, ejected_until, probes, up)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(name) DO UPDATE SET requests = excluded.requests, verified = excluded.verified,
-                   faults = excluded.faults, ejected_until = excluded.ejected_until",
+                   faults = excluded.faults, ejected_until = excluded.ejected_until,
+                   probes = excluded.probes, up = excluded.up",
                 params![
                     name,
                     st.requests as i64,
                     st.verified as i64,
                     st.faults as i64,
-                    st.ejected_until.map(|v| v as i64)
+                    st.ejected_until.map(|v| v as i64),
+                    st.probes as i64,
+                    st.up as i64
                 ],
             )
             .map_err(|e| e.to_string())?;
@@ -1065,6 +1075,18 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
     if version < SCHEMA_VERSION {
         conn.execute_batch(SCHEMA)
             .map_err(|e| format!("cannot create token schema: {e}"))?;
+        // v4: uptime counters on an upstream_stats table that already
+        // exists (CREATE IF NOT EXISTS leaves it alone).
+        if version == 3 {
+            for col in ["probes", "up"] {
+                let _ = conn.execute(
+                    &format!(
+                        "ALTER TABLE upstream_stats ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0"
+                    ),
+                    [],
+                );
+            }
+        }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(|e| e.to_string())?;
     }
@@ -1193,7 +1215,7 @@ mod tests {
             .conn()
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 3);
+        assert_eq!(v, SCHEMA_VERSION);
         assert!(store.load_upstream_stats().is_empty());
         assert!(store.load_faults(10).is_empty());
         assert!(store.load_opt_outs().is_empty());
@@ -1224,6 +1246,8 @@ mod tests {
                     requests: 9,
                     verified: 4,
                     faults: 5,
+                    probes: 100,
+                    up: 97,
                     ejected_until: Some(u64::MAX),
                 },
             )])
