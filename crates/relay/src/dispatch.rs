@@ -1334,6 +1334,11 @@ mod tests {
         let a = u.try_take_stream();
         let b = u.try_take_stream();
         assert!(a.is_some() && b.is_some(), "both slots free again");
+        // The bytes are this upstream's load: one call plus 20 WU per MB.
+        let st = &env.pool.status().upstreams[0];
+        assert_eq!(st.stream_bytes, 300_000);
+        assert_eq!(st.requests, 1);
+        assert_eq!(st.wu, 1 + 300_000 * 20 / 1_000_000);
     }
 
     #[tokio::test]

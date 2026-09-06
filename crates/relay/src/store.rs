@@ -34,7 +34,7 @@ use crate::upstream::{FaultEvent, OptOutEvent};
 /// Seconds the previous token stays valid after a rotation (gateway plan §3.1).
 const GRACE_SECS: u64 = 24 * 3600;
 /// Schema version, stored in `PRAGMA user_version`.
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 /// How often the relay re-reads the token table to pick up CLI changes.
 const TOKEN_RELOAD_EVERY: Duration = Duration::from_secs(30);
 
@@ -62,7 +62,8 @@ CREATE TABLE IF NOT EXISTS upstream_stats(
   faults INTEGER NOT NULL,
   ejected_until INTEGER,
   probes INTEGER NOT NULL DEFAULT 0,
-  up INTEGER NOT NULL DEFAULT 0
+  up INTEGER NOT NULL DEFAULT 0,
+  stream_bytes INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS fault_log(
   id INTEGER PRIMARY KEY,
@@ -143,6 +144,8 @@ impl Default for UsageState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct UpstreamStats {
     pub requests: u64,
+    /// Bytes pulled by block streams (lifetime), for the load figure.
+    pub stream_bytes: u64,
     pub verified: u64,
     pub faults: u64,
     /// Probe rounds seen and rounds found answering on the tip (lifetime).
@@ -598,7 +601,7 @@ impl SqliteStore {
     pub fn load_upstream_stats(&self) -> HashMap<String, UpstreamStats> {
         let conn = self.conn.lock();
         let mut stmt = match conn
-            .prepare("SELECT name, requests, verified, faults, ejected_until, probes, up FROM upstream_stats")
+            .prepare("SELECT name, requests, verified, faults, ejected_until, probes, up, stream_bytes FROM upstream_stats")
         {
             Ok(s) => s,
             Err(_) => return HashMap::new(),
@@ -613,6 +616,7 @@ impl SqliteStore {
                     ejected_until: r.get::<_, Option<i64>>(4)?.map(|v| v as u64),
                     probes: r.get::<_, i64>(5)? as u64,
                     up: r.get::<_, i64>(6)? as u64,
+                    stream_bytes: r.get::<_, i64>(7)? as u64,
                 },
             ))
         })
@@ -624,11 +628,11 @@ impl SqliteStore {
         let conn = self.conn.lock();
         for (name, st) in stats {
             conn.execute(
-                "INSERT INTO upstream_stats (name, requests, verified, faults, ejected_until, probes, up)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                "INSERT INTO upstream_stats (name, requests, verified, faults, ejected_until, probes, up, stream_bytes)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT(name) DO UPDATE SET requests = excluded.requests, verified = excluded.verified,
                    faults = excluded.faults, ejected_until = excluded.ejected_until,
-                   probes = excluded.probes, up = excluded.up",
+                   probes = excluded.probes, up = excluded.up, stream_bytes = excluded.stream_bytes",
                 params![
                     name,
                     st.requests as i64,
@@ -636,7 +640,8 @@ impl SqliteStore {
                     st.faults as i64,
                     st.ejected_until.map(|v| v as i64),
                     st.probes as i64,
-                    st.up as i64
+                    st.up as i64,
+                    st.stream_bytes as i64
                 ],
             )
             .map_err(|e| e.to_string())?;
@@ -1113,17 +1118,18 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
     if version < SCHEMA_VERSION {
         conn.execute_batch(SCHEMA)
             .map_err(|e| format!("cannot create token schema: {e}"))?;
-        // v4: uptime counters on an upstream_stats table that already
-        // exists (CREATE IF NOT EXISTS leaves it alone).
-        if version == 3 {
-            for col in ["probes", "up"] {
-                let _ = conn.execute(
-                    &format!(
-                        "ALTER TABLE upstream_stats ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0"
-                    ),
-                    [],
-                );
-            }
+        // v4: uptime counters, v5: stream bytes, on an upstream_stats table
+        // that already exists (CREATE IF NOT EXISTS leaves it alone).
+        let added: &[&str] = match version {
+            3 => &["probes", "up", "stream_bytes"],
+            4 => &["stream_bytes"],
+            _ => &[],
+        };
+        for col in added {
+            let _ = conn.execute(
+                &format!("ALTER TABLE upstream_stats ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0"),
+                [],
+            );
         }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(|e| e.to_string())?;
@@ -1287,6 +1293,7 @@ mod tests {
                     probes: 100,
                     up: 97,
                     ejected_until: Some(u64::MAX),
+                    stream_bytes: 0,
                 },
             )])
             .unwrap();
@@ -1297,6 +1304,53 @@ mod tests {
             (st.requests, st.verified, st.faults, st.ejected_until),
             (9, 4, 0, None)
         );
+    }
+
+    #[test]
+    fn schema_v4_database_gains_stream_bytes_and_keeps_its_stats() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v4.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE tokens(id INTEGER PRIMARY KEY, token_hash BLOB UNIQUE NOT NULL, prev_token_hash BLOB, prev_grace_until INTEGER, tier TEXT NOT NULL, status TEXT NOT NULL, valid_until INTEGER, created_at INTEGER NOT NULL);
+                 CREATE TABLE usage(token_id INTEGER NOT NULL, day INTEGER NOT NULL, wu INTEGER NOT NULL, PRIMARY KEY(token_id, day));
+                 CREATE TABLE invoices(id TEXT PRIMARY KEY, subaddr_index INTEGER NOT NULL, address TEXT NOT NULL, amount INTEGER NOT NULL, months INTEGER NOT NULL, renew_hash BLOB, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, status TEXT NOT NULL, received INTEGER NOT NULL DEFAULT 0, paid_at INTEGER);
+                 CREATE TABLE upstream_stats(name TEXT PRIMARY KEY, requests INTEGER NOT NULL, verified INTEGER NOT NULL, faults INTEGER NOT NULL, ejected_until INTEGER, probes INTEGER NOT NULL DEFAULT 0, up INTEGER NOT NULL DEFAULT 0);
+                 INSERT INTO upstream_stats VALUES ('own-1', 500, 200, 1, NULL, 400, 399);
+                 PRAGMA user_version = 4;",
+            )
+            .unwrap();
+        }
+        let store = SqliteStore::open(Some(&path)).unwrap();
+        let v: i64 = store
+            .conn()
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        let got = store.load_upstream_stats();
+        assert_eq!(
+            got["own-1"],
+            UpstreamStats {
+                requests: 500,
+                stream_bytes: 0,
+                verified: 200,
+                faults: 1,
+                probes: 400,
+                up: 399,
+                ejected_until: None,
+            }
+        );
+        store
+            .save_upstream_stats(&[(
+                "own-1".into(),
+                UpstreamStats {
+                    stream_bytes: 3_000_000,
+                    ..got["own-1"]
+                },
+            )])
+            .unwrap();
+        assert_eq!(store.load_upstream_stats()["own-1"].stream_bytes, 3_000_000);
     }
 
     #[test]

@@ -11,7 +11,9 @@
 //! - `mnr_requests_total{class,verify,cache,status}` — dispatched requests
 //! - `mnr_refused_total{reason}` — requests refused before dispatch
 //! - `mnr_wu_charged_total{tier}` — work units charged
-//! - `mnr_upstream_requests_total{upstream}`, `mnr_upstream_verified_total{upstream}`,
+//! - `mnr_upstream_requests_total{upstream}`, `mnr_upstream_stream_bytes_total{upstream}`,
+//!   `mnr_upstream_wu_total{upstream}` (the load figure: RPC calls less probes plus 20 per
+//!   MB streamed; its owned/public split is a Stage 1 gate), `mnr_upstream_verified_total{upstream}`,
 //!   `mnr_upstream_faults_total{upstream}`, `mnr_upstream_rtt_ms{upstream}`,
 //!   `mnr_upstream_healthy{upstream}`, `mnr_upstream_on_tip{upstream}`
 //! - `mnr_quorum_height`, `mnr_degraded`, `mnr_chain_height`,
@@ -118,6 +120,8 @@ impl Metrics {
         let status = pool.status();
         for (name, help) in [
             ("mnr_upstream_requests_total", "counter"),
+            ("mnr_upstream_stream_bytes_total", "counter"),
+            ("mnr_upstream_wu_total", "counter"),
             ("mnr_upstream_verified_total", "counter"),
             ("mnr_upstream_faults_total", "counter"),
             ("mnr_upstream_rtt_ms", "gauge"),
@@ -132,6 +136,8 @@ impl Metrics {
                 let labels = format!("upstream=\"{}\"", escape(&u.name));
                 let value: u64 = match name {
                     "mnr_upstream_requests_total" => u.requests,
+                    "mnr_upstream_stream_bytes_total" => u.stream_bytes,
+                    "mnr_upstream_wu_total" => u.wu,
                     "mnr_upstream_verified_total" => u.verified,
                     "mnr_upstream_faults_total" => u.faults,
                     "mnr_upstream_rtt_ms" => u.rtt_ms.unwrap_or(0),
@@ -270,6 +276,8 @@ mod tests {
         has("mnr_wu_charged_total{tier=\"free\"} 3");
         has("mnr_wu_charged_total{tier=\"pro\"} 40");
         has("mnr_upstream_verified_total{upstream=\"own\"} 2");
+        has("mnr_upstream_stream_bytes_total{upstream=\"own\"} 0");
+        has("mnr_upstream_wu_total{upstream=\"own\"} 0");
         has("mnr_upstream_faults_total{upstream=\"own\"} 1");
         has("mnr_upstream_healthy{upstream=\"own\"} 1");
         has("mnr_upstream_on_tip{upstream=\"own\"} 1");

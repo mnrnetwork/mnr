@@ -173,8 +173,14 @@ pub struct Upstream {
     pub cfg: UpstreamConfig,
     client: reqwest::Client,
     timeout: Duration,
-    /// Requests we sent, for the public request-rate figure (rule 1).
+    /// Requests we sent, for the public request-rate figure (rule 1). This
+    /// counts probe rounds too (one `get_info` per round); `probes` says how
+    /// many of them there were, so `requests - probes` is the RPC load.
     pub requests: AtomicU64,
+    /// Bytes pulled from this node by `get_blocks.bin` streams, whether or
+    /// not the client received them: the heavy half of the load figure.
+    /// Shared with the stream wrapper that counts the chunks as they pass.
+    pub stream_bytes: Arc<AtomicU64>,
     /// Answers from this upstream that passed verification (plan §4: the
     /// public numbers on the upstreams page).
     pub verified: AtomicU64,
@@ -299,6 +305,13 @@ pub struct UpstreamStatus {
     pub synchronized: bool,
     pub opted_out: bool,
     pub requests: u64,
+    /// Bytes pulled by block streams, lifetime.
+    pub stream_bytes: u64,
+    /// Work units of load this node carried, lifetime: one per RPC call
+    /// (`requests` less the probe rounds) plus 20 per MB streamed, the
+    /// relay's own work-unit rule. The owned/public split of this figure is
+    /// a Stage 1 gate (plan §9).
+    pub wu: u64,
     pub verified: u64,
     pub faults: u64,
     /// Share of probe rounds in the last 24 h that found the node answering
@@ -322,6 +335,15 @@ pub struct PoolStatus {
     pub faults: Vec<FaultEvent>,
     /// Hosts that published the opt-out signal since this process started.
     pub opt_outs: Vec<OptOutEvent>,
+}
+
+/// The load one upstream carried, in the relay's work units: one per RPC
+/// call it was sent (probe rounds excluded; they are in `requests` for the
+/// public request figure but are not client load) plus the stream rule.
+/// Floored per upstream: a load share, not a bill.
+pub fn work_units(requests: u64, probes: u64, stream_bytes: u64) -> u64 {
+    requests.saturating_sub(probes)
+        + stream_bytes.saturating_mul(crate::limits::STREAM_WU_PER_MB) / 1_000_000
 }
 
 impl Pool {
@@ -358,6 +380,7 @@ impl Pool {
                     client,
                     timeout,
                     requests: AtomicU64::new(0),
+                    stream_bytes: Arc::new(AtomicU64::new(0)),
                     verified: AtomicU64::new(0),
                     faults: AtomicU64::new(0),
                     probes: AtomicU64::new(0),
@@ -391,6 +414,7 @@ impl Pool {
             for (u, h) in self.upstreams.iter().zip(health.iter_mut()) {
                 if let Some(st) = saved.get(&u.cfg.name) {
                     u.requests.store(st.requests, Ordering::Relaxed);
+                    u.stream_bytes.store(st.stream_bytes, Ordering::Relaxed);
                     u.verified.store(st.verified, Ordering::Relaxed);
                     u.faults.store(st.faults, Ordering::Relaxed);
                     u.probes.store(st.probes, Ordering::Relaxed);
@@ -430,6 +454,7 @@ impl Pool {
                     u.cfg.name.clone(),
                     UpstreamStats {
                         requests: u.requests.load(Ordering::Relaxed),
+                        stream_bytes: u.stream_bytes.load(Ordering::Relaxed),
                         verified: u.verified.load(Ordering::Relaxed),
                         faults: u.faults.load(Ordering::Relaxed),
                         probes: u.probes.load(Ordering::Relaxed),
@@ -713,6 +738,12 @@ impl Pool {
                     synchronized: h.synchronized,
                     opted_out: h.opted_out,
                     requests: u.requests.load(Ordering::Relaxed),
+                    stream_bytes: u.stream_bytes.load(Ordering::Relaxed),
+                    wu: work_units(
+                        u.requests.load(Ordering::Relaxed),
+                        u.probes.load(Ordering::Relaxed),
+                        u.stream_bytes.load(Ordering::Relaxed),
+                    ),
                     verified: u.verified.load(Ordering::Relaxed),
                     faults: u.faults.load(Ordering::Relaxed),
                     up_24h: {
@@ -932,7 +963,12 @@ impl Upstream {
             status,
             content_type,
             content_length,
-            body: throttled(inner, Arc::clone(&self.bandwidth), slot),
+            body: throttled(
+                inner,
+                Arc::clone(&self.bandwidth),
+                slot,
+                Arc::clone(&self.stream_bytes),
+            ),
         })
     }
 

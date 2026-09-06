@@ -20,6 +20,7 @@
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -101,6 +102,8 @@ pub struct Throttled {
     idle_timer: Option<Pin<Box<tokio::time::Sleep>>>,
     done: bool,
     _slot: OwnedSemaphorePermit,
+    /// The upstream's lifetime stream-byte counter (its load figure).
+    counter: Arc<AtomicU64>,
 }
 
 /// Wrap an upstream byte stream with the cap, the idle timeout and the
@@ -110,8 +113,10 @@ pub fn throttled(
     inner: BoxStream<'static, Result<Bytes, ForwardError>>,
     bucket: Arc<Mutex<ByteBucket>>,
     slot: OwnedSemaphorePermit,
+    counter: Arc<AtomicU64>,
 ) -> Throttled {
     Throttled {
+        counter,
         inner,
         bucket,
         idle: IDLE_TIMEOUT,
@@ -177,6 +182,8 @@ impl Stream for Throttled {
             Poll::Ready(Some(Ok(chunk))) => {
                 this.idle_timer = None;
                 this.total += chunk.len() as u64;
+                this.counter
+                    .fetch_add(chunk.len() as u64, Ordering::Relaxed);
                 if this.total > this.max {
                     this.done = true;
                     return Poll::Ready(Some(Err(io_err(ForwardError::Other(
@@ -290,6 +297,10 @@ mod tests {
         assert!(b.take(1, t0 + Duration::from_secs(100)) > Duration::ZERO);
     }
 
+    fn counter() -> Arc<AtomicU64> {
+        Arc::new(AtomicU64::new(0))
+    }
+
     fn slot() -> OwnedSemaphorePermit {
         Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap()
     }
@@ -302,7 +313,7 @@ mod tests {
     async fn throttled_stream_paces_to_the_cap() {
         // 3 MB at 1 MB/s: the first MB is free (bucket), the rest waits 2 s.
         let bucket = Arc::new(Mutex::new(ByteBucket::new(1_000_000)));
-        let mut s = throttled(chunks(6, 500_000), bucket, slot());
+        let mut s = throttled(chunks(6, 500_000), bucket, slot(), counter());
         let t0 = Instant::now();
         let mut total = 0;
         while let Some(c) = s.next().await {
@@ -323,7 +334,8 @@ mod tests {
             .chain(stream::pending())
             .boxed();
         let bucket = Arc::new(Mutex::new(ByteBucket::new(1 << 30)));
-        let mut s = throttled(inner, bucket, permit).with_limits(Duration::from_secs(15), u64::MAX);
+        let mut s = throttled(inner, bucket, permit, counter())
+            .with_limits(Duration::from_secs(15), u64::MAX);
         assert_eq!(s.next().await.unwrap().unwrap(), Bytes::from_static(b"abc"));
         assert_eq!(sem.available_permits(), 0, "slot held while streaming");
         let t0 = Instant::now();
@@ -340,7 +352,7 @@ mod tests {
         // 4 MB at 1 MB/s takes 3 s of throttling; an idle limit of 1 s must
         // not fire, because the upstream itself never stalls.
         let bucket = Arc::new(Mutex::new(ByteBucket::new(1_000_000)));
-        let mut s = throttled(chunks(4, 1_000_000), bucket, slot())
+        let mut s = throttled(chunks(4, 1_000_000), bucket, slot(), counter())
             .with_limits(Duration::from_secs(1), u64::MAX);
         let mut n = 0;
         while let Some(c) = s.next().await {
@@ -353,7 +365,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn ceiling_ends_the_stream() {
         let bucket = Arc::new(Mutex::new(ByteBucket::new(1 << 30)));
-        let mut s = throttled(chunks(10, 100), bucket, slot()).with_limits(IDLE_TIMEOUT, 250);
+        let mut s =
+            throttled(chunks(10, 100), bucket, slot(), counter()).with_limits(IDLE_TIMEOUT, 250);
         let mut ok = 0;
         let mut err = None;
         while let Some(c) = s.next().await {
