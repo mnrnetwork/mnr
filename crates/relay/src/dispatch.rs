@@ -1112,6 +1112,51 @@ mod tests {
         })
     }
 
+    const TXS_MEMPOOL: &str = include_str!("../../core/fixtures/mainnet/txs-mempool.json");
+
+    /// The symptom seen live on 0.1.8: a mempool entry has no `block_height`,
+    /// the answer failed to parse, every upstream tried was faulted and the
+    /// client got a 502. Now it verifies by hash, faults nobody and is never
+    /// cached.
+    #[tokio::test]
+    async fn mempool_transaction_verifies_by_hash_faults_nobody_and_is_not_cached() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let srv = mock_with(
+            Arc::new(|path, _body| {
+                assert_eq!(path, "/get_transactions");
+                (200, TXS_MEMPOOL.to_owned())
+            }),
+            Arc::clone(&hits),
+        )
+        .await;
+        let env = Env::new(pool_at(&[srv], 3_760_000));
+        let fx: Value = serde_json::from_str(TXS_MEMPOOL).unwrap();
+        let h = fx["txs"][0]["tx_hash"].as_str().unwrap().to_owned();
+        for round in 1..=2 {
+            let o = env
+                .legacy("/get_transactions", json!({"txs_hashes": [h]}))
+                .await;
+            assert_eq!(
+                o.status,
+                200,
+                "round {round}: {}",
+                String::from_utf8_lossy(&o.body)
+            );
+            assert_eq!(header(&o, "Mnr-Verify"), Some("hash"));
+            assert_eq!(header(&o, "Mnr-Cache"), Some("miss"));
+            let v: Value = serde_json::from_slice(&o.body).unwrap();
+            assert_eq!(v["txs"][0]["in_pool"], true);
+            assert!(v["txs"][0].get("block_height").is_none());
+            assert_eq!(v["txs"][0]["relayed"], true);
+            assert_eq!(env.pool.status().faults.len(), 0);
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                round,
+                "pool entries are never cached"
+            );
+        }
+    }
+
     fn fixture_hashes() -> Vec<String> {
         let fx: Value = serde_json::from_str(TXS_FULL).unwrap();
         fx["txs"]

@@ -71,7 +71,10 @@ blocks ahead of it). An entry with no hashable form
 transactions, and `relayed` / `received_timestamp` only for pool ones); it is
 verified by hash alone, labelled `hash` like any other entry, and never
 cached. A confirmed entry that lacks a height is malformed: *unverifiable*,
-not a fault. `missed_tx` entries must have been requested too.
+not a fault; a node that always omits heights therefore shows as permanently
+unverifiable on `/get_transactions` (never cached, never `hash`), which is
+visible on the upstreams page but is not an ejection signal by design.
+`missed_tx` entries must have been requested too.
 
 This is how a client reads the mempool through the relay: pool hashes from
 `/get_transaction_pool_hashes(.bin)` or `/get_transaction_pool_stats`

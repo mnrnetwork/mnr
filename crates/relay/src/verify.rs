@@ -515,7 +515,8 @@ pub fn verify_transactions(
         }
         match verdict {
             Ok(TxVerdict::Verified) => out.push(TxCheck::Verified {
-                height: if e.in_pool { None } else { e.block_height },
+                // A confirmed entry always has a height here (see `location`).
+                height: e.block_height,
             }),
             Ok(TxVerdict::NotVerifiable) => out.push(TxCheck::Unverifiable),
             Err(e) => return Err(Fault(e.to_string())),
