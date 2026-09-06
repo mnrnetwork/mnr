@@ -24,6 +24,12 @@ name = "tx_hash"
 path = "fuzz_targets/tx_hash.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "parse_tx"
+path = "fuzz_targets/parse_tx.rs"
+test = false
+doc = false
 bench = false
 
 [[bin]]

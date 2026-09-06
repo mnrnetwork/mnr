@@ -10,6 +10,9 @@
 //!   hashes, so `get_block` / `get_block_header_*` answers can be checked
 //!   against the requested hash or the header chain (plan §4).
 //! - [`tx_hash`]: a full tx blob → its txid, for `/get_transactions`.
+//! - [`parse_tx`]: a full tx blob → its txid plus what a mempool listing
+//!   needs from it (size, weight, fee, key images), for the composed
+//!   `/get_transaction_pool` (plan decision 8).
 //! - [`pruned_tx_hash`]: a pruned v2 tx blob plus the node-supplied prunable
 //!   hash → its txid. Pruned **v1** transactions cannot be verified at all and
 //!   return [`HashError::NotVerifiable`]; the relay must fetch them unpruned or
@@ -23,7 +26,7 @@ use std::fmt;
 use std::io::Cursor;
 
 use monero_oxide::block::Block;
-use monero_oxide::transaction::{NotPruned, Pruned, Transaction};
+use monero_oxide::transaction::{Input, NotPruned, Pruned, Transaction};
 
 pub use monero_oxide::primitives::keccak256;
 
@@ -109,6 +112,78 @@ pub fn tx_hash(blob: &[u8]) -> Result<Hash, HashError> {
         .map_err(|e| HashError::Malformed(e.to_string()))?;
     reject_trailing(&cursor)?;
     Ok(tx.hash())
+}
+
+/// What the relay learns from a full transaction blob: everything a
+/// `get_transaction_pool` entry states about a transaction, recomputed from
+/// the bytes rather than taken from a node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedTx {
+    /// The txid.
+    pub hash: Hash,
+    /// Transaction version (1 or 2).
+    pub version: u8,
+    /// The blob's length in bytes (`blob_size`).
+    pub blob_size: u64,
+    /// The consensus weight (`weight`): the size plus the bulletproof
+    /// clawback for transactions with more than two outputs.
+    pub weight: u64,
+    /// The fee in atomic units. `None` for a coinbase transaction (it has
+    /// none) and for a v1 transaction whose inputs and outputs do not sum.
+    pub fee: Option<u64>,
+    /// The key images of the spent outputs, in input order; empty for a
+    /// coinbase transaction.
+    pub key_images: Vec<Hash>,
+}
+
+/// Parse a full (unpruned) transaction blob, v1 or v2. Rejects trailing
+/// bytes like [`tx_hash`].
+pub fn parse_tx(blob: &[u8]) -> Result<ParsedTx, HashError> {
+    let mut cursor = Cursor::new(blob);
+    let tx = Transaction::<NotPruned>::read(&mut cursor)
+        .map_err(|e| HashError::Malformed(e.to_string()))?;
+    reject_trailing(&cursor)?;
+    let prefix = tx.prefix();
+    let key_images: Vec<Hash> = prefix
+        .inputs
+        .iter()
+        .filter_map(|i| match i {
+            Input::ToKey { key_image, .. } => Some(key_image.to_bytes()),
+            Input::Gen(_) => None,
+        })
+        .collect();
+    let coinbase = prefix.inputs.iter().any(|i| matches!(i, Input::Gen(_)));
+    let fee = match &tx {
+        _ if coinbase => None,
+        Transaction::V2 { proofs, .. } => proofs.as_ref().map(|p| p.base.fee),
+        Transaction::V1 { prefix, .. } => {
+            let ins = prefix
+                .inputs
+                .iter()
+                .map(|i| match i {
+                    Input::ToKey { amount, .. } => amount.unwrap_or(0),
+                    Input::Gen(_) => 0,
+                })
+                .try_fold(0u64, u64::checked_add);
+            let outs = prefix
+                .outputs
+                .iter()
+                .map(|o| o.amount.unwrap_or(0))
+                .try_fold(0u64, u64::checked_add);
+            match (ins, outs) {
+                (Some(i), Some(o)) => i.checked_sub(o),
+                _ => None,
+            }
+        }
+    };
+    Ok(ParsedTx {
+        hash: tx.hash(),
+        version: tx.version(),
+        blob_size: blob.len() as u64,
+        weight: tx.weight() as u64,
+        fee,
+        key_images,
+    })
 }
 
 /// The txid of a pruned transaction blob, given the prunable hash the node
@@ -396,6 +471,91 @@ mod tests {
         let mut blob = hex::decode(tx["as_hex"].as_str().unwrap()).unwrap();
         blob.extend_from_slice(&[0, 0]);
         assert_eq!(tx_hash(&blob), Err(HashError::TrailingBytes(2)));
+    }
+
+    #[test]
+    fn parsed_pool_entry_matches_monerods_own_numbers() {
+        // fixtures/mainnet/pool-entries.json: /get_transaction_pool from the
+        // owned node, with the node's blob_size, weight and fee.
+        let fx = json(fixture!("pool-entries.json"));
+        let mut checked = 0;
+        for t in fx["transactions"].as_array().unwrap() {
+            let blob = hex::decode(t["tx_blob"].as_str().unwrap()).unwrap();
+            let p = parse_tx(&blob).unwrap();
+            assert_eq!(p.hash, h32(t["id_hash"].as_str().unwrap()));
+            assert_eq!(p.version, 2);
+            assert_eq!(p.blob_size, t["blob_size"].as_u64().unwrap());
+            assert_eq!(p.weight, t["weight"].as_u64().unwrap());
+            assert_eq!(p.fee, t["fee"].as_u64());
+            assert_eq!(p.weight, p.blob_size, "two outputs: no clawback");
+            // Every key image is in the node's spent_key_images for this tx.
+            for ki in &p.key_images {
+                let hex_ki = hex::encode(ki);
+                let listed = fx["spent_key_images"].as_array().unwrap().iter().any(|s| {
+                    s["id_hash"] == hex_ki
+                        && s["txs_hashes"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|h| h == &t["id_hash"])
+                });
+                assert!(listed, "key image {hex_ki} not in spent_key_images");
+            }
+            assert!(!p.key_images.is_empty());
+            checked += 1;
+        }
+        assert!(checked >= 1);
+    }
+
+    #[test]
+    fn parsed_fee_matches_the_nodes_json_rendering() {
+        // txs-mempool.json entries carry monerod's as_json with txnFee.
+        let fx = json(fixture!("txs-mempool.json"));
+        let mut checked = 0;
+        for t in fx["txs"].as_array().unwrap() {
+            let blob = hex::decode(t["as_hex"].as_str().unwrap()).unwrap();
+            let p = parse_tx(&blob).unwrap();
+            assert_eq!(p.hash, h32(t["tx_hash"].as_str().unwrap()));
+            let rendered: Value = serde_json::from_str(t["as_json"].as_str().unwrap()).unwrap();
+            assert_eq!(p.fee, rendered["rct_signatures"]["txnFee"].as_u64());
+            assert_eq!(
+                p.key_images.len(),
+                rendered["vin"].as_array().unwrap().len(),
+                "one key image per input"
+            );
+            for (ki, vin) in p.key_images.iter().zip(rendered["vin"].as_array().unwrap()) {
+                assert_eq!(hex::encode(ki), vin["key"]["k_image"]);
+            }
+            assert_eq!(p.blob_size, blob.len() as u64);
+            checked += 1;
+        }
+        assert!(checked >= 1);
+    }
+
+    #[test]
+    fn coinbase_has_no_fee_and_no_key_images() {
+        let fx = json(fixture!("txs-coinbase-3756163.json"));
+        let t = &fx["txs"][0];
+        // A coinbase has no prunable part: monerod leaves as_hex empty and
+        // the pruned form is the whole transaction.
+        let blob = hex::decode(t["pruned_as_hex"].as_str().unwrap()).unwrap();
+        let p = parse_tx(&blob).unwrap();
+        assert_eq!(p.hash, h32(t["tx_hash"].as_str().unwrap()));
+        assert_eq!(p.fee, None);
+        assert!(p.key_images.is_empty());
+        assert_eq!(p.version, 2);
+    }
+
+    #[test]
+    fn parse_tx_rejects_trailing_bytes_and_garbage() {
+        let fx = json(fixture!("txs-mempool.json"));
+        let mut blob = hex::decode(fx["txs"][0]["as_hex"].as_str().unwrap()).unwrap();
+        blob.push(0);
+        assert_eq!(parse_tx(&blob), Err(HashError::TrailingBytes(1)));
+        assert!(matches!(
+            parse_tx(b"\x02\x00"),
+            Err(HashError::Malformed(_))
+        ));
     }
 
     #[test]
