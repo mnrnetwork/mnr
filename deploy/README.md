@@ -68,3 +68,22 @@ build on mainnet; `mnr_chain_height` in `/metrics` shows progress.
 
 This playbook is syntax-checked in CI; it has not yet run against the real
 boxes, which is the ops step that follows (column B, week 1–2).
+
+## Updating the relay by hand
+
+On the relay box, `deploy/update.sh` does what the playbook's binary step
+does, without Ansible:
+
+```
+sudo ./update.sh            # latest GitHub release
+sudo ./update.sh v0.1.12    # a named release
+sudo ./update.sh --dry-run  # fetch and verify only
+sudo ./update.sh --rollback # previous binary back, restart
+```
+
+It verifies the tarball against the release's `SHA256SUMS`, keeps the
+running binary as `/usr/local/bin/mnr-relay.prev`, restarts `mnr-relay`
+and prints the version the relay reports on its own feed. Copy the script
+to the box once (`scp deploy/update.sh <box>:/usr/local/sbin/`); it needs
+`curl` and `jq`, both installed by the `common` role. `mnr-relay faults clear`
+still needs its own restart afterwards, as before.
