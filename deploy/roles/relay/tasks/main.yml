@@ -159,8 +159,13 @@
           body: { jsonrpc: "2.0", id: "0", method: close_wallet }
         failed_when: false
 
+      # By the port it listens on: a pattern match on the command line can
+      # hit the calling shell, and a survivor keeps the keys file locked so
+      # the real service exits 1 with "opened by another wallet program".
       - name: Kill the temporary wallet-rpc
-        ansible.builtin.shell: pkill -u mnr -f 'rpc-bind-port 18083' || true
+        ansible.builtin.shell: |
+          pid=$(ss -ltnp | grep ':18083 ' | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
+          [ -n "$pid" ] && kill "$pid" || true
         changed_when: true
 
   - name: Wallet-rpc service

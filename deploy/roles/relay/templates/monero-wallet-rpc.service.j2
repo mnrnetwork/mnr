@@ -8,14 +8,21 @@ After=network-online.target
 [Service]
 User=mnr
 Group=mnr
+# wallet2 writes its log and the shared ring database relative to the
+# working directory and $HOME; both must be inside the one writable path
+# below or the service exits 1 under ProtectSystem=strict.
+WorkingDirectory=/var/lib/mnr/wallet
+Environment=HOME=/var/lib/mnr/wallet
 ExecStart=/usr/local/bin/monero-wallet-rpc \
   --daemon-address {{ mnr_wallet_daemon | default('https://node.kyc.rip') }} \
   --trusted-daemon \
   --wallet-file /var/lib/mnr/wallet/invoices \
-  --password '' \
+  --password "" \
   --rpc-bind-ip 127.0.0.1 --rpc-bind-port 18082 \
   --disable-rpc-login \
-  --log-level 0 --max-log-file-size 0
+  --log-level 0 --max-log-file-size 0 \
+  --log-file /var/lib/mnr/wallet/monero-wallet-rpc.log \
+  --shared-ringdb-dir /var/lib/mnr/wallet/ringdb
 Restart=always
 RestartSec=5
 NoNewPrivileges=true
