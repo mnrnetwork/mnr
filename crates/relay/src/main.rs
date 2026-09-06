@@ -36,6 +36,10 @@ async fn main() {
         run_token_command(&args[1..]);
         return;
     }
+    if args.first().map(String::as_str) == Some("faults") {
+        run_faults_command(&args[1..]);
+        return;
+    }
     let args = Args::parse(&args).unwrap_or_else(|why| {
         eprintln!("{why}\nusage: mnr-relay --config relay.toml [--dev-token <token>[:pro]]...");
         std::process::exit(2);
@@ -291,6 +295,59 @@ fn run_token_command(args: &[String]) {
         other => {
             eprintln!("unknown token subcommand {other}");
             std::process::exit(2);
+        }
+    }
+}
+
+/// `mnr-relay faults clear --config relay.toml` — wipe the fault log and
+/// every ejection, for the case where the verifier, not the nodes, was
+/// wrong. Stop the relay first: the running process keeps its own copy.
+fn run_faults_command(args: &[String]) {
+    let mut config = None;
+    let mut i = 0;
+    let mut sub = None;
+    while i < args.len() {
+        match args[i].as_str() {
+            "clear" => sub = Some("clear"),
+            "--config" => {
+                i += 1;
+                config = args.get(i).map(PathBuf::from);
+            }
+            f if f.starts_with("--config=") => {
+                config = Some(PathBuf::from(&f["--config=".len()..]))
+            }
+            other => {
+                eprintln!("unknown faults argument {other}");
+                std::process::exit(2);
+            }
+        }
+        i += 1;
+    }
+    if sub != Some("clear") {
+        eprintln!("usage: mnr-relay faults clear --config relay.toml");
+        std::process::exit(2);
+    }
+    let config = config.unwrap_or_else(|| {
+        eprintln!("faults clear requires --config");
+        std::process::exit(2);
+    });
+    let cfg = Config::load(&config).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    });
+    let Some(db) = cfg.auth.database.as_deref() else {
+        eprintln!("faults clear requires [auth] database in the config");
+        std::process::exit(1);
+    };
+    let store = SqliteStore::open(Some(db)).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    });
+    match store.clear_faults() {
+        Ok(n) => println!("cleared {n} fault log entries and every ejection; restart the relay"),
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
         }
     }
 }

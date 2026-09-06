@@ -627,6 +627,22 @@ impl SqliteStore {
         );
     }
 
+    /// Wipe the fault log and every upstream's fault count and ejection:
+    /// the operator's tool after a verifier bug faulted honest nodes.
+    /// Returns how many log rows were removed.
+    pub fn clear_faults(&self) -> Result<usize, String> {
+        let conn = self.conn.lock();
+        let n = conn
+            .execute("DELETE FROM fault_log", [])
+            .map_err(|e| e.to_string())?;
+        conn.execute(
+            "UPDATE upstream_stats SET faults = 0, ejected_until = NULL",
+            [],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(n)
+    }
+
     /// The newest `limit` faults, oldest first.
     pub fn load_faults(&self, limit: usize) -> Vec<FaultEvent> {
         let conn = self.conn.lock();
@@ -1201,6 +1217,24 @@ mod tests {
         assert_eq!(kept.len(), 5);
         assert_eq!(kept[0].detail, "15");
         assert_eq!(kept[4].detail, "19");
+        store
+            .save_upstream_stats(&[(
+                "u".into(),
+                UpstreamStats {
+                    requests: 9,
+                    verified: 4,
+                    faults: 5,
+                    ejected_until: Some(u64::MAX),
+                },
+            )])
+            .unwrap();
+        assert_eq!(store.clear_faults().unwrap(), 5);
+        assert!(store.load_faults(10).is_empty());
+        let st = store.load_upstream_stats()["u"];
+        assert_eq!(
+            (st.requests, st.verified, st.faults, st.ejected_until),
+            (9, 4, 0, None)
+        );
     }
 
     #[test]

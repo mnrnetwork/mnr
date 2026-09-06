@@ -411,9 +411,18 @@ pub enum TxCheck {
     Unverifiable,
 }
 
+/// How far above the quorum tip a confirmed height may be before it is a
+/// lie. The quorum tip lags a probe round (15 s) behind the network, and a
+/// node on the real tip answers honestly with the newest block's height;
+/// two blocks in one round happens, three is rare, more is a claim no honest
+/// node makes. Found in the beta: without slack, every node was faulted and
+/// ejected for telling the truth about the newest block.
+pub const TIP_SLACK: u64 = 3;
+
 /// Verify every entry of a `/get_transactions` answer against the request.
-/// `tip` is the quorum tip height (a confirmed height above it is a lie).
-/// Returns one verdict per entry, in answer order.
+/// `tip` is the quorum tip height; a confirmed height more than
+/// [`TIP_SLACK`] above it is a lie. Returns one verdict per entry, in answer
+/// order.
 pub fn verify_transactions(
     requested: &[String],
     result: &GetTransactionsResult,
@@ -481,7 +490,8 @@ pub fn verify_transactions(
             out.push(TxCheck::Unverifiable);
             continue;
         };
-        match rules::verify_tx(form, txid, location, tip.unwrap_or(u64::MAX)) {
+        let bound = tip.map_or(u64::MAX, |t| t.saturating_add(TIP_SLACK));
+        match rules::verify_tx(form, txid, location, bound) {
             Ok(TxVerdict::Verified) => out.push(TxCheck::Verified {
                 height: (!e.in_pool).then_some(e.block_height),
             }),
@@ -853,8 +863,15 @@ mod tests {
                 }
             )));
             assert_eq!(batch_label(&checks), (Verify::Hash, None));
-            // Claimed above the quorum tip: a lie.
-            assert!(verify_transactions(&requested, &r, Some(3_753_999)).is_err());
+            // Within the slack the quorum lag allows: honest.
+            for lag in 1..=TIP_SLACK {
+                assert!(
+                    verify_transactions(&requested, &r, Some(3_754_000 - lag)).is_ok(),
+                    "tip {lag} behind"
+                );
+            }
+            // Beyond it: a lie.
+            assert!(verify_transactions(&requested, &r, Some(3_754_000 - TIP_SLACK - 1)).is_err());
             // Not what was asked for.
             let other = vec!["00".repeat(32)];
             assert!(verify_transactions(&other, &r, Some(3_754_000)).is_err());

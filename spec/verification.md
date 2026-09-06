@@ -62,7 +62,9 @@ parallel arrays a wallet may read instead of the entries (`txs_as_hex`,
 `txs[i].as_hex` / `txs[i].as_json`. For each entry the blob is hashed and must
 equal `tx_hash`: the full form from `as_hex`,
 or the pruned form from `pruned_as_hex` plus `prunable_hash`. A confirmed entry
-must not claim a height above the quorum tip. An entry with no hashable form
+must not claim a height more than three blocks above the quorum tip (the
+quorum lags a probe round, so a node on the real tip is honestly one or two
+blocks ahead of it). An entry with no hashable form
 (a pruned v1 transaction) is *unverifiable*, not a fault. `missed_tx` entries
 must have been requested too.
 
