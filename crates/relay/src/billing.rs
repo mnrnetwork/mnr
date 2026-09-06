@@ -376,7 +376,9 @@ impl Billing {
                     .filter(|v| *v > now)
                     .unwrap_or(now);
                 if let Err(e) = self.store.extend(&hash, from + bought) {
-                    tracing::error!(error = %e, invoice = %inv.id, "cannot extend renewed token");
+                    // The handle, never the invoice id: the id recovers the
+                    // token (spec/storefront.md).
+                    tracing::error!(error = %e, handle = %handle(&hash), "cannot extend renewed token");
                     return;
                 }
                 tracing::info!(handle = %handle(&hash), months = inv.months, "pro token renewed");
