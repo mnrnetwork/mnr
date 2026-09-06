@@ -83,7 +83,7 @@
   block:
   - name: monero CLI tools for wallet-rpc
     ansible.builtin.get_url:
-      url: "https://downloads.getmonero.org/cli/monero-linux-x64-{{ monero_cli_version | default('v0.18.5.0') }}.tar.bz2"
+      url: "https://downloads.getmonero.org/cli/monero-linux-x64-{{ monero_cli_version | default('v0.18.5.1') }}.tar.bz2"
       dest: "/var/lib/mnr/monero-cli.tar.bz2"
       mode: "0644"
 
@@ -92,11 +92,11 @@
       src: /var/lib/mnr/monero-cli.tar.bz2
       dest: /var/lib/mnr
       remote_src: true
-      creates: "/var/lib/mnr/monero-x86_64-linux-gnu-{{ monero_cli_version | default('v0.18.5.0') }}/monero-wallet-rpc"
+      creates: "/var/lib/mnr/monero-x86_64-linux-gnu-{{ monero_cli_version | default('v0.18.5.1') }}/monero-wallet-rpc"
 
   - name: Link monero-wallet-rpc
     ansible.builtin.file:
-      src: "/var/lib/mnr/monero-x86_64-linux-gnu-{{ monero_cli_version | default('v0.18.5.0') }}/monero-wallet-rpc"
+      src: "/var/lib/mnr/monero-x86_64-linux-gnu-{{ monero_cli_version | default('v0.18.5.1') }}/monero-wallet-rpc"
       dest: /usr/local/bin/monero-wallet-rpc
       state: link
 

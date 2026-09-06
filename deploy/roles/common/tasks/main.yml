@@ -1,7 +1,7 @@
 # Baseline for every box: patched, firewalled, quiet.
 - name: Packages
   ansible.builtin.apt:
-    name: [unattended-upgrades, ufw, curl, ca-certificates, jq]
+    name: [unattended-upgrades, ufw, curl, ca-certificates, jq, bzip2]
     state: present
     update_cache: true
 
