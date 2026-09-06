@@ -464,7 +464,20 @@ async fn transactions(ctx: Ctx, req: Request, timeout: Duration) -> Outcome {
         timeout,
         "/get_transactions",
         |f| {
-            let result: GetTransactionsResult = serde_json::from_slice(&f.body)
+            // A daemon-level answer (`{"status":"Failed",…}` with no `txs`)
+            // is the node declining, not lying: pass it through unverified.
+            let raw: Value =
+                serde_json::from_slice(&f.body).map_err(|_| Fault("answer is not JSON".into()))?;
+            if raw.get("txs").is_none() {
+                let empty: GetTransactionsResult = serde_json::from_value(json!({
+                    "txs": [], "txs_as_hex": [],
+                    "status": raw.get("status").cloned().unwrap_or(json!("Failed")),
+                    "untrusted": true
+                }))
+                .map_err(|_| Fault("answer is not a get_transactions result".into()))?;
+                return Ok((empty, Vec::new()));
+            }
+            let result: GetTransactionsResult = serde_json::from_value(raw)
                 .map_err(|_| Fault("answer is not a get_transactions result".into()))?;
             let checks = verify::verify_transactions(&misses, &result, tip)?;
             Ok((result, checks))
@@ -1167,6 +1180,31 @@ mod tests {
             )
             .await;
         assert_eq!(header(&o, "Mnr-Cache"), Some("miss"));
+    }
+
+    #[tokio::test]
+    async fn daemon_refusal_on_get_transactions_is_passed_through_not_faulted() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let refusing = mock_with(
+            Arc::new(|_, _| (200, r#"{"status":"Failed","untrusted":true}"#.to_owned())),
+            Arc::clone(&hits),
+        )
+        .await;
+        let env = Env::new(pool_at(&[refusing], 3_760_000));
+        let o = env
+            .legacy(
+                "/get_transactions",
+                json!({"txs_hashes": ["ab".repeat(32)]}),
+            )
+            .await;
+        assert_eq!(o.status, 200);
+        assert_eq!(header(&o, "Mnr-Verify"), Some("none"));
+        assert!(
+            env.pool.status().faults.is_empty(),
+            "declining is not lying"
+        );
+        let v: Value = serde_json::from_slice(&o.body).unwrap();
+        assert_eq!(v["status"], "Failed");
     }
 
     #[tokio::test]

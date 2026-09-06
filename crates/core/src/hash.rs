@@ -115,8 +115,11 @@ pub fn tx_hash(blob: &[u8]) -> Result<Hash, HashError> {
 /// reports alongside it (`prunable_hash` in `/get_transactions`).
 ///
 /// Only v2 transactions have a prunable-hash form. For a v2 transaction whose
-/// RingCT type is `Null` (no prunable part), monerod reports an all-zero
-/// prunable hash and that is what must be passed in.
+/// RingCT type is `Null` (coinbase: no prunable part) the hash uses an
+/// **all-zero** prunable hash, while monerod's `/get_transactions` reports
+/// `prunable_hash` as the Keccak of the empty string for it; callers must
+/// pass zeros for that case (see `mnr-relay`'s verifier, which retries with
+/// zeros when the reported value does not match).
 ///
 /// Returns [`HashError::NotVerifiable`] for v1 transactions.
 pub fn pruned_tx_hash(pruned_blob: &[u8], prunable_hash: Hash) -> Result<Hash, HashError> {

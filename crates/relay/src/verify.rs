@@ -491,7 +491,24 @@ pub fn verify_transactions(
             continue;
         };
         let bound = tip.map_or(u64::MAX, |t| t.saturating_add(TIP_SLACK));
-        match rules::verify_tx(form, txid, location, bound) {
+        let mut verdict = rules::verify_tx(form, txid, location, bound);
+        // A coinbase (RingCT type Null) hashes with an all-zero prunable
+        // hash, but monerod reports `prunable_hash` as the hash of nothing.
+        // Retry with zeros before calling a mismatch a lie.
+        if let (Err(VerifyError::HashMismatch { .. }), TxForm::Pruned { blob, .. }) =
+            (&verdict, form)
+        {
+            verdict = rules::verify_tx(
+                TxForm::Pruned {
+                    blob,
+                    prunable_hash: [0; 32],
+                },
+                txid,
+                location,
+                bound,
+            );
+        }
+        match verdict {
             Ok(TxVerdict::Verified) => out.push(TxCheck::Verified {
                 height: (!e.in_pool).then_some(e.block_height),
             }),
@@ -539,6 +556,8 @@ mod tests {
         include_str!("../../core/fixtures/mainnet/txs-3754000-prune-true.json");
     const TXS_V1_PRUNED: &str =
         include_str!("../../core/fixtures/mainnet/txs-202612-prune-true.json");
+    const TXS_COINBASE: &str =
+        include_str!("../../core/fixtures/mainnet/txs-coinbase-3756163.json");
 
     fn chain_0_1() -> HeaderChain {
         let mut c = HeaderChain::new();
@@ -876,6 +895,34 @@ mod tests {
             let other = vec!["00".repeat(32)];
             assert!(verify_transactions(&other, &r, Some(3_754_000)).is_err());
         }
+    }
+
+    /// A coinbase as monerod serves it: `as_hex` empty, `pruned_as_hex`
+    /// set, and `prunable_hash` equal to Keccak("") although the real hash
+    /// uses zeros there. Found in the beta: every node was faulted for it.
+    #[test]
+    fn coinbase_in_pruned_form_verifies() {
+        let r: GetTransactionsResult = serde_json::from_str(TXS_COINBASE).unwrap();
+        assert!(r.txs[0].as_hex.is_empty());
+        assert_eq!(
+            r.txs[0].prunable_hash.as_deref(),
+            Some("c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470")
+        );
+        let requested = vec![r.txs[0].tx_hash.clone()];
+        let checks = verify_transactions(&requested, &r, Some(3_756_163)).unwrap();
+        assert_eq!(
+            checks,
+            vec![TxCheck::Verified {
+                height: Some(3_756_163)
+            }]
+        );
+        // Still a lie if the pruned blob itself is wrong.
+        let mut bad = r.clone();
+        let mut hex_blob = bad.txs[0].pruned_as_hex.clone().unwrap();
+        let last = hex_blob.len() - 1;
+        hex_blob.replace_range(last.., if &hex_blob[last..] == "0" { "1" } else { "0" });
+        bad.txs[0].pruned_as_hex = Some(hex_blob);
+        assert!(verify_transactions(&requested, &bad, Some(3_756_163)).is_err());
     }
 
     #[test]

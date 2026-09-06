@@ -1,0 +1,21 @@
+{
+  "credits": 0,
+  "status": "OK",
+  "top_hash": "",
+  "txs": [{
+    "as_hex": "",
+    "as_json": "",
+    "block_height": 3756163,
+    "block_timestamp": 1788654117,
+    "confirmations": 1,
+    "double_spend_seen": false,
+    "in_pool": false,
+    "output_indices": [162905656],
+    "prunable_as_hex": "",
+    "prunable_hash": "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470",
+    "pruned_as_hex": "02bfa1e50101ff83a1e50101809de487ce11030262ba21558e3607aa66380381df196cefa6862362cd670c85bd2adea2927aaa39660321004e429ca8f25ab00123f2e86d75ba14f22487de852e358dd52eb69b50adb114ba01914b52c0435ebdb98da814405f82036229d61d24d65a9a76c55df8d01ae9a81202200000000000000000276f58e5910000000400000407000000000000000000000000",
+    "tx_hash": "cd7b18176fef67aa7258e58a6614048a7f37056c40e768b83a97cd82a11e9b1d"
+  }],
+  "txs_as_hex": [""],
+  "untrusted": false
+}
