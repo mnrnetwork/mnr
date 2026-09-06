@@ -466,10 +466,15 @@ pub fn verify_transactions(
             )));
         }
         let txid = decode_hex32(&e.tx_hash).map_err(|_| Fault("tx_hash is not hex".into()))?;
-        let location = if e.in_pool {
-            TxLocation::Pool
-        } else {
-            TxLocation::Block(e.block_height)
+        // A confirmed entry without a height cannot be placed; it is a
+        // malformed answer, not a lie, so it is unverifiable rather than a fault.
+        let location = match (e.in_pool, e.block_height) {
+            (true, _) => TxLocation::Pool,
+            (false, Some(h)) => TxLocation::Block(h),
+            (false, None) => {
+                out.push(TxCheck::Unverifiable);
+                continue;
+            }
         };
         let full;
         let pruned;
@@ -510,7 +515,7 @@ pub fn verify_transactions(
         }
         match verdict {
             Ok(TxVerdict::Verified) => out.push(TxCheck::Verified {
-                height: (!e.in_pool).then_some(e.block_height),
+                height: if e.in_pool { None } else { e.block_height },
             }),
             Ok(TxVerdict::NotVerifiable) => out.push(TxCheck::Unverifiable),
             Err(e) => return Err(Fault(e.to_string())),
@@ -558,6 +563,7 @@ mod tests {
         include_str!("../../core/fixtures/mainnet/txs-202612-prune-true.json");
     const TXS_COINBASE: &str =
         include_str!("../../core/fixtures/mainnet/txs-coinbase-3756163.json");
+    const TXS_MEMPOOL: &str = include_str!("../../core/fixtures/mainnet/txs-mempool.json");
 
     fn chain_0_1() -> HeaderChain {
         let mut c = HeaderChain::new();
@@ -900,6 +906,38 @@ mod tests {
     /// A coinbase as monerod serves it: `as_hex` empty, `pruned_as_hex`
     /// set, and `prunable_hash` equal to Keccak("") although the real hash
     /// uses zeros there. Found in the beta: every node was faulted for it.
+    /// A mempool entry has no `block_height` (monerod serialises it only for
+    /// confirmed transactions). It parses, verifies by hash, carries no height
+    /// (so it is never cached) and is not a fault against the node that sent it.
+    #[test]
+    fn mempool_entry_verifies_by_hash_without_a_height() {
+        let r: GetTransactionsResult = serde_json::from_str(TXS_MEMPOOL).unwrap();
+        let e = &r.txs[0];
+        assert!(e.in_pool);
+        assert_eq!(e.block_height, None);
+        assert_eq!(e.extra["relayed"], true);
+        let requested = vec![e.tx_hash.clone()];
+        let checks = verify_transactions(&requested, &r, Some(3_756_300)).unwrap();
+        assert_eq!(checks, vec![TxCheck::Verified { height: None }]);
+        // Round trip keeps monerod's shape: no `block_height` key for a pool tx.
+        let v: Value = serde_json::to_value(&r).unwrap();
+        assert!(v["txs"][0].get("block_height").is_none());
+        // A tampered pool blob is still a lie.
+        let mut bad = r.clone();
+        let mut hex_blob = bad.txs[0].as_hex.clone();
+        let last = hex_blob.len() - 1;
+        hex_blob.replace_range(last.., if &hex_blob[last..] == "0" { "1" } else { "0" });
+        bad.txs[0].as_hex = hex_blob;
+        assert!(verify_transactions(&requested, &bad, Some(3_756_300)).is_err());
+        // A confirmed entry that lost its height is unverifiable, not a fault.
+        let mut odd = r.clone();
+        odd.txs[0].in_pool = false;
+        assert_eq!(
+            verify_transactions(&requested, &odd, Some(3_756_300)).unwrap(),
+            vec![TxCheck::Unverifiable]
+        );
+    }
+
     #[test]
     fn coinbase_in_pruned_form_verifies() {
         let r: GetTransactionsResult = serde_json::from_str(TXS_COINBASE).unwrap();

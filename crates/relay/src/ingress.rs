@@ -178,7 +178,7 @@ async fn rpc(
     match policy.class {
         Class::Deny => {
             app.metrics.refused("denied");
-            return denied(is_jsonrpc, id, &requested);
+            return denied(is_jsonrpc, id, &requested, Some(policy.note));
         }
         Class::NotDaemon => {
             app.metrics.refused("not_daemon");
@@ -306,21 +306,26 @@ fn policy_paths() -> impl Iterator<Item = &'static str> {
 
 /// JSON-RPC callers get `-32601` in a 200 like monerod would; legacy paths
 /// get a 403 so a wallet does not mistake the body for a daemon answer.
-fn denied(is_jsonrpc: bool, id: Value, requested: &str) -> Response {
+/// Either way the policy note rides in `error.data.hint`, so a caller learns
+/// why (`/get_transaction_pool` is restricted-gated in monerod itself) and
+/// what to call instead, without a support round trip.
+fn denied(is_jsonrpc: bool, id: Value, requested: &str, hint: Option<&str>) -> Response {
     if is_jsonrpc {
         json_response(
             StatusCode::OK,
-            &JsonRpcResponse::<()>::method_not_found(id, requested, None),
+            &JsonRpcResponse::<()>::method_not_found(id, requested, hint),
             &[],
         )
     } else {
-        json_rpc_error(
-            StatusCode::FORBIDDEN,
+        let mut body = JsonRpcResponse::<()>::error(
             Value::Null,
             mnr_core::wire::METHOD_NOT_FOUND,
             "method not allowed",
-            &[],
-        )
+        );
+        if let (Some(err), Some(h)) = (body.error.as_mut(), hint) {
+            err.data = Some(serde_json::json!({ "hint": h }));
+        }
+        json_response(StatusCode::FORBIDDEN, &body, &[])
     }
 }
 
@@ -464,6 +469,28 @@ mod tests {
             r2.headers().get_all(header::WWW_AUTHENTICATE).iter().next(),
             "nonce is fresh per challenge"
         );
+    }
+
+    #[tokio::test]
+    async fn denial_carries_the_policy_hint() {
+        let note = mnr_core::policy::lookup_or_deny("/get_transaction_pool").note;
+        assert!(note.contains("get_transaction_pool_hashes"), "{note}");
+        let legacy = denied(false, Value::Null, "/get_transaction_pool", Some(note));
+        assert_eq!(legacy.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(legacy.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"]["message"], "method not allowed");
+        assert_eq!(v["error"]["data"]["hint"], note);
+        let rpc = denied(true, Value::from(3), "flush_txpool", Some("no"));
+        assert_eq!(rpc.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(rpc.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"]["code"], mnr_core::wire::METHOD_NOT_FOUND);
+        assert_eq!(v["error"]["data"]["hint"], "no");
     }
 
     #[test]

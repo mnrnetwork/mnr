@@ -260,7 +260,12 @@ pub struct GetBlockHeadersRangeResult {
 pub struct TxEntry {
     pub as_hex: String,
     pub as_json: String,
-    pub block_height: u64,
+    /// Absent for a mempool entry: monerod serialises `block_height`,
+    /// `block_timestamp`, `confirmations` and `output_indices` only when
+    /// `in_pool` is false, and `relayed` / `received_timestamp` only when it
+    /// is true (the latter two land in `extra`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_height: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub block_timestamp: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

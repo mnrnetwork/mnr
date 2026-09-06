@@ -65,8 +65,20 @@ or the pruned form from `pruned_as_hex` plus `prunable_hash`. A confirmed entry
 must not claim a height more than three blocks above the quorum tip (the
 quorum lags a probe round, so a node on the real tip is honestly one or two
 blocks ahead of it). An entry with no hashable form
-(a pruned v1 transaction) is *unverifiable*, not a fault. `missed_tx` entries
-must have been requested too.
+(a pruned v1 transaction) is *unverifiable*, not a fault. A mempool entry
+(`in_pool: true`) carries no `block_height`, `confirmations` or
+`output_indices` at all (monerod serialises those only for confirmed
+transactions, and `relayed` / `received_timestamp` only for pool ones); it is
+verified by hash alone, labelled `hash` like any other entry, and never
+cached. A confirmed entry that lacks a height is malformed: *unverifiable*,
+not a fault. `missed_tx` entries must have been requested too.
+
+This is how a client reads the mempool through the relay: pool hashes from
+`/get_transaction_pool_hashes(.bin)` or `/get_transaction_pool_stats`
+(pass-through, `none`, one upstream), then the transactions themselves from
+`/get_transactions`, each proven to hash to its txid. `/get_transaction_pool`
+is denied because monerod itself gates it behind unrestricted mode; the 403
+says so in `error.data.hint`.
 
 Label: `hash` when every entry verified, `partial` with `Mnr-Verified: k/n`
 when some could not be, `none` when none could. Each verified, confirmed entry

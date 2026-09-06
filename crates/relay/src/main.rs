@@ -32,6 +32,18 @@ async fn main() {
         .init();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if matches!(
+        args.first().map(String::as_str),
+        Some("--version" | "-V" | "version")
+    ) {
+        println!(
+            "mnr-relay {}+{} ({})",
+            ingress::VERSION,
+            ingress::GIT_SHA,
+            ingress::TARGET
+        );
+        return;
+    }
     if args.first().map(String::as_str) == Some("token") {
         run_token_command(&args[1..]);
         return;
@@ -41,7 +53,7 @@ async fn main() {
         return;
     }
     let args = Args::parse(&args).unwrap_or_else(|why| {
-        eprintln!("{why}\nusage: mnr-relay --config relay.toml [--dev-token <token>[:pro]]...");
+        eprintln!("{why}\nusage: mnr-relay --config relay.toml [--dev-token <token>[:pro]]... | --version");
         std::process::exit(2);
     });
     let cfg = match Config::load(&args.config) {
