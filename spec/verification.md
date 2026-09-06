@@ -134,6 +134,18 @@ config's `opt_out` list, which refuses it at load. Anything else (404, no
 answer) means "no answer today" and is re-read the next day; removing the file
 re-admits the host on the next read.
 
+## Routing of revealing requests
+
+The content of some requests says what a wallet is looking at: the outputs it
+builds a ring from (`/get_outs`, `/get_outs.bin`, `/get_o_indexes.bin`,
+`get_output_distribution`, `get_output_histogram`), the transactions it looks
+up (`/get_transactions`) and the key images it checks (`/is_key_image_spent`).
+These go to the relay's **own node first, always**, and to public nodes only
+when it is down or at its cap. A public node therefore sees such a request
+only as the fallback, and even then without the client's address. The
+outputs family for Pro compares the owned node's answer with the best public
+node's, so the public node sees that query by design; see `agreement`.
+
 ## Not verified
 
 Streams (`/get_blocks.bin` family), mempool methods, `/is_key_image_spent`,
