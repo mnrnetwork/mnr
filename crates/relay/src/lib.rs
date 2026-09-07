@@ -29,6 +29,7 @@ pub mod ingress;
 pub mod limits;
 pub mod metrics;
 pub mod pool;
+pub mod price;
 pub mod store;
 pub mod stream;
 pub mod upstream;

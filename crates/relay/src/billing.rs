@@ -50,6 +50,7 @@ use sha2::{Digest, Sha256};
 
 use crate::auth::{self, handle, token_hash, Tier};
 use crate::config::BillingConfig;
+use crate::price::{self, Price};
 use crate::store::{Invoice, InvoiceStatus, SqliteStore};
 
 /// How often the watcher checks pending invoices.
@@ -70,6 +71,8 @@ const TOKEN_DOMAIN: &[u8] = b"mnr-invoice-token-v1";
 pub struct Billing {
     cfg: BillingConfig,
     store: Arc<SqliteStore>,
+    /// The live XMR/USD rate; `None` when the price is fixed in XMR.
+    price: Option<Arc<Price>>,
     wallet: reqwest::Client,
     secret: [u8; 32],
     boot_key: [u8; 32],
@@ -108,7 +111,11 @@ impl Refusal {
 impl Billing {
     /// Build the storefront over an opened token store. Fails only if the
     /// secret file cannot be created or read.
-    pub fn new(cfg: BillingConfig, store: Arc<SqliteStore>) -> Result<Self, String> {
+    pub fn new(
+        cfg: BillingConfig,
+        store: Arc<SqliteStore>,
+        price: Option<Arc<Price>>,
+    ) -> Result<Self, String> {
         let secret = match &cfg.secret_file {
             Some(p) => load_or_create_secret(p)?,
             None => {
@@ -130,6 +137,7 @@ impl Billing {
         Ok(Self {
             cfg,
             store,
+            price,
             wallet,
             secret,
             boot_key,
@@ -486,11 +494,12 @@ impl Billing {
             })?,
         };
         let now = unix_now();
+        let priced = self.amount_for(months, now)?;
         let inv = Invoice {
             id: id.clone(),
             subaddr_index,
             address: address.clone(),
-            amount: self.cfg.pro_price_atomic.saturating_mul(u64::from(months)),
+            amount: priced.amount,
             months,
             renew_hash,
             created_at: now,
@@ -498,11 +507,40 @@ impl Billing {
             status: InvoiceStatus::Pending,
             received: 0,
             paid_at: None,
+            usd_cents: priced.usd_cents,
+            rate_usd_per_xmr: priced.rate.as_ref().map(|r| r.usd_per_xmr),
+            rate_at: priced.rate.as_ref().map(|r| r.at_unix),
+            rate_sources: priced.rate.as_ref().map(|r| r.sources.join(",")),
         };
         self.store
             .create_invoice(&inv)
             .map_err(|_| Refusal::Unavailable("cannot store invoice"))?;
         Ok(invoice_view(&inv, None, 0))
+    }
+
+    /// The atomic amount for `months`: a fixed XMR price when configured,
+    /// else `pro_price_usd` (default $9) at the live rate, rounded up to
+    /// 0.0001 XMR. Without a fresh rate the invoice is refused rather than
+    /// mispriced.
+    fn amount_for(&self, months: u32, now: u64) -> Result<Priced, Refusal> {
+        if let Some(fixed) = self.cfg.pro_price_atomic {
+            return Ok(Priced {
+                amount: fixed.saturating_mul(u64::from(months)),
+                usd_cents: None,
+                rate: None,
+            });
+        }
+        let usd = self.cfg.pro_price_usd.unwrap_or(9.0) * f64::from(months);
+        let rate = self
+            .price
+            .as_ref()
+            .and_then(|p| p.rate(now))
+            .ok_or(Refusal::Unavailable("price unavailable; try again later"))?;
+        Ok(Priced {
+            amount: price::atomic_for(usd, rate.usd_per_xmr),
+            usd_cents: Some((usd * 100.0).round() as u64),
+            rate: Some(rate),
+        })
     }
 
     async fn invoice_status(
@@ -558,10 +596,29 @@ fn invoice_view(inv: &Invoice, token: Option<String>, confirmations: u64) -> Val
         "expires_at": inv.expires_at,
         "uri": format!("monero:{}?tx_amount={}", inv.address, inv.amount as f64 / 1e12),
     });
+    if let Some(c) = inv.usd_cents {
+        v["price_usd"] = json!(c as f64 / 100.0);
+    }
+    if let Some(r) = inv.rate_usd_per_xmr {
+        v["rate_usd_per_xmr"] = json!(r);
+    }
+    if let Some(t) = inv.rate_at {
+        v["rate_at"] = json!(t);
+    }
+    if let Some(src) = &inv.rate_sources {
+        v["rate_sources"] = json!(src.split(',').filter(|s| !s.is_empty()).collect::<Vec<_>>());
+    }
     if let Some(t) = token {
         v["token"] = Value::String(t);
     }
     v
+}
+
+/// An invoice amount and how it was arrived at.
+struct Priced {
+    amount: u64,
+    usd_cents: Option<u64>,
+    rate: Option<price::Rate>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -778,7 +835,9 @@ mod tests {
     fn cfg(wallet_rpc: Option<String>, dir: &Path) -> BillingConfig {
         BillingConfig {
             wallet_rpc,
-            pro_price_atomic: 60_000_000_000,
+            pro_price_atomic: Some(60_000_000_000),
+            pro_price_usd: None,
+            price_sources: Vec::new(),
             confirmations: 10,
             free_per_day: 100,
             per_client_per_hour: 3,
@@ -798,7 +857,7 @@ mod tests {
     async fn free_tokens_are_issued_and_throttled_per_client_key() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(SqliteStore::open(Some(&dir.path().join("b.db"))).unwrap());
-        let b = Billing::new(cfg(None, dir.path()), Arc::clone(&store)).unwrap();
+        let b = Billing::new(cfg(None, dir.path()), Arc::clone(&store), None).unwrap();
         let h = HeaderMap::new();
         let mut tokens = Vec::new();
         for _ in 0..3 {
@@ -822,7 +881,7 @@ mod tests {
         // Keys are hashes with a per-process key: never the address.
         let k = b.client_key(&other, peer());
         assert_ne!(&k[..], b"203.0.113.9");
-        let b2 = Billing::new(cfg(None, dir.path()), Arc::clone(&store)).unwrap();
+        let b2 = Billing::new(cfg(None, dir.path()), Arc::clone(&store), None).unwrap();
         assert_ne!(
             k,
             b2.client_key(&other, peer()),
@@ -851,7 +910,7 @@ mod tests {
             calls: AtomicU64::new(0),
         });
         let url = wallet(Arc::clone(&w)).await;
-        let b = Billing::new(cfg(Some(url), dir.path()), Arc::clone(&store)).unwrap();
+        let b = Billing::new(cfg(Some(url), dir.path()), Arc::clone(&store), None).unwrap();
         let h = HeaderMap::new();
         let v = b
             .create_invoice(
@@ -976,7 +1035,7 @@ mod tests {
         let url = wallet(Arc::clone(&w)).await;
         let mut c = cfg(Some(url), dir.path());
         c.status_per_client_per_hour = 5;
-        let b = Billing::new(c, Arc::clone(&store)).unwrap();
+        let b = Billing::new(c, Arc::clone(&store), None).unwrap();
         let h = HeaderMap::new();
         // A Free token has nothing to extend.
         let free = store.issue(Tier::Free, None);
@@ -1038,7 +1097,7 @@ mod tests {
         forged.insert("cf-connecting-ip", HeaderValue::from_static("198.51.100.1"));
         let mut plain_cfg = cfg(None, dir.path());
         plain_cfg.client_ip_header = None;
-        let b2 = Billing::new(plain_cfg, Arc::clone(&store)).unwrap();
+        let b2 = Billing::new(plain_cfg, Arc::clone(&store), None).unwrap();
         assert_eq!(
             b2.client_key(&forged, peer()),
             b2.client_key(&HeaderMap::new(), peer())
@@ -1055,7 +1114,7 @@ mod tests {
             calls: AtomicU64::new(0),
         });
         let url = wallet(Arc::clone(&w)).await;
-        let b = Billing::new(cfg(Some(url), dir.path()), Arc::clone(&store)).unwrap();
+        let b = Billing::new(cfg(Some(url), dir.path()), Arc::clone(&store), None).unwrap();
         let h = HeaderMap::new();
         let old = store.issue(Tier::Pro, Some(1));
         let v = b
@@ -1089,6 +1148,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_price_bills_nine_dollars_at_the_rate_and_refuses_without_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteStore::open(Some(&dir.path().join("b.db"))).unwrap());
+        let w = Arc::new(Wallet {
+            next_index: AtomicU64::new(1),
+            transfers: Mutex::new(Vec::new()),
+            calls: AtomicU64::new(0),
+        });
+        let url = wallet(Arc::clone(&w)).await;
+        let mut c = cfg(Some(url), dir.path());
+        c.pro_price_atomic = None; // live rate, $9 by default
+        let price = Arc::new(
+            Price::new(
+                vec!["a".into(), "b".into()],
+                "mnr-relay/test",
+                Some(Arc::clone(&store)),
+            )
+            .unwrap(),
+        );
+        let b = Billing::new(c, Arc::clone(&store), Some(Arc::clone(&price))).unwrap();
+        let h = HeaderMap::new();
+        // No rate yet: refused, not mispriced.
+        assert!(matches!(
+            b.create_invoice(&h, peer(), InvoiceRequest { months: Some(1), renew: None }).await,
+            Err(Refusal::Unavailable(m)) if m.contains("price")
+        ));
+        // Two sources agree at 538.8: $9 -> 0.0168 XMR, three months -> 0.0502.
+        price.observe(
+            &[("a".into(), Ok(538.8)), ("b".into(), Ok(538.8))],
+            unix_now(),
+        );
+        let v = b
+            .create_invoice(
+                &h,
+                peer(),
+                InvoiceRequest {
+                    months: Some(3),
+                    renew: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(v["amount_atomic"], price::atomic_for(27.0, 538.8));
+        assert_eq!(v["amount_xmr"], "0.0502");
+        assert_eq!(v["price_usd"], 27.0);
+        assert_eq!(v["rate_usd_per_xmr"], 538.8);
+        assert_eq!(v["rate_sources"], json!(["a", "b"]));
+        assert!(v["rate_at"].as_u64().is_some());
+        // The stored invoice carries the same, and the status view shows it.
+        let id = v["invoice_id"].as_str().unwrap();
+        let inv = store.invoice(id).unwrap();
+        assert_eq!(inv.usd_cents, Some(2700));
+        assert_eq!(inv.rate_sources.as_deref(), Some("a,b"));
+        let st = b.invoice_status(&h, peer(), id).await.unwrap();
+        assert_eq!(st["rate_usd_per_xmr"], 538.8);
+        // The rate survives a restart through the store.
+        let again = Price::new(vec![], "mnr-relay/test", Some(Arc::clone(&store))).unwrap();
+        assert_eq!(again.rate(unix_now()).unwrap().usd_per_xmr, 538.8);
+        // A fixed price ignores the rate entirely and carries no rate fields.
+        let mut fixed = cfg(None, dir.path());
+        fixed.pro_price_atomic = Some(60_000_000_000);
+        let fb = Billing::new(fixed, Arc::clone(&store), Some(price)).unwrap();
+        let p = fb.amount_for(2, unix_now()).unwrap();
+        assert_eq!(
+            (p.amount, p.usd_cents, p.rate),
+            (120_000_000_000, None, None)
+        );
+    }
+
+    #[tokio::test]
     async fn wallet_failures_leave_invoices_pending_and_expiry_closes_them() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(SqliteStore::open(Some(&dir.path().join("b.db"))).unwrap());
@@ -1104,12 +1233,17 @@ mod tests {
             status: InvoiceStatus::Pending,
             received: 0,
             paid_at: None,
+            usd_cents: None,
+            rate_usd_per_xmr: None,
+            rate_at: None,
+            rate_sources: None,
         };
         store.create_invoice(&inv).unwrap();
         // The wallet is unreachable: nothing changes, nothing is paid.
         let b = Billing::new(
             cfg(Some("http://127.0.0.1:1/json_rpc".into()), dir.path()),
             Arc::clone(&store),
+            None,
         )
         .unwrap();
         b.check_invoices().await;
@@ -1140,7 +1274,7 @@ mod tests {
             Err(Refusal::NotFound)
         ));
         // Without a wallet, invoices are refused but free tokens still work.
-        let b = Billing::new(cfg(None, dir.path()), Arc::clone(&store)).unwrap();
+        let b = Billing::new(cfg(None, dir.path()), Arc::clone(&store), None).unwrap();
         assert!(matches!(
             b.create_invoice(&HeaderMap::new(), peer(), InvoiceRequest::default())
                 .await,
@@ -1174,7 +1308,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(SqliteStore::open(Some(&dir.path().join("b.db"))).unwrap());
-        let b = Arc::new(Billing::new(cfg(None, dir.path()), Arc::clone(&store)).unwrap());
+        let b = Arc::new(Billing::new(cfg(None, dir.path()), Arc::clone(&store), None).unwrap());
         let cfg = Config::parse(
             "[probe]\nmin_agree = 1\n[[upstreams]]\nname = \"o\"\nurl = \"http://10.0.0.2:18081\"\nkind = \"owned\"\ntransport = \"http\"\n",
         )

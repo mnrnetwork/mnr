@@ -16,6 +16,7 @@ use mnr_relay::config::Config;
 use mnr_relay::ingress::{self, App};
 use mnr_relay::limits::{Limiter, MemoryLimiter};
 use mnr_relay::metrics::{self, Metrics};
+use mnr_relay::price::Price;
 use mnr_relay::store::SqliteStore;
 use mnr_relay::upstream::Pool;
 
@@ -72,6 +73,7 @@ async fn main() {
     );
 
     let mut billing = None;
+    let mut price: Option<Arc<Price>> = None;
     let (store, limiter): (Arc<dyn TokenStore>, Arc<dyn Limiter>) = match &cfg.auth.database {
         Some(db) => {
             if !args.dev_tokens.is_empty() {
@@ -87,11 +89,30 @@ async fn main() {
             // the fault and opt-out logs) live in the same database.
             pool.attach_store(Arc::clone(&s));
             tokio::spawn(Arc::clone(&pool).run_stats_flusher());
+            // The live XMR/USD rate behind the $9 price (decision 1), unless
+            // the operator fixed the price in XMR.
+            if cfg.billing.pro_price_atomic.is_none() && cfg.billing.wallet_rpc.is_some() {
+                let p = Arc::new(
+                    Price::new(
+                        cfg.billing.price_sources.clone(),
+                        cfg.user_agent(),
+                        Some(Arc::clone(&s)),
+                    )
+                    .unwrap_or_else(|e| {
+                        eprintln!("{e}");
+                        std::process::exit(1);
+                    }),
+                );
+                tokio::spawn(Arc::clone(&p).run());
+                price = Some(p);
+            }
             let b = Arc::new(
-                Billing::new(cfg.billing.clone(), Arc::clone(&s)).unwrap_or_else(|e| {
-                    eprintln!("{e}");
-                    std::process::exit(1);
-                }),
+                Billing::new(cfg.billing.clone(), Arc::clone(&s), price.clone()).unwrap_or_else(
+                    |e| {
+                        eprintln!("{e}");
+                        std::process::exit(1);
+                    },
+                ),
             );
             if cfg.billing.wallet_rpc.is_some() {
                 tokio::spawn(Arc::clone(&b).run_watcher());
@@ -137,6 +158,7 @@ async fn main() {
         tokio::spawn(metrics::serve(
             listen,
             Arc::new(metrics::Exporter {
+                price: price.clone(),
                 metrics: Arc::clone(&metrics),
                 pool: Arc::clone(&pool),
                 chain: Arc::clone(&chain),

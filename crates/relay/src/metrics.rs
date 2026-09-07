@@ -214,6 +214,8 @@ pub struct Exporter {
     pub pool: Arc<Pool>,
     pub chain: Arc<ChainStore>,
     pub cache: Arc<Cache>,
+    /// The live XMR/USD rate, when the Pro price is billed at one.
+    pub price: Option<Arc<crate::price::Price>>,
 }
 
 /// Serve `/metrics` on `listen` (a private address; never the public one).
@@ -235,8 +237,33 @@ pub async fn serve(listen: SocketAddr, exporter: Arc<Exporter>) {
 async fn handler(State(x): State<Arc<Exporter>>) -> ([(&'static str, &'static str); 1], String) {
     (
         [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
-        x.metrics.render(&x.pool, &x.chain, &x.cache).await,
+        {
+            let mut out = x.metrics.render(&x.pool, &x.chain, &x.cache).await;
+            if let Some(p) = &x.price {
+                render_price(&mut out, p);
+            }
+            out
+        },
     )
+}
+
+/// The XMR/USD rate behind the Pro price: the accepted rate, how many
+/// sources agreed in the last round, and how old the rate is.
+pub fn render_price(out: &mut String, p: &crate::price::Price) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let _ = writeln!(out, "# TYPE mnr_xmr_usd gauge");
+    if let Some(r) = p.rate(now) {
+        line(out, "mnr_xmr_usd", "", r.usd_per_xmr);
+    }
+    let _ = writeln!(out, "# TYPE mnr_price_sources_ok gauge");
+    line(out, "mnr_price_sources_ok", "", p.sources_ok());
+    let _ = writeln!(out, "# TYPE mnr_price_age_seconds gauge");
+    if let Some(age) = p.age(now) {
+        line(out, "mnr_price_age_seconds", "", age);
+    }
 }
 
 #[cfg(test)]
@@ -294,5 +321,30 @@ mod tests {
             assert!(!text.contains(forbidden), "{forbidden} leaked into metrics");
         }
         assert_eq!(escape("a\"b\\c\nd"), "a\\\"b\\\\c\\nd");
+    }
+
+    #[test]
+    fn price_gauges_follow_the_accepted_rate() {
+        let p = crate::price::Price::new(vec![], "mnr-relay/test", None).unwrap();
+        let mut out = String::new();
+        render_price(&mut out, &p);
+        assert!(out.contains("mnr_price_sources_ok 0"));
+        assert!(
+            !out.contains("mnr_xmr_usd "),
+            "no rate, no gauge line: {out}"
+        );
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        p.observe(
+            &[("a".into(), Ok(538.8)), ("b".into(), Ok(539.0))],
+            now - 30,
+        );
+        let mut out = String::new();
+        render_price(&mut out, &p);
+        assert!(out.contains("mnr_xmr_usd 538.9"), "{out}");
+        assert!(out.contains("mnr_price_sources_ok 2"));
+        assert!(out.contains("mnr_price_age_seconds 3"), "{out}");
     }
 }

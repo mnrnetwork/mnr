@@ -102,10 +102,20 @@ pub struct BillingConfig {
     /// View-only `monero-wallet-rpc` JSON-RPC URL on loopback
     /// (`--disable-rpc-login`). Unset disables Pro invoices.
     pub wallet_rpc: Option<String>,
-    /// Price of one Pro month in atomic units. $9 is the promise; this
-    /// figure is set by hand (no exchange-rate lookups).
-    #[serde(default = "default_pro_price")]
-    pub pro_price_atomic: u64,
+    /// Fixed price of one Pro month in atomic units. Set this to bill a
+    /// fixed XMR amount with no rate lookups; leave it unset (the default)
+    /// to bill `pro_price_usd` at the live rate. Setting both is an error.
+    #[serde(default)]
+    pub pro_price_atomic: Option<u64>,
+    /// Price of one Pro month in USD, billed in XMR at the median of
+    /// `price_sources` when the invoice is created (plan §10 decision 1:
+    /// $9, the default when neither price is set).
+    #[serde(default)]
+    pub pro_price_usd: Option<f64>,
+    /// Public XMR/USD sources for the rate; see `price::SOURCES`. At least
+    /// two must agree for a rate to exist.
+    #[serde(default = "default_price_sources")]
+    pub price_sources: Vec<String>,
     /// Confirmations before a payment counts (plan §5: 10).
     #[serde(default = "default_confirmations")]
     pub confirmations: u32,
@@ -134,8 +144,11 @@ pub struct BillingConfig {
     pub cors_origin: Option<String>,
 }
 
-fn default_pro_price() -> u64 {
-    60_000_000_000
+fn default_price_sources() -> Vec<String> {
+    crate::price::SOURCES
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect()
 }
 fn default_confirmations() -> u32 {
     10
@@ -160,7 +173,9 @@ impl Default for BillingConfig {
     fn default() -> Self {
         Self {
             wallet_rpc: None,
-            pro_price_atomic: default_pro_price(),
+            pro_price_atomic: None,
+            pro_price_usd: None,
+            price_sources: default_price_sources(),
             confirmations: default_confirmations(),
             free_per_day: default_free_per_day(),
             per_client_per_hour: default_per_client(),
@@ -376,6 +391,33 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
+        if self.billing.pro_price_atomic.is_some() && self.billing.pro_price_usd.is_some() {
+            return Err(ConfigError::Invalid(
+                "[billing] set either pro_price_atomic (fixed XMR) or pro_price_usd (live rate), not both".into(),
+            ));
+        }
+        if let Some(v) = self.billing.pro_price_usd {
+            if !(v.is_finite() && v > 0.0) {
+                return Err(ConfigError::Invalid(
+                    "[billing] pro_price_usd must be positive".into(),
+                ));
+            }
+        }
+        if self.billing.pro_price_atomic.is_none() {
+            if self.billing.price_sources.len() < crate::price::MIN_SOURCES {
+                return Err(ConfigError::Invalid(
+                    "[billing] price_sources needs at least two sources for a live rate".into(),
+                ));
+            }
+            for src in &self.billing.price_sources {
+                if !crate::price::SOURCES.contains(&src.as_str()) {
+                    return Err(ConfigError::Invalid(format!(
+                        "[billing] unknown price source {src:?}; known: {}",
+                        crate::price::SOURCES.join(", ")
+                    )));
+                }
+            }
+        }
         let invalid = |why: String| Err(ConfigError::Invalid(why));
         if self.upstreams.is_empty() {
             return invalid("at least one upstream is required".into());
@@ -582,6 +624,43 @@ transport = "onion"
     fn unknown_fields_are_rejected() {
         let text = format!("logging = true\n{PROBE1}{MINIMAL}");
         assert!(Config::parse(&text).is_err());
+    }
+
+    #[test]
+    fn pro_price_is_live_by_default_fixed_by_choice_never_both() {
+        let c = Config::parse(&format!("{PROBE1}{MINIMAL}")).unwrap();
+        assert_eq!(
+            (c.billing.pro_price_atomic, c.billing.pro_price_usd),
+            (None, None)
+        );
+        assert_eq!(c.billing.price_sources.len(), crate::price::SOURCES.len());
+        let c = Config::parse(&format!(
+            "[billing]\npro_price_atomic = 60000000000\n{PROBE1}{MINIMAL}"
+        ))
+        .unwrap();
+        assert_eq!(c.billing.pro_price_atomic, Some(60_000_000_000));
+        let err = Config::parse(&format!(
+            "[billing]\npro_price_atomic = 1\npro_price_usd = 9.0\n{PROBE1}{MINIMAL}"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not both"), "{err}");
+        let err = Config::parse(&format!(
+            "[billing]\nprice_sources = [\"kraken\", \"binance\"]\n{PROBE1}{MINIMAL}"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown price source"), "{err}");
+        let err = Config::parse(&format!(
+            "[billing]\nprice_sources = [\"kraken\"]\n{PROBE1}{MINIMAL}"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("at least two"), "{err}");
+        let err = Config::parse(&format!("[billing]\npro_price_usd = 0\n{PROBE1}{MINIMAL}"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("positive"), "{err}");
     }
 
     #[test]

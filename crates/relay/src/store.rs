@@ -34,7 +34,7 @@ use crate::upstream::{FaultEvent, OptOutEvent};
 /// Seconds the previous token stays valid after a rotation (gateway plan §3.1).
 const GRACE_SECS: u64 = 24 * 3600;
 /// Schema version, stored in `PRAGMA user_version`.
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 /// How often the relay re-reads the token table to pick up CLI changes.
 const TOKEN_RELOAD_EVERY: Duration = Duration::from_secs(30);
 
@@ -90,7 +90,17 @@ CREATE TABLE IF NOT EXISTS invoices(
   expires_at INTEGER NOT NULL,
   status TEXT NOT NULL CHECK(status IN ('pending','paid','expired')),
   received INTEGER NOT NULL DEFAULT 0,
-  paid_at INTEGER
+  paid_at INTEGER,
+  usd_cents INTEGER,
+  rate_usd_per_xmr REAL,
+  rate_at INTEGER,
+  rate_sources TEXT
+);
+CREATE TABLE IF NOT EXISTS rates(
+  id INTEGER PRIMARY KEY CHECK(id = 1),
+  usd_per_xmr REAL NOT NULL,
+  at_unix INTEGER NOT NULL,
+  sources TEXT NOT NULL
 );
 ";
 
@@ -165,7 +175,7 @@ pub struct TokenState {
 
 /// One Pro invoice (plan §5 payments). Holds no client identity: the id is
 /// random, the subaddress is ours, and `renew_hash` is a token hash.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Invoice {
     pub id: String,
     pub subaddr_index: u32,
@@ -181,6 +191,14 @@ pub struct Invoice {
     /// Atomic units seen with enough confirmations at the last check.
     pub received: u64,
     pub paid_at: Option<u64>,
+    /// The USD price this invoice was for (None: fixed XMR price, or an
+    /// invoice from before rates existed).
+    pub usd_cents: Option<u64>,
+    /// The XMR/USD rate the amount was computed at, when it was.
+    pub rate_usd_per_xmr: Option<f64>,
+    pub rate_at: Option<u64>,
+    /// Comma-separated names of the sources that agreed on that rate.
+    pub rate_sources: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -586,7 +604,7 @@ impl SqliteStore {
         let (a, b) = self.hash_pair(hash);
         let conn = self.conn.lock();
         conn.query_row(
-            "SELECT id, subaddr_index, address, amount, months, renew_hash, created_at, expires_at, status, received, paid_at
+            "SELECT id, subaddr_index, address, amount, months, renew_hash, created_at, expires_at, status, received, paid_at, usd_cents, rate_usd_per_xmr, rate_at, rate_sources
              FROM invoices WHERE renew_hash IN (?1, ?2) AND status = 'pending' LIMIT 1",
             params![a.as_slice(), b.as_slice()],
             Self::row_to_invoice,
@@ -752,8 +770,8 @@ impl SqliteStore {
     pub fn create_invoice(&self, inv: &Invoice) -> Result<(), String> {
         let conn = self.conn.lock();
         conn.execute(
-            "INSERT INTO invoices (id, subaddr_index, address, amount, months, renew_hash, created_at, expires_at, status, received, paid_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', 0, NULL)",
+            "INSERT INTO invoices (id, subaddr_index, address, amount, months, renew_hash, created_at, expires_at, status, received, paid_at, usd_cents, rate_usd_per_xmr, rate_at, rate_sources)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', 0, NULL, ?9, ?10, ?11, ?12)",
             params![
                 inv.id,
                 inv.subaddr_index as i64,
@@ -763,6 +781,10 @@ impl SqliteStore {
                 inv.renew_hash.as_ref().map(|h| h.as_slice()),
                 inv.created_at as i64,
                 inv.expires_at as i64,
+                inv.usd_cents.map(|v| v as i64),
+                inv.rate_usd_per_xmr,
+                inv.rate_at.map(|v| v as i64),
+                inv.rate_sources.as_deref(),
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -772,7 +794,7 @@ impl SqliteStore {
     pub fn invoice(&self, id: &str) -> Option<Invoice> {
         let conn = self.conn.lock();
         conn.query_row(
-            "SELECT id, subaddr_index, address, amount, months, renew_hash, created_at, expires_at, status, received, paid_at
+            "SELECT id, subaddr_index, address, amount, months, renew_hash, created_at, expires_at, status, received, paid_at, usd_cents, rate_usd_per_xmr, rate_at, rate_sources
              FROM invoices WHERE id = ?1",
             params![id],
             Self::row_to_invoice,
@@ -784,7 +806,7 @@ impl SqliteStore {
     pub fn pending_invoices(&self) -> Vec<Invoice> {
         let conn = self.conn.lock();
         let mut stmt = match conn.prepare(
-            "SELECT id, subaddr_index, address, amount, months, renew_hash, created_at, expires_at, status, received, paid_at
+            "SELECT id, subaddr_index, address, amount, months, renew_hash, created_at, expires_at, status, received, paid_at, usd_cents, rate_usd_per_xmr, rate_at, rate_sources
              FROM invoices WHERE status = 'pending'",
         ) {
             Ok(s) => s,
@@ -801,7 +823,7 @@ impl SqliteStore {
         let (a, b) = self.hash_pair(hash);
         let conn = self.conn.lock();
         conn.query_row(
-            "SELECT id, subaddr_index, address, amount, months, renew_hash, created_at, expires_at, status, received, paid_at
+            "SELECT id, subaddr_index, address, amount, months, renew_hash, created_at, expires_at, status, received, paid_at, usd_cents, rate_usd_per_xmr, rate_at, rate_sources
              FROM invoices WHERE renew_hash IN (?1, ?2) ORDER BY created_at DESC LIMIT 1",
             params![a.as_slice(), b.as_slice()],
             Self::row_to_invoice,
@@ -820,7 +842,7 @@ impl SqliteStore {
         let conn = self.conn.lock();
         let mut stmt = conn
             .prepare(
-                "SELECT id, subaddr_index, address, amount, months, renew_hash, created_at, expires_at, status, received, paid_at
+                "SELECT id, subaddr_index, address, amount, months, renew_hash, created_at, expires_at, status, received, paid_at, usd_cents, rate_usd_per_xmr, rate_at, rate_sources
                  FROM invoices WHERE status = 'paid' AND renew_hash IS NULL ORDER BY created_at DESC",
             )
             .ok()?;
@@ -880,7 +902,44 @@ impl SqliteStore {
             },
             received: r.get::<_, i64>(9)? as u64,
             paid_at: r.get::<_, Option<i64>>(10)?.map(|v| v as u64),
+            usd_cents: r.get::<_, Option<i64>>(11)?.map(|v| v as u64),
+            rate_usd_per_xmr: r.get::<_, Option<f64>>(12)?,
+            rate_at: r.get::<_, Option<i64>>(13)?.map(|v| v as u64),
+            rate_sources: r.get::<_, Option<String>>(14)?,
         })
+    }
+
+    /// The last accepted XMR/USD rate, if one was persisted.
+    pub fn load_rate(&self) -> Option<crate::price::Rate> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT usd_per_xmr, at_unix, sources FROM rates WHERE id = 1",
+            [],
+            |r| {
+                Ok(crate::price::Rate {
+                    usd_per_xmr: r.get(0)?,
+                    at_unix: r.get::<_, i64>(1)? as u64,
+                    sources: r
+                        .get::<_, String>(2)?
+                        .split(',')
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                        .collect(),
+                })
+            },
+        )
+        .ok()
+    }
+
+    pub fn save_rate(&self, rate: &crate::price::Rate) -> Result<(), String> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO rates (id, usd_per_xmr, at_unix, sources) VALUES (1, ?1, ?2, ?3)
+             ON CONFLICT(id) DO UPDATE SET usd_per_xmr = excluded.usd_per_xmr, at_unix = excluded.at_unix, sources = excluded.sources",
+            params![rate.usd_per_xmr, rate.at_unix as i64, rate.sources.join(",")],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     /// Rotate the token whose *current* hash is `hash`: the new token becomes
@@ -1131,6 +1190,18 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
                 [],
             );
         }
+        // v6: the rate behind each invoice, on an invoices table that has
+        // existed since v2 (the rates table itself is new and created above).
+        if (2..=5).contains(&version) {
+            for (col, ty) in [
+                ("usd_cents", "INTEGER"),
+                ("rate_usd_per_xmr", "REAL"),
+                ("rate_at", "INTEGER"),
+                ("rate_sources", "TEXT"),
+            ] {
+                let _ = conn.execute(&format!("ALTER TABLE invoices ADD COLUMN {col} {ty}"), []);
+            }
+        }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(|e| e.to_string())?;
     }
@@ -1354,6 +1425,60 @@ mod tests {
     }
 
     #[test]
+    fn schema_v5_database_gains_rate_columns_and_a_rates_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v5.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE tokens(id INTEGER PRIMARY KEY, token_hash BLOB UNIQUE NOT NULL, prev_token_hash BLOB, prev_grace_until INTEGER, tier TEXT NOT NULL, status TEXT NOT NULL, valid_until INTEGER, created_at INTEGER NOT NULL);
+                 CREATE TABLE usage(token_id INTEGER NOT NULL, day INTEGER NOT NULL, wu INTEGER NOT NULL, PRIMARY KEY(token_id, day));
+                 CREATE TABLE invoices(id TEXT PRIMARY KEY, subaddr_index INTEGER NOT NULL, address TEXT NOT NULL, amount INTEGER NOT NULL, months INTEGER NOT NULL, renew_hash BLOB, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, status TEXT NOT NULL, received INTEGER NOT NULL DEFAULT 0, paid_at INTEGER);
+                 CREATE TABLE upstream_stats(name TEXT PRIMARY KEY, requests INTEGER NOT NULL, verified INTEGER NOT NULL, faults INTEGER NOT NULL, ejected_until INTEGER, probes INTEGER NOT NULL DEFAULT 0, up INTEGER NOT NULL DEFAULT 0, stream_bytes INTEGER NOT NULL DEFAULT 0);
+                 INSERT INTO invoices VALUES ('old1', 3, '8abc', 60000000000, 1, NULL, 1000, 90000, 'paid', 60000000000, 2000);
+                 PRAGMA user_version = 5;",
+            )
+            .unwrap();
+        }
+        let store = SqliteStore::open(Some(&path)).unwrap();
+        let v: i64 = store
+            .conn()
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        let old = store.invoice("old1").unwrap();
+        assert_eq!(old.amount, 60_000_000_000);
+        assert_eq!(
+            (
+                old.usd_cents,
+                old.rate_usd_per_xmr,
+                old.rate_at,
+                old.rate_sources
+            ),
+            (None, None, None, None)
+        );
+        assert!(store.load_rate().is_none());
+        let rate = crate::price::Rate {
+            usd_per_xmr: 538.8,
+            at_unix: 5_000,
+            sources: vec!["kraken".into(), "coingecko".into()],
+        };
+        store.save_rate(&rate).unwrap();
+        assert_eq!(store.load_rate(), Some(rate.clone()));
+        store
+            .save_rate(&crate::price::Rate {
+                usd_per_xmr: 540.0,
+                ..rate
+            })
+            .unwrap();
+        assert_eq!(
+            store.load_rate().unwrap().usd_per_xmr,
+            540.0,
+            "one row, replaced"
+        );
+    }
+
+    #[test]
     fn invoices_round_trip_and_expire() {
         let dir = tempfile::tempdir().unwrap();
         let store = SqliteStore::open(Some(&dir.path().join("i.db"))).unwrap();
@@ -1369,6 +1494,10 @@ mod tests {
             status: InvoiceStatus::Pending,
             received: 0,
             paid_at: None,
+            usd_cents: None,
+            rate_usd_per_xmr: None,
+            rate_at: None,
+            rate_sources: None,
         };
         store.create_invoice(&inv).unwrap();
         assert_eq!(store.invoice("abc123"), Some(inv.clone()));
@@ -1433,6 +1562,10 @@ mod tests {
             status: InvoiceStatus::Pending,
             received: 0,
             paid_at: None,
+            usd_cents: None,
+            rate_usd_per_xmr: None,
+            rate_at: None,
+            rate_sources: None,
         };
         s.create_invoice(&inv).unwrap();
         let new = s.rotate(&old_hash).unwrap();
