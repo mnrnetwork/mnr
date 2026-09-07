@@ -65,6 +65,9 @@ pub struct ChainStore {
     /// Cache epoch: part of every immutable cache key; bumped on reorg.
     epoch: AtomicU64,
     reorgs: AtomicU64,
+    /// Header ranges on which the asked upstreams could not agree (plan §8:
+    /// the alert). The range is never appended; it is retried.
+    disagreements: AtomicU64,
     /// Current reorg search window (records behind the tip re-fetched).
     window: AtomicU64,
     file: Option<Mutex<File>>,
@@ -143,6 +146,7 @@ impl ChainStore {
             chain: RwLock::new(chain),
             epoch: AtomicU64::new(epoch),
             reorgs: AtomicU64::new(0),
+            disagreements: AtomicU64::new(0),
             window: AtomicU64::new(INITIAL_WINDOW),
             file,
         })
@@ -169,6 +173,10 @@ impl ChainStore {
 
     pub fn reorgs(&self) -> u64 {
         self.reorgs.load(Ordering::Relaxed)
+    }
+
+    pub fn disagreements(&self) -> u64 {
+        self.disagreements.load(Ordering::Relaxed)
     }
 
     /// Run sync steps forever, pacing by what the last step did.
@@ -200,7 +208,7 @@ impl ChainStore {
             Some(t) => (t.height.min(q.height) + 1).saturating_sub(window),
         };
         let end = start.saturating_add(batch - 1).min(q.height);
-        let Some(candidate) = fetch_agreed(pool, start, end, &q).await else {
+        let Some(candidate) = fetch_agreed(pool, start, end, &q, &self.disagreements).await else {
             return Step::Retry;
         };
         self.merge(candidate, start, tip, &q)
@@ -360,12 +368,27 @@ enum CopyError {
     Fault(String),
 }
 
-/// Fetch `start..=end` from `min_agree` upstreams and return the run they
-/// all agree on. A copy in the minority (when there is a strict majority)
-/// is recorded as a fault against its upstream.
-async fn fetch_agreed(pool: &Pool, start: u64, end: u64, q: &QuorumTip) -> Option<Vec<Entry>> {
-    let need = pool.min_agree();
+/// How many upstreams a header range is asked of: plan §8 says a majority
+/// of at least five including the owned node; with fewer healthy on the
+/// tip, every one of them, never fewer than `min_agree`.
+pub const BUILD_COPIES: usize = 5;
+
+/// Fetch `start..=end` from up to `max(min_agree, min(5, healthy))`
+/// upstreams, the owned node first when it is on the tip, and return the
+/// run they all agree on; at least `min_agree` copies must have arrived. A
+/// copy in the minority (when there is a strict majority) is recorded as a
+/// fault against its upstream; no majority at all is counted and logged as
+/// an error, and the range is retried, never appended.
+async fn fetch_agreed(
+    pool: &Pool,
+    start: u64,
+    end: u64,
+    q: &QuorumTip,
+    disagreements: &AtomicU64,
+) -> Option<Vec<Entry>> {
     let ranked = pool.ranked(Work::Light);
+    let need = pool.min_agree();
+    let ask = need.max(BUILD_COPIES.min(ranked.len()));
     // Owned node first (rule 2: it carries our own load by preference),
     // then the rest by rank; each must have a light token right now.
     let owned = ranked
@@ -376,9 +399,9 @@ async fn fetch_agreed(pool: &Pool, start: u64, end: u64, q: &QuorumTip) -> Optio
         .iter()
         .copied()
         .filter(|&id| pool.upstream(id).cfg.kind != Kind::Owned);
-    let mut chosen = Vec::with_capacity(need);
+    let mut chosen = Vec::with_capacity(ask);
     for id in owned.chain(public) {
-        if chosen.len() == need {
+        if chosen.len() == ask {
             break;
         }
         if pool.upstream(id).try_take_light() {
@@ -459,11 +482,29 @@ async fn fetch_agreed(pool: &Pool, start: u64, end: u64, q: &QuorumTip) -> Optio
             );
         }
     } else {
-        tracing::warn!(
+        disagreements.fetch_add(1, Ordering::Relaxed);
+        let tips: Vec<String> = copies
+            .iter()
+            .map(|(id, e)| {
+                format!(
+                    "{}:{}",
+                    pool.upstream(*id).cfg.name,
+                    e.last().map_or_else(
+                        || "-".into(),
+                        |l| l.hash[..4]
+                            .iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<String>()
+                    )
+                )
+            })
+            .collect();
+        tracing::error!(
             start,
             end,
             copies = copies.len(),
-            "header range: no majority among copies"
+            tips = ?tips,
+            "header range: no majority among copies; not appended, retrying (plan §8)"
         );
     }
     None
@@ -858,6 +899,59 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.contains("corrupt"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_range_is_asked_of_five_when_six_are_healthy_and_all_when_fewer() {
+        // Six mocks, min_agree 3: a batch asks five of them (plan §8), the
+        // owned node among them. Three mocks: all three.
+        let net = Net::new(6, 3).await;
+        net.quorum_at(20, Spec { branch: 0, fork: 0 });
+        let store = ChainStore::open(None).unwrap();
+        let before = net.hits.load(Ordering::SeqCst);
+        assert_eq!(store.step(&net.pool, 1000).await, Step::Idle);
+        assert_eq!(
+            net.hits.load(Ordering::SeqCst) - before,
+            5,
+            "five copies of one batch"
+        );
+        let net3 = Net::new(3, 3).await;
+        net3.quorum_at(20, Spec { branch: 0, fork: 0 });
+        let store3 = ChainStore::open(None).unwrap();
+        let before = net3.hits.load(Ordering::SeqCst);
+        assert_eq!(store3.step(&net3.pool, 1000).await, Step::Idle);
+        assert_eq!(net3.hits.load(Ordering::SeqCst) - before, 3);
+    }
+
+    #[tokio::test]
+    async fn an_even_split_is_a_disagreement_never_appended() {
+        // Four mocks, two per branch from height 30: no majority, nothing
+        // appended past the fork, the counter says so, nobody is faulted.
+        let net = Net::new(4, 2).await;
+        net.quorum_at(50, Spec { branch: 0, fork: 0 });
+        net.switch(
+            2,
+            Spec {
+                branch: 1,
+                fork: 30,
+            },
+        );
+        net.switch(
+            3,
+            Spec {
+                branch: 1,
+                fork: 30,
+            },
+        );
+        let store = ChainStore::open(None).unwrap();
+        let _ = store.step(&net.pool, 1000).await;
+        assert_eq!(store.disagreements(), 1);
+        assert!(
+            store.read().len() <= 30,
+            "the disputed range was not appended: {}",
+            store.read().len()
+        );
+        assert!(net.pool.status().faults.is_empty());
     }
 
     #[tokio::test]

@@ -774,6 +774,7 @@ impl SqliteStore {
                 at_unix: r.get::<_, i64>(0)? as u64,
                 upstream: r.get(1)?,
                 host: r.get(2)?,
+                how: "well-known".into(),
             })
         })
         .map(|rows| rows.filter_map(Result::ok).collect())

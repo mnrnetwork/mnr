@@ -122,6 +122,7 @@ impl Metrics {
             ("mnr_upstream_requests_total", "counter"),
             ("mnr_upstream_stream_bytes_total", "counter"),
             ("mnr_upstream_wu_total", "counter"),
+            ("mnr_upstream_rate_millirps_15m", "gauge"),
             ("mnr_upstream_verified_total", "counter"),
             ("mnr_upstream_faults_total", "counter"),
             ("mnr_upstream_rtt_ms", "gauge"),
@@ -138,6 +139,9 @@ impl Metrics {
                     "mnr_upstream_requests_total" => u.requests,
                     "mnr_upstream_stream_bytes_total" => u.stream_bytes,
                     "mnr_upstream_wu_total" => u.wu,
+                    "mnr_upstream_rate_millirps_15m" => {
+                        u.rate_15m.map_or(0, |r| (r * 1000.0).round() as u64)
+                    }
                     "mnr_upstream_verified_total" => u.verified,
                     "mnr_upstream_faults_total" => u.faults,
                     "mnr_upstream_rtt_ms" => u.rtt_ms.unwrap_or(0),
@@ -169,6 +173,13 @@ impl Metrics {
         );
         let _ = writeln!(out, "# TYPE mnr_chain_epoch gauge");
         line(&mut out, "mnr_chain_epoch", "", chain.epoch());
+        let _ = writeln!(out, "# TYPE mnr_chain_disagreements_total counter");
+        line(
+            &mut out,
+            "mnr_chain_disagreements_total",
+            "",
+            chain.disagreements(),
+        );
         let _ = writeln!(out, "# TYPE mnr_reorgs_total counter");
         line(&mut out, "mnr_reorgs_total", "", chain.reorgs());
 

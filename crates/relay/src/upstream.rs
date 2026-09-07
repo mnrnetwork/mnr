@@ -43,6 +43,8 @@ const FAULT_LIMIT: usize = 3;
 const EJECT_FOR: Duration = Duration::from_secs(24 * 3600);
 /// Newest fault events kept for the public log.
 const FAULT_LOG_MAX: usize = 1000;
+/// The window of the public request-rate figure (rule 1).
+const RATE_WINDOW: Duration = Duration::from_secs(15 * 60);
 /// Rule 5: how often each upstream host's `/.well-known/mnr-optout` is read.
 pub const OPT_OUT_CHECK_EVERY: Duration = Duration::from_secs(24 * 3600);
 /// Timeout for one opt-out check (a web host, possibly over Tor).
@@ -154,6 +156,9 @@ pub struct OptOutEvent {
     pub at_unix: u64,
     pub upstream: String,
     pub host: String,
+    /// `well-known` (the host published `/.well-known/mnr-optout`) or
+    /// `config` (the operator asked and the host is refused at load).
+    pub how: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -181,6 +186,9 @@ pub struct Upstream {
     /// not the client received them: the heavy half of the load figure.
     /// Shared with the stream wrapper that counts the chunks as they pass.
     pub stream_bytes: Arc<AtomicU64>,
+    /// `(unix, requests − probes)` sampled every probe round, kept for
+    /// `RATE_WINDOW`: the public request-rate figure (rule 1).
+    rate_samples: Mutex<VecDeque<(u64, u64)>>,
     /// Answers from this upstream that passed verification (plan §4: the
     /// public numbers on the upstreams page).
     pub verified: AtomicU64,
@@ -276,6 +284,10 @@ pub struct Pool {
     quorum: RwLock<Option<QuorumTip>>,
     faults: RwLock<VecDeque<FaultEvent>>,
     opt_outs: RwLock<Vec<OptOutEvent>>,
+    /// Hosts the operator listed under `opt_out` (refused at load); shown
+    /// in the public list alongside the runtime ones.
+    config_opt_outs: Vec<String>,
+    started_unix: u64,
     min_agree: usize,
     interval: Duration,
     /// Where the public numbers persist across restarts (plan §4), when the
@@ -305,6 +317,9 @@ pub struct UpstreamStatus {
     pub synchronized: bool,
     pub opted_out: bool,
     pub requests: u64,
+    /// RPC calls per second over the last 15 minutes, probe rounds
+    /// excluded; `null` until two probe rounds have sampled it.
+    pub rate_15m: Option<f64>,
     /// Bytes pulled by block streams, lifetime.
     pub stream_bytes: u64,
     /// Work units of load this node carried, lifetime: one per RPC call
@@ -381,6 +396,7 @@ impl Pool {
                     timeout,
                     requests: AtomicU64::new(0),
                     stream_bytes: Arc::new(AtomicU64::new(0)),
+                    rate_samples: Mutex::new(VecDeque::new()),
                     verified: AtomicU64::new(0),
                     faults: AtomicU64::new(0),
                     probes: AtomicU64::new(0),
@@ -394,7 +410,19 @@ impl Pool {
             health: RwLock::new(vec![Health::default(); n]),
             quorum: RwLock::new(None),
             faults: RwLock::new(VecDeque::new()),
-            opt_outs: RwLock::new(Vec::new()),
+            opt_outs: RwLock::new(
+                cfg.opt_out
+                    .iter()
+                    .map(|h| OptOutEvent {
+                        at_unix: unix_now(),
+                        upstream: h.clone(),
+                        host: h.clone(),
+                        how: "config".into(),
+                    })
+                    .collect(),
+            ),
+            config_opt_outs: cfg.opt_out.clone(),
+            started_unix: unix_now(),
             min_agree: cfg.probe.min_agree,
             interval: Duration::from_secs(cfg.probe.interval_secs),
             store: RwLock::new(None),
@@ -429,6 +457,9 @@ impl Pool {
         store.prune_faults(FAULT_LOG_MAX);
         *self.faults.write() = store.load_faults(FAULT_LOG_MAX).into();
         *self.opt_outs.write() = store.load_opt_outs();
+        // The store holds the runtime opt-outs; the config's own list is
+        // public too (rule 5) and is seeded again after the overwrite.
+        self.seed_config_opt_outs();
         for o in self.opt_outs.read().iter() {
             if let Some(u) = self.upstreams.iter().find(|u| u.cfg.name == o.upstream) {
                 self.health.write()[u.id].opted_out = true;
@@ -549,6 +580,7 @@ impl Pool {
                 if up {
                     u.up.fetch_add(1, Ordering::Relaxed);
                 }
+                u.sample_rate(unix);
             }
         }
         *self.quorum.write() = q;
@@ -658,6 +690,22 @@ impl Pool {
     }
 
     /// Count an answer from `id` that passed verification.
+    /// Put the config's opt-out hosts into the public list (after a store
+    /// load replaced it), without duplicating what is already there.
+    fn seed_config_opt_outs(&self) {
+        let mut list = self.opt_outs.write();
+        for h in &self.config_opt_outs {
+            if !list.iter().any(|o| o.how == "config" && o.host == *h) {
+                list.push(OptOutEvent {
+                    at_unix: self.started_unix,
+                    upstream: h.clone(),
+                    host: h.clone(),
+                    how: "config".into(),
+                });
+            }
+        }
+    }
+
     pub fn record_verified(&self, id: usize) {
         self.upstreams[id].verified.fetch_add(1, Ordering::Relaxed);
     }
@@ -738,6 +786,7 @@ impl Pool {
                     synchronized: h.synchronized,
                     opted_out: h.opted_out,
                     requests: u.requests.load(Ordering::Relaxed),
+                    rate_15m: u.rate_15m(),
                     stream_bytes: u.stream_bytes.load(Ordering::Relaxed),
                     wu: work_units(
                         u.requests.load(Ordering::Relaxed),
@@ -817,6 +866,7 @@ impl Pool {
             at_unix: unix_now(),
             upstream: u.cfg.name.clone(),
             host,
+            how: "well-known".into(),
         };
         self.opt_outs.write().push(event.clone());
         if let Some(store) = self.store.read().clone() {
@@ -869,6 +919,34 @@ impl Upstream {
     /// Reserve a stream slot, if one is free right now.
     pub fn try_take_stream(&self) -> Option<OwnedSemaphorePermit> {
         Arc::clone(&self.streams).try_acquire_owned().ok()
+    }
+
+    /// Record this round's RPC-call count for the 15-minute rate.
+    pub fn sample_rate(&self, unix: u64) {
+        let calls = self
+            .requests
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.probes.load(Ordering::Relaxed));
+        let mut ring = self.rate_samples.lock();
+        ring.push_back((unix, calls));
+        while ring
+            .front()
+            .is_some_and(|(t, _)| unix.saturating_sub(*t) > RATE_WINDOW.as_secs())
+        {
+            ring.pop_front();
+        }
+    }
+
+    /// RPC calls per second over the sampled window, or `None` until two
+    /// samples exist.
+    pub fn rate_15m(&self) -> Option<f64> {
+        let ring = self.rate_samples.lock();
+        let (t0, c0) = *ring.front()?;
+        let (t1, c1) = *ring.back()?;
+        if t1 <= t0 {
+            return None;
+        }
+        Some(c1.saturating_sub(c0) as f64 / (t1 - t0) as f64)
     }
 
     /// Forward a client body to `path` on this upstream.
@@ -1382,6 +1460,48 @@ transport = "onion"
             assert!(b.try_take(t1));
         }
         assert!(!b.try_take(t1));
+    }
+
+    #[test]
+    fn request_rate_is_sampled_per_probe_round_and_excludes_probes() {
+        let cfg = Config::parse(
+            "[probe]\nmin_agree = 1\n[[upstreams]]\nname = \"a\"\nurl = \"http://127.0.0.1:1\"\nkind = \"public\"\ntransport = \"http\"\n",
+        )
+        .unwrap();
+        let pool = Pool::from_config(&cfg).unwrap();
+        let u = pool.upstream(0);
+        assert_eq!(u.rate_15m(), None, "no samples yet");
+        u.sample_rate(1_000);
+        assert_eq!(u.rate_15m(), None, "one sample is not a rate");
+        // 30 RPC calls and 2 probe rounds in 15 s: 2.0 calls/s.
+        u.requests.fetch_add(32, Ordering::Relaxed);
+        u.probes.fetch_add(2, Ordering::Relaxed);
+        u.sample_rate(1_015);
+        assert_eq!(u.rate_15m(), Some(2.0));
+        // Samples older than the window fall off.
+        u.sample_rate(1_000 + RATE_WINDOW.as_secs() + 1);
+        assert_eq!(u.rate_samples.lock().front().map(|s| s.0), Some(1_015));
+        assert_eq!(pool.status().upstreams[0].rate_15m, u.rate_15m());
+    }
+
+    #[test]
+    fn config_opt_outs_are_public_and_survive_a_store_load() {
+        let cfg = Config::parse(
+            "opt_out = [\"gone.example\"]\n[probe]\nmin_agree = 1\n[[upstreams]]\nname = \"a\"\nurl = \"http://127.0.0.1:1\"\nkind = \"public\"\ntransport = \"http\"\n",
+        )
+        .unwrap();
+        let pool = Pool::from_config(&cfg).unwrap();
+        let list = pool.status().opt_outs;
+        assert_eq!(list.len(), 1);
+        assert_eq!(
+            (list[0].host.as_str(), list[0].how.as_str()),
+            ("gone.example", "config")
+        );
+        // A store load replaces the runtime list; the config entry comes back once.
+        let store = Arc::new(crate::store::SqliteStore::open(None).unwrap());
+        pool.attach_store(store);
+        let list = pool.status().opt_outs;
+        assert_eq!(list.iter().filter(|o| o.how == "config").count(), 1);
     }
 
     #[tokio::test]

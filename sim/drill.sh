@@ -117,17 +117,20 @@ check "header 295 verified again after the switch back" "$v $c" "chain miss"
 
 echo
 echo "phase 2: ejection"
+# The liar is a public node (the exit criterion's "fake upstream"); the
+# owned node stays honest.
 for h in 200 201 202; do
-  inject "${INJ[0]}" "{\"mode\":\"lie_header\",\"height\":$h}"
+  inject "${INJ[1]}" "{\"mode\":\"lie_header\",\"height\":$h}"
   read -r v c u <<<"$(header_by_height "$h")"
   check "header $h: liar skipped, verified answer from another node" "$v" "chain"
-  if [ "$u" = "0" ]; then echo "  FAIL header $h came from the liar"; FAIL=1; fi
+  if [ "$u" = "1" ]; then echo "  FAIL header $h came from the liar"; FAIL=1; fi
 done
-inject "${INJ[0]}" '{"mode":"honest"}'
+inject "${INJ[1]}" '{"mode":"honest"}'
 S=$(curl -s "http://$RELAY/upstreams.json")
-check "liar ejected" "$(echo "$S" | jq -r '.upstreams[0].ejected')" "true"
+check "liar ejected" "$(echo "$S" | jq -r '.upstreams[1].ejected')" "true"
 check_ge "faults in the public log" "$(echo "$S" | jq -r '.faults | length')" 3
-check "faults name the liar" "$(echo "$S" | jq -r '.faults[0].upstream')" "inj-owned"
+check "faults name the liar" "$(echo "$S" | jq -r '[.faults[].upstream] | unique | join(",")')" "inj-1"
+check_ge "the ejection is in the public log" "$(echo "$S" | jq -r '[.faults[] | select(.ejected)] | length')" 1
 check "quorum survives with three honest nodes" "$(echo "$S" | jq -r '.degraded')" "false"
 
 echo
