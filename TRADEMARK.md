@@ -4,6 +4,14 @@
 project: the software, the network and the service published at
 **https://mnr.network**. The code is free software; the name is not.
 
+## The name
+
+`mnr` is the name and the mark. It stands for **Monero Network Relay**, the
+descriptive expansion used to say which mnr this is (in page titles, first
+mentions, taglines and the entity note on the front page), decided
+2026-09-07. The expansion describes what the project does and is not claimed
+as a mark; the wordmark stays `mnr`.
+
 ## What "official mnr" means
 
 There is no company behind mnr. The identity of the project is anchored in

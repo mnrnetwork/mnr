@@ -36,7 +36,7 @@ The method policy table is code: `mnr-core::policy` is canonical, checked in tes
 - Monero serialization/hashing: the `monero-oxide` crates (the monero-serai fork); wrap them behind `mnr-core::hash` so a crate swap never touches the relay. Every hashing function has fixture tests from real mainnet blocks (every hard-fork boundary block, coinbase-only blocks, pruned and unpruned tx forms, a live mempool entry).
 - Tests: `cargo test` for units; `sim/` for integration; differential tests against a real `monerod` for `wire`/`hash`.
 - Config is one TOML file; upstreams are a list with `kind = "owned" | "public"`, `transport = "https" | "http" | "onion"`, and per-node caps.
-- Headers we emit are `Mnr-*`. Package/crate prefix is `mnr`. The name is written lowercase `mnr`; in prose, "mnr — an RPC network for Monero", never "the Monero network".
+- Headers we emit are `Mnr-*`. Package/crate prefix is `mnr`. The name is written lowercase `mnr`; it stands for **Monero Network Relay** (decided 2026-09-07), which is the descriptive expansion used for disambiguation in titles, first mentions and taglines, never as the wordmark. In prose, "mnr — an RPC network for Monero", never "the Monero network".
 - Commit messages: imperative, one line, reference the plan section when implementing it (e.g. `relay: add upstream prober (plan §3)`).
 
 ## Repositories

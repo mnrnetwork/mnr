@@ -1,5 +1,7 @@
 # mnr — an RPC network for Monero
 
+*mnr: Monero Network Relay, at [mnr.network](https://mnr.network).*
+
 Stage 0: a verified proxy over public Monero nodes plus one node we run.
 
 - Plan: `docs/stage0-mvp-plan.md` (what to build, in order)
