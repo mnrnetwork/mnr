@@ -50,7 +50,8 @@ The domain `mnr.network`; the GitHub organisation `mnrnetwork`; on
 crates.io `mnr`, `mnr-core`, `mnr-relay`, `mnr-client` and `mnr-agent`; on
 PyPI `mnr`; on npm the package `mnr-network` and the organisations
 `@mnrnetwork` (where packages are published) and `@mnr-network` (held, unused).
-`mnr` on npm belongs to an unrelated package and is not ours.
+`mnr` on npm belongs to an unrelated package and is not ours. On X the
+account is `@mnr_network`; no other social account speaks for the project.
 
 ## Enforcement
 
