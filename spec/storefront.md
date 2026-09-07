@@ -109,6 +109,13 @@ holds the token's hash, as for every token; the raw token exists only in the
 answer to the status call, recomputed from the id on demand. Payment activates
 it for 30 days × months from the moment of payment.
 
+While an invoice is pending, its status carries `seen_atomic` (what the
+wallet has seen for that subaddress at any confirmation depth, pool included),
+`received_atomic` (what has the required confirmations) and
+`remaining_atomic` / `remaining_xmr` (what is still due), with `confirmations`
+being the deepest transfer's. A payer who sent too little sees the shortfall
+rather than a count that never turns into a token.
+
 ## `POST /v1/{token}/rotate`
 
 Answers `{"token": "sub_…", "previous_valid_secs": 86400}`. The new token is

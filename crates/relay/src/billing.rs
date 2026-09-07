@@ -303,7 +303,7 @@ impl Billing {
     /// Atomic units received on `subaddr_index` with enough confirmations,
     /// counting only transfers from around the invoice's creation on, and
     /// the highest confirmation count seen (for the status page).
-    async fn received(&self, subaddr_index: u32, since: u64) -> Result<(u64, u64), String> {
+    async fn received(&self, subaddr_index: u32, since: u64) -> Result<Seen, String> {
         let r = self
             .wallet_call(
                 "get_transfers",
@@ -311,6 +311,7 @@ impl Billing {
             )
             .await?;
         let mut sum = 0u64;
+        let mut seen = 0u64;
         let mut best_conf = 0u64;
         for list in ["in", "pool"] {
             let Some(items) = r.get(list).and_then(Value::as_array) else {
@@ -329,13 +330,19 @@ impl Billing {
                     continue;
                 }
                 let conf = t.get("confirmations").and_then(Value::as_u64).unwrap_or(0);
+                let amount = t.get("amount").and_then(Value::as_u64).unwrap_or(0);
                 best_conf = best_conf.max(conf);
+                seen = seen.saturating_add(amount);
                 if conf >= u64::from(self.cfg.confirmations) {
-                    sum = sum.saturating_add(t.get("amount").and_then(Value::as_u64).unwrap_or(0));
+                    sum = sum.saturating_add(amount);
                 }
             }
         }
-        Ok((sum, best_conf))
+        Ok(Seen {
+            confirmed: sum,
+            seen,
+            best_conf,
+        })
     }
 
     // ── watcher ─────────────────────────────────────────────────────────
@@ -356,7 +363,10 @@ impl Billing {
         }
         for inv in self.store.pending_invoices() {
             match self.received(inv.subaddr_index, inv.created_at).await {
-                Ok((received, _)) => {
+                Ok(Seen {
+                    confirmed: received,
+                    ..
+                }) => {
                     if received >= inv.amount {
                         self.activate(&inv, received);
                     } else if received != inv.received {
@@ -515,7 +525,7 @@ impl Billing {
         self.store
             .create_invoice(&inv)
             .map_err(|_| Refusal::Unavailable("cannot store invoice"))?;
-        Ok(invoice_view(&inv, None, 0))
+        Ok(invoice_view(&inv, None, 0, 0))
     }
 
     /// The atomic amount for `months`: a fixed XMR price when configured,
@@ -553,13 +563,16 @@ impl Billing {
         let Some(inv) = self.store.invoice(id) else {
             return Err(Refusal::NotFound);
         };
-        let confirmations = match inv.status {
+        // While pending, what the wallet has seen so far, confirmed or not,
+        // so the page can say "received X of Y" instead of leaving a payer
+        // who sent too little to wait for a token that will not come.
+        let (confirmations, seen) = match inv.status {
             InvoiceStatus::Pending => self
                 .received(inv.subaddr_index, inv.created_at)
                 .await
-                .map(|(_, c)| c)
-                .unwrap_or(0),
-            _ => u64::from(self.cfg.confirmations),
+                .map(|s| (s.best_conf, s.seen))
+                .unwrap_or((0, inv.received)),
+            _ => (u64::from(self.cfg.confirmations), inv.received),
         };
         // A purchase shows its token for a week after payment; after that a
         // leaked invoice id recovers nothing.
@@ -569,7 +582,7 @@ impl Billing {
             }
             _ => None,
         };
-        Ok(invoice_view(&inv, token, confirmations))
+        Ok(invoice_view(&inv, token, confirmations, seen))
     }
 
     fn rotate(&self, token: &str) -> Result<Value, Refusal> {
@@ -581,7 +594,24 @@ impl Billing {
     }
 }
 
-fn invoice_view(inv: &Invoice, token: Option<String>, confirmations: u64) -> Value {
+/// What the wallet holds for one invoice's subaddress since it was created.
+struct Seen {
+    /// Atomic units with enough confirmations to count.
+    confirmed: u64,
+    /// Atomic units seen at any confirmation depth (pool included).
+    seen: u64,
+    /// The deepest confirmation among those transfers.
+    best_conf: u64,
+}
+
+fn invoice_view(inv: &Invoice, token: Option<String>, confirmations: u64, seen: u64) -> Value {
+    let xmr = |a: u64| {
+        format!("{:.12}", a as f64 / 1e12)
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_owned()
+    };
+    let remaining = inv.amount.saturating_sub(seen.max(inv.received));
     let mut v = json!({
         "invoice_id": inv.id,
         "status": inv.status.label(),
@@ -591,6 +621,9 @@ fn invoice_view(inv: &Invoice, token: Option<String>, confirmations: u64) -> Val
         "months": inv.months,
         "renewal": inv.renew_hash.is_some(),
         "received_atomic": inv.received,
+        "seen_atomic": seen.max(inv.received),
+        "remaining_atomic": remaining,
+        "remaining_xmr": xmr(remaining),
         "confirmations": confirmations,
         "created_at": inv.created_at,
         "expires_at": inv.expires_at,
@@ -1145,6 +1178,57 @@ mod tests {
             "the rotated token runs on"
         );
         assert!(store.pending_invoices().is_empty());
+    }
+
+    #[tokio::test]
+    async fn status_shows_what_was_seen_and_what_is_left_before_it_confirms() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteStore::open(Some(&dir.path().join("b.db"))).unwrap());
+        let w = Arc::new(Wallet {
+            next_index: AtomicU64::new(1),
+            transfers: Mutex::new(Vec::new()),
+            calls: AtomicU64::new(0),
+        });
+        let url = wallet(Arc::clone(&w)).await;
+        let b = Billing::new(cfg(Some(url), dir.path()), Arc::clone(&store), None).unwrap();
+        let h = HeaderMap::new();
+        let v = b
+            .create_invoice(
+                &h,
+                peer(),
+                InvoiceRequest {
+                    months: Some(1),
+                    renew: None,
+                },
+            )
+            .await
+            .unwrap();
+        let id = v["invoice_id"].as_str().unwrap().to_owned();
+        assert_eq!(v["seen_atomic"], 0);
+        assert_eq!(v["remaining_xmr"], "0.06");
+        // Half the amount, four confirmations: seen, not counted, not paid.
+        w.transfers.lock().push((1, 30_000_000_000, 4, unix_now()));
+        let st = b.invoice_status(&h, peer(), &id).await.unwrap();
+        assert_eq!(st["status"], "pending");
+        assert_eq!(st["confirmations"], 4);
+        assert_eq!(st["seen_atomic"], 30_000_000_000u64);
+        assert_eq!(st["received_atomic"], 0);
+        assert_eq!(st["remaining_xmr"], "0.03");
+        // Ten confirmations of half is still half: pending, remaining stays.
+        w.transfers.lock().clear();
+        w.transfers.lock().push((1, 30_000_000_000, 10, unix_now()));
+        b.check_invoices().await;
+        let st = b.invoice_status(&h, peer(), &id).await.unwrap();
+        assert_eq!(st["status"], "pending");
+        assert_eq!(st["received_atomic"], 30_000_000_000u64);
+        assert_eq!(st["remaining_xmr"], "0.03");
+        // The rest arrives: paid.
+        w.transfers.lock().push((1, 30_000_000_000, 10, unix_now()));
+        b.check_invoices().await;
+        let st = b.invoice_status(&h, peer(), &id).await.unwrap();
+        assert_eq!(st["status"], "paid");
+        assert_eq!(st["remaining_atomic"], 0);
+        assert!(st["token"].is_string());
     }
 
     #[tokio::test]
