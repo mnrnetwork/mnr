@@ -50,13 +50,20 @@ max_bytes = 1073741824               # 1 GiB for the immutable tier
 
 # The storefront (plan §5): free tokens need only [auth] database; Pro
 # invoices also need a view-only monero-wallet-rpc on loopback, started with
-# --disable-rpc-login. Prices are atomic units per month, set by hand.
+# --disable-rpc-login. The Pro price is pro_price_usd a month (default $9,
+# plan decision 1), billed in XMR at the median of price_sources when the
+# invoice is created (at least two must agree within 15%; a move over 30% is
+# held until three rounds confirm it; a rate older than 24 h refuses new
+# invoices). Set pro_price_atomic instead for a fixed XMR price with no
+# lookups; never both.
 # client_ip_header is for a trusted proxy in front (Cloudflare's
 # CF-Connecting-IP forwarded by Caddy) and is only accepted when `listen`
 # is a loopback address.
 [billing]
 # wallet_rpc = "http://127.0.0.1:18082/json_rpc"
-pro_price_atomic = 16700000000       # 0.0167 XMR per month ≈ $9 at 538.8 USD/XMR (2026-09-06); update with the rate
+pro_price_usd = 9.0
+price_sources = ["kraken", "coingecko", "kucoin", "xmrclub", "monerospace"]
+# pro_price_atomic = 16700000000     # fixed alternative: 0.0167 XMR per month, no lookups
 confirmations = 10
 free_per_day = 2000
 per_client_per_hour = 3

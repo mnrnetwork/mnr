@@ -330,7 +330,7 @@ mod tests {
         render_price(&mut out, &p);
         assert!(out.contains("mnr_price_sources_ok 0"));
         assert!(
-            !out.contains("mnr_xmr_usd "),
+            !out.contains("\nmnr_xmr_usd "),
             "no rate, no gauge line: {out}"
         );
         let now = std::time::SystemTime::now()

@@ -157,7 +157,7 @@ Collect three numbers weekly from week 6: **paying Pro tokens**, **WU served per
 
 Recorded here so nothing in the code resolves them silently. Changing one is a plan edit, not a code edit.
 
-1. **Pricing:** Pro is $9/month, Free is 500k WU/month. Confirmed; the tier table in §5 is the contract and `mnr-relay` enforces it.
+1. **Pricing:** Pro is $9/month, Free is 500k WU/month. Confirmed; the tier table in §5 is the contract and `mnr-relay` enforces it. Amended 2026-09-07: the $9 is billed in XMR at the median of five public rate sources at invoice creation (agreement within 15%, a 30% jump held for three rounds, a 24 h stale rate refuses new invoices), replacing the hand-set XMR amount, which drifted to 3.6× the price within days. See `spec/storefront.md`.
 2. **Owned node provider:** a Hetzner dedicated box with NVMe (auction line), per the gateway plan's provider guidance. The relayer VPS goes to a different provider and ASN (Vultr or OVH), so the two boxes never share a failure domain.
 3. **`get_outs` for Free:** single upstream, owned node preferred. Two-upstream agreement stays a Pro feature; Free capacity is the reason. Encoded as `Agreement { free: 1, pro: 2 }` in `mnr-core::policy`.
 4. **Operator notices:** signed in the project's name, "mnr (mnr.network)", with the opt-out link; the human contact is the address the notice comes from, `dev@mnr.network`, and no personal name is used (amended 2026-09-06; the original said B's name). Operators should know where to answer, and the project name is what they will see in the `User-Agent`. Sent through Cloudflare Email Sending from `dev@mnr.network`, DKIM-signed for the domain; the first five went out 2026-09-06.

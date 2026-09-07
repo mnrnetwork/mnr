@@ -63,10 +63,21 @@ invoice per token may be open at a time (a second one would be paid by the
 same transfer). Only a current, active **Pro** token can be renewed: a Free
 token has nothing to extend and a suspended one stays suspended; an expired
 Pro token is exactly what renewal is for, and its new validity runs from the
-payment. The price is per month and
-set by the operator in XMR (the promise is about nine dollars; there is no
-exchange-rate lookup in the relay). An invoice is open for 24 hours. Creation
-is throttled like free tokens.
+payment. The price is $9 per month (plan decision 1), billed in XMR at the
+rate when the invoice is created, and fixed for that invoice: the amount is
+$9 × months ÷ rate, rounded **up** to the next 0.0001 XMR. The rate is the
+median of independent public sources (Kraken, CoinGecko, KuCoin, and the
+hourly feeds of explorer.xmr.club and monerospace.org), refreshed every ten
+minutes; a source more than 15% from the median is dropped and at least two
+must remain; a new rate more than 30% from the last accepted one is held
+until three consecutive rounds agree; the last accepted rate is persisted and
+one older than 24 hours is not used, in which case invoice creation answers
+503 `price unavailable` rather than mispricing. The invoice reports
+`price_usd`, `rate_usd_per_xmr`, `rate_at` and `rate_sources` so the payer
+sees how the amount came about. An operator may instead set a fixed XMR
+price (`pro_price_atomic`), in which case no lookups run and those fields
+are absent. An invoice is open for 24 hours. Creation is throttled like free
+tokens.
 
 ## `GET /v1/invoices/{invoice_id}`
 
