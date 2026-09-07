@@ -1,0 +1,59 @@
+<!doctype html><html><head><meta charset="utf-8"><style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{background:#0B0A09}
+.card{width:1280px;height:640px;background:#141210;position:relative;overflow:hidden;
+  font-family:"SF Pro Display","Helvetica Neue",Helvetica,Arial,sans-serif;color:#ECE7E1;
+  background-image:radial-gradient(900px 420px at 82% 46%, rgba(242,104,34,.10), transparent 62%)}
+.wrap{position:absolute;inset:0;padding:64px 72px}
+.top{display:flex;align-items:center;justify-content:space-between}
+.lock{display:flex;align-items:center;gap:14px}
+.name{font-size:34px;font-weight:700;letter-spacing:-.02em}
+.slash{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:19px;color:#8E877F;letter-spacing:.01em}
+.pill{display:flex;align-items:center;gap:10px;border:1px solid #4A2A16;border-radius:999px;
+  padding:11px 20px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;
+  letter-spacing:.10em;color:#F26822;text-transform:uppercase}
+.dot{width:9px;height:9px;border-radius:50%;background:#F26822}
+h1{position:absolute;left:72px;top:212px;font-size:62px;line-height:1.1;letter-spacing:-.028em;font-weight:700;max-width:760px}
+h1 .mute{color:#8E877F}
+p.sub{position:absolute;left:72px;top:388px;max-width:660px;font-size:23px;line-height:1.5;color:#B5ADA4;letter-spacing:-.005em}
+.foot{position:absolute;left:72px;right:72px;top:498px;display:flex;align-items:center;gap:12px}
+.chip{border:1px solid #2E2A26;border-radius:8px;padding:9px 15px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14.5px;color:#B5ADA4}
+.chip.on{border-color:#4A2A16;color:#F26822}
+.ep{margin-left:auto;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:15px;color:#8E877F}
+.ep b{color:#ECE7E1;font-weight:600}
+.net{position:absolute;right:78px;top:196px;width:330px;height:250px}
+</style></head><body><div class="card"><div class="wrap">
+<div class="top">
+  <div class="lock">
+    <svg width="40" height="40" viewBox="0 0 24 24"><circle cx="16.5" cy="12" r="5.2" fill="#F26822"/><path d="M5.2 6.6 L11.9 10.1 M5.2 17.4 L11.9 13.9" stroke="#ECE7E1" stroke-width="2.6" stroke-linecap="round"/><circle cx="5.2" cy="6.6" r="2.1" fill="#ECE7E1"/><circle cx="5.2" cy="17.4" r="2.1" fill="#ECE7E1"/></svg>
+    <span class="name">mnr</span><span class="slash">/ mnr.network</span>
+  </div>
+  <div class="pill"><span class="dot"></span>Verified RPC Network</div>
+</div>
+<svg class="net" viewBox="0 0 330 250">
+  <g stroke="#F26822" stroke-width="1.4" fill="none" opacity=".85">
+    <path d="M40 34 L268 125" stroke-dasharray="3 7" opacity=".5"/>
+    <path d="M40 96 L268 125"/>
+    <path d="M40 156 L268 125"/>
+    <path d="M40 216 L268 125" stroke-dasharray="3 7" opacity=".5"/>
+  </g>
+  <g fill="#141210" stroke="#ECE7E1" stroke-width="1.8">
+    <circle cx="40" cy="34" r="6"/><circle cx="40" cy="96" r="6"/><circle cx="40" cy="156" r="6"/><circle cx="40" cy="216" r="6"/>
+  </g>
+  <g fill="#ECE7E1"><circle cx="40" cy="34" r="2"/><circle cx="40" cy="96" r="2"/><circle cx="40" cy="156" r="2"/><circle cx="40" cy="216" r="2"/></g>
+  <circle cx="268" cy="125" r="30" fill="none" stroke="#F26822" stroke-width="1.2" opacity=".35"/>
+  <circle cx="268" cy="125" r="19" fill="none" stroke="#F26822" stroke-width="1.6" opacity=".7"/>
+  <circle cx="268" cy="125" r="9" fill="#F26822"/>
+  <text x="268" y="180" fill="#F26822" font-family="ui-monospace,Menlo,monospace" font-size="13" text-anchor="middle" letter-spacing="0.5">mnr-relay</text>
+  <text x="40" y="18" fill="#8E877F" font-family="ui-monospace,Menlo,monospace" font-size="12" text-anchor="middle">node.01</text>
+  <text x="40" y="240" fill="#8E877F" font-family="ui-monospace,Menlo,monospace" font-size="12" text-anchor="middle">node.04</text>
+</svg>
+<h1>One address for your wallet.<br><span class="mute">Every answer checked.</span></h1>
+<p class="sub">Verified RPC relay for Monero. Every block, transaction and header checked against multi-node consensus. Zero logs. Tor &amp; I2P.</p>
+<div class="foot">
+  <span class="chip on">Mnr-Verify: quorum(3/3)</span>
+  <span class="chip">Zero Request Logs</span>
+  <span class="chip">Free &amp; Pro in XMR</span>
+  <span class="ep">Endpoint: <b>rpc.mnr.network:443</b></span>
+</div>
+</div></div></body></html>
