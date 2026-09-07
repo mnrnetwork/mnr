@@ -56,7 +56,7 @@ max_bytes = 1073741824               # 1 GiB for the immutable tier
 # is a loopback address.
 [billing]
 # wallet_rpc = "http://127.0.0.1:18082/json_rpc"
-pro_price_atomic = 60000000000       # 0.06 XMR per month; update with the rate
+pro_price_atomic = 16700000000       # 0.0167 XMR per month ≈ $9 at 538.8 USD/XMR (2026-09-06); update with the rate
 confirmations = 10
 free_per_day = 2000
 per_client_per_hour = 3

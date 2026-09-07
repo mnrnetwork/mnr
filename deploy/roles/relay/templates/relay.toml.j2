@@ -27,7 +27,7 @@ wallet_rpc = "http://127.0.0.1:18082/json_rpc"
 # wallet_rpc unset: Free tokens only; Pro invoices answer 503 until a
 # view-only wallet is configured (mnr_wallet_address / vault_wallet_viewkey).
 {% endif %}
-pro_price_atomic = {{ mnr_pro_price_atomic | default(60000000000) }}
+pro_price_atomic = {{ mnr_pro_price_atomic | default(16700000000) }}   # the $9 of plan decision 1 in atomic units at the current rate (0.0167 XMR at 538.8 USD/XMR, 2026-09-06); set mnr_pro_price_atomic in the inventory and review it weekly
 confirmations = 10
 free_per_day = {{ mnr_free_per_day | default(2000) }}
 per_client_per_hour = 3
