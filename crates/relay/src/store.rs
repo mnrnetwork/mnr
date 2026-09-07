@@ -34,7 +34,7 @@ use crate::upstream::{FaultEvent, OptOutEvent};
 /// Seconds the previous token stays valid after a rotation (gateway plan §3.1).
 const GRACE_SECS: u64 = 24 * 3600;
 /// Schema version, stored in `PRAGMA user_version`.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 /// How often the relay re-reads the token table to pick up CLI changes.
 const TOKEN_RELOAD_EVERY: Duration = Duration::from_secs(30);
 
@@ -94,7 +94,11 @@ CREATE TABLE IF NOT EXISTS invoices(
   usd_cents INTEGER,
   rate_usd_per_xmr REAL,
   rate_at INTEGER,
-  rate_sources TEXT
+  rate_sources TEXT,
+  required_confirmations INTEGER NOT NULL DEFAULT 10,
+  finalized INTEGER NOT NULL DEFAULT 0,
+  prev_valid_until INTEGER,
+  suspended_by_billing INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS rates(
   id INTEGER PRIMARY KEY CHECK(id = 1),
@@ -199,6 +203,17 @@ pub struct Invoice {
     pub rate_at: Option<u64>,
     /// Comma-separated names of the sources that agreed on that rate.
     pub rate_sources: Option<String>,
+    /// Confirmations the payment needs before the token activates, fixed
+    /// at creation from the USD tier (plan §5, amended 2026-09-07).
+    pub required_confirmations: u32,
+    /// The payment reached the final depth; the watch is over.
+    pub finalized: bool,
+    /// A renewal's validity before this invoice extended it, so a take-back
+    /// can restore it.
+    pub prev_valid_until: Option<u64>,
+    /// The purchase token was suspended by a take-back (never by hand), so
+    /// billing may reactivate it when the payment returns.
+    pub suspended_by_billing: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -604,7 +619,7 @@ impl SqliteStore {
         let (a, b) = self.hash_pair(hash);
         let conn = self.conn.lock();
         conn.query_row(
-            "SELECT id, subaddr_index, address, amount, months, renew_hash, created_at, expires_at, status, received, paid_at, usd_cents, rate_usd_per_xmr, rate_at, rate_sources
+            "SELECT id, subaddr_index, address, amount, months, renew_hash, created_at, expires_at, status, received, paid_at, usd_cents, rate_usd_per_xmr, rate_at, rate_sources, required_confirmations, finalized, prev_valid_until, suspended_by_billing
              FROM invoices WHERE renew_hash IN (?1, ?2) AND status = 'pending' LIMIT 1",
             params![a.as_slice(), b.as_slice()],
             Self::row_to_invoice,
@@ -770,8 +785,8 @@ impl SqliteStore {
     pub fn create_invoice(&self, inv: &Invoice) -> Result<(), String> {
         let conn = self.conn.lock();
         conn.execute(
-            "INSERT INTO invoices (id, subaddr_index, address, amount, months, renew_hash, created_at, expires_at, status, received, paid_at, usd_cents, rate_usd_per_xmr, rate_at, rate_sources)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', 0, NULL, ?9, ?10, ?11, ?12)",
+            "INSERT INTO invoices (id, subaddr_index, address, amount, months, renew_hash, created_at, expires_at, status, received, paid_at, usd_cents, rate_usd_per_xmr, rate_at, rate_sources, required_confirmations)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', 0, NULL, ?9, ?10, ?11, ?12, ?13)",
             params![
                 inv.id,
                 inv.subaddr_index as i64,
@@ -785,6 +800,7 @@ impl SqliteStore {
                 inv.rate_usd_per_xmr,
                 inv.rate_at.map(|v| v as i64),
                 inv.rate_sources.as_deref(),
+                i64::from(inv.required_confirmations),
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -794,7 +810,7 @@ impl SqliteStore {
     pub fn invoice(&self, id: &str) -> Option<Invoice> {
         let conn = self.conn.lock();
         conn.query_row(
-            "SELECT id, subaddr_index, address, amount, months, renew_hash, created_at, expires_at, status, received, paid_at, usd_cents, rate_usd_per_xmr, rate_at, rate_sources
+            "SELECT id, subaddr_index, address, amount, months, renew_hash, created_at, expires_at, status, received, paid_at, usd_cents, rate_usd_per_xmr, rate_at, rate_sources, required_confirmations, finalized, prev_valid_until, suspended_by_billing
              FROM invoices WHERE id = ?1",
             params![id],
             Self::row_to_invoice,
@@ -806,7 +822,7 @@ impl SqliteStore {
     pub fn pending_invoices(&self) -> Vec<Invoice> {
         let conn = self.conn.lock();
         let mut stmt = match conn.prepare(
-            "SELECT id, subaddr_index, address, amount, months, renew_hash, created_at, expires_at, status, received, paid_at, usd_cents, rate_usd_per_xmr, rate_at, rate_sources
+            "SELECT id, subaddr_index, address, amount, months, renew_hash, created_at, expires_at, status, received, paid_at, usd_cents, rate_usd_per_xmr, rate_at, rate_sources, required_confirmations, finalized, prev_valid_until, suspended_by_billing
              FROM invoices WHERE status = 'pending'",
         ) {
             Ok(s) => s,
@@ -823,7 +839,7 @@ impl SqliteStore {
         let (a, b) = self.hash_pair(hash);
         let conn = self.conn.lock();
         conn.query_row(
-            "SELECT id, subaddr_index, address, amount, months, renew_hash, created_at, expires_at, status, received, paid_at, usd_cents, rate_usd_per_xmr, rate_at, rate_sources
+            "SELECT id, subaddr_index, address, amount, months, renew_hash, created_at, expires_at, status, received, paid_at, usd_cents, rate_usd_per_xmr, rate_at, rate_sources, required_confirmations, finalized, prev_valid_until, suspended_by_billing
              FROM invoices WHERE renew_hash IN (?1, ?2) ORDER BY created_at DESC LIMIT 1",
             params![a.as_slice(), b.as_slice()],
             Self::row_to_invoice,
@@ -842,7 +858,7 @@ impl SqliteStore {
         let conn = self.conn.lock();
         let mut stmt = conn
             .prepare(
-                "SELECT id, subaddr_index, address, amount, months, renew_hash, created_at, expires_at, status, received, paid_at, usd_cents, rate_usd_per_xmr, rate_at, rate_sources
+                "SELECT id, subaddr_index, address, amount, months, renew_hash, created_at, expires_at, status, received, paid_at, usd_cents, rate_usd_per_xmr, rate_at, rate_sources, required_confirmations, finalized, prev_valid_until, suspended_by_billing
                  FROM invoices WHERE status = 'paid' AND renew_hash IS NULL ORDER BY created_at DESC",
             )
             .ok()?;
@@ -860,7 +876,8 @@ impl SqliteStore {
         let conn = self.conn.lock();
         if paid {
             conn.execute(
-                "UPDATE invoices SET received = ?1, status = 'paid', paid_at = ?2 WHERE id = ?3",
+                "UPDATE invoices SET received = ?1, status = 'paid', paid_at = ?2, finalized = 0,
+                        suspended_by_billing = 0 WHERE id = ?3",
                 params![received as i64, unix_now() as i64, id],
             )
         } else {
@@ -906,7 +923,62 @@ impl SqliteStore {
             rate_usd_per_xmr: r.get::<_, Option<f64>>(12)?,
             rate_at: r.get::<_, Option<i64>>(13)?.map(|v| v as u64),
             rate_sources: r.get::<_, Option<String>>(14)?,
+            required_confirmations: r.get::<_, i64>(15)? as u32,
+            finalized: r.get::<_, i64>(16)? != 0,
+            prev_valid_until: r.get::<_, Option<i64>>(17)?.map(|v| v as u64),
+            suspended_by_billing: r.get::<_, i64>(18)? != 0,
         })
+    }
+
+    /// Invoices the watcher still has work on: pending ones, and paid ones
+    /// whose payment has not reached the final depth yet.
+    pub fn open_invoices(&self) -> Vec<Invoice> {
+        let conn = self.conn.lock();
+        let mut stmt = match conn.prepare(
+            "SELECT id, subaddr_index, address, amount, months, renew_hash, created_at, expires_at, status, received, paid_at, usd_cents, rate_usd_per_xmr, rate_at, rate_sources, required_confirmations, finalized, prev_valid_until, suspended_by_billing
+             FROM invoices WHERE status = 'pending' OR (status = 'paid' AND finalized = 0)",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map([], Self::row_to_invoice)
+            .map(|rows| rows.filter_map(Result::ok).collect())
+            .unwrap_or_default()
+    }
+
+    /// The payment reached the final depth.
+    pub fn finalize_invoice(&self, id: &str) -> Result<(), String> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE invoices SET finalized = 1 WHERE id = ?1",
+            params![id],
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    }
+
+    /// The payment vanished before the final depth: back to pending, with
+    /// a note of whether billing suspended the purchase token.
+    pub fn take_back_invoice(&self, id: &str, suspended_by_billing: bool) -> Result<(), String> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE invoices SET status = 'pending', paid_at = NULL, received = 0, finalized = 0,
+                    suspended_by_billing = ?2 WHERE id = ?1",
+            params![id, i64::from(suspended_by_billing)],
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    }
+
+    /// Remember a renewal's validity before extending it.
+    pub fn set_prev_valid_until(&self, id: &str, prev: Option<u64>) -> Result<(), String> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE invoices SET prev_valid_until = ?2 WHERE id = ?1",
+            params![id, prev.map(|v| v as i64)],
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string())
     }
 
     /// The last accepted XMR/USD rate, if one was persisted.
@@ -1003,12 +1075,28 @@ impl SqliteStore {
         }
     }
 
+    /// Suspend the token `hash` names as its current or previous hash: a
+    /// billing take-back must reach a purchase token even after the
+    /// customer rotated it.
     pub fn suspend(&self, hash: &[u8; 32]) -> Result<(), String> {
+        self.set_status(hash, TokenStatus::Suspended)
+    }
+
+    /// Undo a billing suspension when the payment is back.
+    pub fn reactivate(&self, hash: &[u8; 32]) -> Result<(), String> {
+        self.set_status(hash, TokenStatus::Active)
+    }
+
+    fn set_status(&self, hash: &[u8; 32], status: TokenStatus) -> Result<(), String> {
+        let label = match status {
+            TokenStatus::Active => "active",
+            TokenStatus::Suspended => "suspended",
+        };
         let conn = self.conn.lock();
         let n = conn
             .execute(
-                "UPDATE tokens SET status = 'suspended' WHERE token_hash = ?1",
-                params![hash.as_slice()],
+                "UPDATE tokens SET status = ?1 WHERE token_hash = ?2 OR prev_token_hash = ?2",
+                params![label, hash.as_slice()],
             )
             .map_err(|e| e.to_string())?;
         drop(conn);
@@ -1017,8 +1105,31 @@ impl SqliteStore {
         }
         // Bind the id first: the read guard must be gone before the write.
         let id = self.tokens.read().get(hash).map(|r| r.id);
+        let id = id.or_else(|| self.lookup_db(hash).map(|r| r.id));
         if let Some(id) = id {
-            self.update_cached(id, |r| r.status = TokenStatus::Suspended);
+            self.update_cached(id, |r| r.status = status);
+        }
+        Ok(())
+    }
+
+    /// Set a token's `valid_until` outright (a take-back restoring what a
+    /// renewal had before). `hash` may be current or previous.
+    pub fn set_valid_until(&self, hash: &[u8; 32], valid_until: Option<u64>) -> Result<(), String> {
+        let conn = self.conn.lock();
+        let n = conn
+            .execute(
+                "UPDATE tokens SET valid_until = ?1 WHERE token_hash = ?2 OR prev_token_hash = ?2",
+                params![valid_until.map(|v| v as i64), hash.as_slice()],
+            )
+            .map_err(|e| e.to_string())?;
+        drop(conn);
+        if n == 0 {
+            return Err("unknown token".to_owned());
+        }
+        let id = self.tokens.read().get(hash).map(|r| r.id);
+        let id = id.or_else(|| self.lookup_db(hash).map(|r| r.id));
+        if let Some(id) = id {
+            self.update_cached(id, |r| r.valid_until = valid_until);
         }
         Ok(())
     }
@@ -1201,6 +1312,22 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
             ] {
                 let _ = conn.execute(&format!("ALTER TABLE invoices ADD COLUMN {col} {ty}"), []);
             }
+        }
+        // v7: tiered activation with a settle phase. Invoices paid before
+        // it were paid at the final depth, so they are finalized.
+        if (2..=6).contains(&version) {
+            for (col, ty) in [
+                ("required_confirmations", "INTEGER NOT NULL DEFAULT 10"),
+                ("finalized", "INTEGER NOT NULL DEFAULT 0"),
+                ("prev_valid_until", "INTEGER"),
+                ("suspended_by_billing", "INTEGER NOT NULL DEFAULT 0"),
+            ] {
+                let _ = conn.execute(&format!("ALTER TABLE invoices ADD COLUMN {col} {ty}"), []);
+            }
+            let _ = conn.execute(
+                "UPDATE invoices SET finalized = 1 WHERE status = 'paid'",
+                [],
+            );
         }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(|e| e.to_string())?;
@@ -1479,6 +1606,78 @@ mod tests {
     }
 
     #[test]
+    fn schema_v6_database_gains_settle_columns_and_old_paid_rows_are_finalized() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v6.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE tokens(id INTEGER PRIMARY KEY, token_hash BLOB UNIQUE NOT NULL, prev_token_hash BLOB, prev_grace_until INTEGER, tier TEXT NOT NULL, status TEXT NOT NULL, valid_until INTEGER, created_at INTEGER NOT NULL);
+                 CREATE TABLE usage(token_id INTEGER NOT NULL, day INTEGER NOT NULL, wu INTEGER NOT NULL, PRIMARY KEY(token_id, day));
+                 CREATE TABLE invoices(id TEXT PRIMARY KEY, subaddr_index INTEGER NOT NULL, address TEXT NOT NULL, amount INTEGER NOT NULL, months INTEGER NOT NULL, renew_hash BLOB, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, status TEXT NOT NULL, received INTEGER NOT NULL DEFAULT 0, paid_at INTEGER, usd_cents INTEGER, rate_usd_per_xmr REAL, rate_at INTEGER, rate_sources TEXT);
+                 CREATE TABLE upstream_stats(name TEXT PRIMARY KEY, requests INTEGER NOT NULL, verified INTEGER NOT NULL, faults INTEGER NOT NULL, ejected_until INTEGER, probes INTEGER NOT NULL DEFAULT 0, up INTEGER NOT NULL DEFAULT 0, stream_bytes INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE rates(id INTEGER PRIMARY KEY CHECK(id = 1), usd_per_xmr REAL NOT NULL, at_unix INTEGER NOT NULL, sources TEXT NOT NULL);
+                 INSERT INTO invoices VALUES ('paid1', 3, '8abc', 60000000000, 1, NULL, 1000, 90000, 'paid', 60000000000, 2000, 900, 538.8, 1500, 'a,b');
+                 INSERT INTO invoices VALUES ('open1', 4, '8def', 60000000000, 1, NULL, 1000, 90000, 'pending', 0, NULL, 900, 538.8, 1500, 'a,b');
+                 PRAGMA user_version = 6;",
+            )
+            .unwrap();
+        }
+        let store = SqliteStore::open(Some(&path)).unwrap();
+        let paid = store.invoice("paid1").unwrap();
+        assert!(
+            paid.finalized,
+            "a row paid before the settle phase is settled"
+        );
+        assert_eq!(paid.required_confirmations, 10);
+        let open = store.invoice("open1").unwrap();
+        assert!(!open.finalized);
+        assert_eq!(
+            store.open_invoices().len(),
+            1,
+            "only the pending one is open"
+        );
+        store.take_back_invoice("paid1", true).unwrap();
+        let back = store.invoice("paid1").unwrap();
+        assert_eq!(
+            (
+                back.status,
+                back.paid_at,
+                back.suspended_by_billing,
+                back.finalized
+            ),
+            (InvoiceStatus::Pending, None, true, false)
+        );
+        assert_eq!(store.open_invoices().len(), 2);
+        store.set_prev_valid_until("open1", Some(4_000)).unwrap();
+        assert_eq!(
+            store.invoice("open1").unwrap().prev_valid_until,
+            Some(4_000)
+        );
+    }
+
+    #[test]
+    fn suspend_reactivate_and_set_valid_until_follow_a_rotation() {
+        let s = SqliteStore::open(None).unwrap();
+        let t = s.issue(Tier::Pro, Some(unix_now() + 1_000));
+        let old = token_hash(&t);
+        let new = token_hash(&s.rotate(&old).unwrap());
+        s.suspend(&old).unwrap();
+        assert!(
+            matches!(s.authenticate(&new), Err(AuthError::Expired)),
+            "the rotated token is suspended through its previous hash"
+        );
+        s.reactivate(&old).unwrap();
+        assert!(s.authenticate(&new).is_ok());
+        s.set_valid_until(&old, Some(unix_now() + 5_000)).unwrap();
+        assert_eq!(
+            s.valid_until(&new),
+            Some(Some(s.valid_until(&old).unwrap().unwrap()))
+        );
+        assert_eq!(s.reactivate(&[9; 32]), Err("unknown token".to_owned()));
+    }
+
+    #[test]
     fn invoices_round_trip_and_expire() {
         let dir = tempfile::tempdir().unwrap();
         let store = SqliteStore::open(Some(&dir.path().join("i.db"))).unwrap();
@@ -1498,6 +1697,10 @@ mod tests {
             rate_usd_per_xmr: None,
             rate_at: None,
             rate_sources: None,
+            required_confirmations: 10,
+            finalized: false,
+            prev_valid_until: None,
+            suspended_by_billing: false,
         };
         store.create_invoice(&inv).unwrap();
         assert_eq!(store.invoice("abc123"), Some(inv.clone()));
@@ -1566,6 +1769,10 @@ mod tests {
             rate_usd_per_xmr: None,
             rate_at: None,
             rate_sources: None,
+            required_confirmations: 10,
+            finalized: false,
+            prev_valid_until: None,
+            suspended_by_billing: false,
         };
         s.create_invoice(&inv).unwrap();
         let new = s.rotate(&old_hash).unwrap();

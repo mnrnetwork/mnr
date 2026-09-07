@@ -109,6 +109,25 @@ holds the token's hash, as for every token; the raw token exists only in the
 answer to the status call, recomputed from the id on demand. Payment activates
 it for 30 days × months from the moment of payment.
 
+### Activation, settling, take-back
+
+A payment activates the token once it has the invoice's **required
+confirmations**, set at creation from the invoice's USD value: under $10 one
+confirmation, under $30 two, under $100 five, otherwise ten (`confirmation_tiers`;
+a fixed-price invoice uses the final depth). Ten is Monero's spend lock, not a
+reorg-safety number, and what is at stake here is service, not funds. The
+invoice then **settles**: the watcher keeps reading the payment until it is
+ten deep (`confirmations`, the final depth). If, before that, the payment
+leaves both chain and pool (a reorg, or a double spend that won), the
+activation is taken back: a purchase token is suspended (through a rotation
+too), a renewal's validity is restored to what it was, and the invoice
+returns to pending with the full amount due. A payment that returns brings
+the same token back; a token the operator suspended by hand is never touched
+by billing. A paid invoice that has not settled never expires; one taken back
+after its 24 hours expires on the next round, and the payer keeps their XMR.
+The status shows `required_confirmations`, `final_confirmations`,
+`finalized` and `taken_back`, and `confirmations` stays live until settled.
+
 While an invoice is pending, its status carries `seen_atomic` (what the
 wallet has seen for that subaddress at any confirmation depth, pool included),
 `received_atomic` (what has the required confirmations) and

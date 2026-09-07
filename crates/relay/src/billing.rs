@@ -36,6 +36,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -82,6 +83,8 @@ pub struct Billing {
     status_buckets: Mutex<HashMap<[u8; 32], Vec<Instant>>>,
     /// `(day, count)` of free tokens issued today.
     free_today: Mutex<(u64, u64)>,
+    /// Activations taken back because the payment vanished before settling.
+    takebacks: AtomicU64,
 }
 
 /// Why a storefront request was refused.
@@ -144,6 +147,7 @@ impl Billing {
             buckets: Mutex::new(HashMap::new()),
             status_buckets: Mutex::new(HashMap::new()),
             free_today: Mutex::new((0, 0)),
+            takebacks: AtomicU64::new(0),
         })
     }
 
@@ -345,6 +349,7 @@ impl Billing {
             confirmed: sum,
             seen,
             best_conf: relevant_confirmations(&transfers, due),
+            transfers,
         })
     }
 
@@ -364,27 +369,80 @@ impl Billing {
         if expired > 0 {
             tracing::info!(expired, "invoices expired unpaid");
         }
-        for inv in self.store.pending_invoices() {
-            match self
+        for inv in self.store.open_invoices() {
+            let seen = match self
                 .received(inv.subaddr_index, inv.created_at, inv.amount)
                 .await
             {
-                Ok(Seen {
-                    confirmed: received,
-                    ..
-                }) => {
-                    if received >= inv.amount {
-                        self.activate(&inv, received);
-                    } else if received != inv.received {
-                        let _ = self.store.update_invoice(&inv.id, received, false);
-                    }
-                }
+                Ok(s) => s,
                 Err(e) => {
                     tracing::warn!(error = %e, "invoice check failed; will retry");
                     return;
                 }
+            };
+            match inv.status {
+                InvoiceStatus::Pending => {
+                    // Activation at the invoice's tier depth (plan §5,
+                    // amended: 1/2/5/10 by USD value).
+                    let at_tier = seen.covered_at(inv.required_confirmations);
+                    if at_tier >= inv.amount {
+                        self.activate(&inv, at_tier);
+                    } else if seen.confirmed != inv.received {
+                        let _ = self.store.update_invoice(&inv.id, seen.confirmed, false);
+                    }
+                }
+                InvoiceStatus::Paid => {
+                    // The settle phase: watched until the final depth. A
+                    // payment that left chain and pool is a reorg or a won
+                    // double spend; the activation is taken back.
+                    if seen.confirmed >= inv.amount {
+                        if let Err(e) = self.store.finalize_invoice(&inv.id) {
+                            tracing::error!(error = %e, "cannot finalize invoice");
+                        }
+                    } else if seen.seen < inv.amount {
+                        self.take_back(&inv);
+                    }
+                }
+                InvoiceStatus::Expired => {}
             }
         }
+    }
+
+    /// The payment behind an activated invoice vanished before it settled:
+    /// suspend the purchase token, or restore the renewed token's previous
+    /// validity, and put the invoice back to pending.
+    fn take_back(&self, inv: &Invoice) {
+        let suspended = match inv.renew_hash {
+            Some(hash) => {
+                if let Err(e) = self.store.set_valid_until(&hash, inv.prev_valid_until) {
+                    tracing::error!(error = %e, handle = %handle(&hash), "take-back: cannot restore validity");
+                }
+                tracing::warn!(handle = %handle(&hash), "payment vanished before settling; renewal taken back");
+                false
+            }
+            None => {
+                let hash = token_hash(&self.derived_token(&inv.id));
+                match self.store.suspend(&hash) {
+                    Ok(()) => {
+                        tracing::warn!(handle = %handle(&hash), "payment vanished before settling; pro token suspended");
+                        true
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, handle = %handle(&hash), "take-back: cannot suspend token");
+                        false
+                    }
+                }
+            }
+        };
+        if let Err(e) = self.store.take_back_invoice(&inv.id, suspended) {
+            tracing::error!(error = %e, "cannot take back invoice");
+        }
+        self.takebacks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Take-backs so far, for metrics.
+    pub fn takebacks(&self) -> u64 {
+        self.takebacks.load(Ordering::Relaxed)
     }
 
     /// Payment arrived: activate the derived token or extend the renewed one.
@@ -393,12 +451,11 @@ impl Billing {
         let bought = MONTH_SECS * u64::from(inv.months);
         match inv.renew_hash {
             Some(hash) => {
-                let from = self
-                    .store
-                    .valid_until(&hash)
-                    .flatten()
-                    .filter(|v| *v > now)
-                    .unwrap_or(now);
+                let before = self.store.valid_until(&hash).flatten();
+                let from = before.filter(|v| *v > now).unwrap_or(now);
+                if let Err(e) = self.store.set_prev_valid_until(&inv.id, before) {
+                    tracing::error!(error = %e, "cannot record validity before renewal");
+                }
                 if let Err(e) = self.store.extend(&hash, from + bought) {
                     // The handle, never the invoice id: the id recovers the
                     // token (spec/storefront.md).
@@ -409,13 +466,24 @@ impl Billing {
             }
             None => {
                 let token = self.derived_token(&inv.id);
-                self.store
-                    .issue_token(&token, Tier::Pro, Some(now + bought));
-                tracing::info!(
-                    handle = %handle(&token_hash(&token)),
-                    months = inv.months,
-                    "pro token activated"
-                );
+                if inv.suspended_by_billing {
+                    // The payment is back after a take-back: the same token
+                    // returns. A token the operator suspended by hand is
+                    // never touched here.
+                    if let Err(e) = self.store.reactivate(&token_hash(&token)) {
+                        tracing::error!(error = %e, handle = %handle(&token_hash(&token)), "cannot reactivate token");
+                        return;
+                    }
+                    tracing::info!(handle = %handle(&token_hash(&token)), "payment returned; pro token reactivated");
+                } else {
+                    self.store
+                        .issue_token(&token, Tier::Pro, Some(now + bought));
+                    tracing::info!(
+                        handle = %handle(&token_hash(&token)),
+                        months = inv.months,
+                        "pro token activated"
+                    );
+                }
             }
         }
         if received > inv.amount {
@@ -527,11 +595,15 @@ impl Billing {
             rate_usd_per_xmr: priced.rate.as_ref().map(|r| r.usd_per_xmr),
             rate_at: priced.rate.as_ref().map(|r| r.at_unix),
             rate_sources: priced.rate.as_ref().map(|r| r.sources.join(",")),
+            required_confirmations: self.cfg.required_confirmations(priced.usd_cents),
+            finalized: false,
+            prev_valid_until: None,
+            suspended_by_billing: false,
         };
         self.store
             .create_invoice(&inv)
             .map_err(|_| Refusal::Unavailable("cannot store invoice"))?;
-        Ok(invoice_view(&inv, None, 0, 0))
+        Ok(invoice_view(&inv, None, 0, 0, self.cfg.confirmations))
     }
 
     /// The atomic amount for `months`: a fixed XMR price when configured,
@@ -572,13 +644,13 @@ impl Billing {
         // While pending, what the wallet has seen so far, confirmed or not,
         // so the page can say "received X of Y" instead of leaving a payer
         // who sent too little to wait for a token that will not come.
-        let (confirmations, seen) = match inv.status {
-            InvoiceStatus::Pending => self
-                .received(inv.subaddr_index, inv.created_at, inv.amount)
+        let (confirmations, seen) = if inv.status == InvoiceStatus::Expired || inv.finalized {
+            (u64::from(self.cfg.confirmations), inv.received)
+        } else {
+            self.received(inv.subaddr_index, inv.created_at, inv.amount)
                 .await
                 .map(|s| (s.best_conf, s.seen))
-                .unwrap_or((0, inv.received)),
-            _ => (u64::from(self.cfg.confirmations), inv.received),
+                .unwrap_or((0, inv.received))
         };
         // A purchase shows its token for a week after payment; after that a
         // leaked invoice id recovers nothing.
@@ -588,7 +660,13 @@ impl Billing {
             }
             _ => None,
         };
-        Ok(invoice_view(&inv, token, confirmations, seen))
+        Ok(invoice_view(
+            &inv,
+            token,
+            confirmations,
+            seen,
+            self.cfg.confirmations,
+        ))
     }
 
     fn rotate(&self, token: &str) -> Result<Value, Refusal> {
@@ -614,15 +692,34 @@ fn relevant_confirmations(transfers: &[(u64, u64)], due: u64) -> u64 {
 
 /// What the wallet holds for one invoice's subaddress since it was created.
 struct Seen {
-    /// Atomic units with enough confirmations to count.
+    /// Atomic units at the final depth (`confirmations`).
     confirmed: u64,
     /// Atomic units seen at any confirmation depth (pool included).
     seen: u64,
-    /// The deepest confirmation among those transfers.
+    /// The completing payment's confirmations (see `relevant_confirmations`).
     best_conf: u64,
+    /// Every transfer as `(amount, confirmations)`.
+    transfers: Vec<(u64, u64)>,
 }
 
-fn invoice_view(inv: &Invoice, token: Option<String>, confirmations: u64, seen: u64) -> Value {
+impl Seen {
+    /// Atomic units with at least `depth` confirmations.
+    fn covered_at(&self, depth: u32) -> u64 {
+        self.transfers
+            .iter()
+            .filter(|(_, c)| *c >= u64::from(depth))
+            .map(|(a, _)| *a)
+            .fold(0u64, u64::saturating_add)
+    }
+}
+
+fn invoice_view(
+    inv: &Invoice,
+    token: Option<String>,
+    confirmations: u64,
+    seen: u64,
+    final_depth: u32,
+) -> Value {
     let xmr = |a: u64| {
         format!("{:.12}", a as f64 / 1e12)
             .trim_end_matches('0')
@@ -639,6 +736,10 @@ fn invoice_view(inv: &Invoice, token: Option<String>, confirmations: u64, seen: 
         "months": inv.months,
         "renewal": inv.renew_hash.is_some(),
         "received_atomic": inv.received,
+        "required_confirmations": inv.required_confirmations,
+        "final_confirmations": final_depth,
+        "finalized": inv.finalized,
+        "taken_back": inv.status == InvoiceStatus::Pending && (inv.suspended_by_billing || inv.prev_valid_until.is_some()),
         "seen_atomic": seen.max(inv.received),
         "remaining_atomic": remaining,
         "remaining_xmr": xmr(remaining),
@@ -829,7 +930,7 @@ pub fn rotate_response(app: &crate::ingress::App, token: &str, method: &Method) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::TokenStore;
+    use crate::auth::{AuthError, TokenStore};
     use axum::routing::post;
     use axum::Router;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -890,6 +991,7 @@ mod tests {
             pro_price_usd: None,
             price_sources: Vec::new(),
             confirmations: 10,
+            confirmation_tiers: vec![(10, 1), (30, 2), (100, 5)],
             free_per_day: 100,
             per_client_per_hour: 3,
             status_per_client_per_hour: 400,
@@ -1274,6 +1376,142 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tiered_activation_settles_at_ten_and_takes_back_a_vanished_payment() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteStore::open(Some(&dir.path().join("b.db"))).unwrap());
+        let w = Arc::new(Wallet {
+            next_index: AtomicU64::new(1),
+            transfers: Mutex::new(Vec::new()),
+            calls: AtomicU64::new(0),
+        });
+        let url = wallet(Arc::clone(&w)).await;
+        let mut c = cfg(Some(url), dir.path());
+        c.pro_price_atomic = None;
+        let price = Arc::new(Price::new(vec![], "mnr-relay/test", None).unwrap());
+        price.observe(
+            &[("a".into(), Ok(500.0)), ("b".into(), Ok(500.0))],
+            unix_now(),
+        );
+        let b = Billing::new(c, Arc::clone(&store), Some(price)).unwrap();
+        let h = HeaderMap::new();
+        // $9: one confirmation activates.
+        let v = b
+            .create_invoice(
+                &h,
+                peer(),
+                InvoiceRequest {
+                    months: Some(1),
+                    renew: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(v["required_confirmations"], 1);
+        assert_eq!(v["final_confirmations"], 10);
+        let id = v["invoice_id"].as_str().unwrap().to_owned();
+        let amount = v["amount_atomic"].as_u64().unwrap();
+        w.transfers.lock().push((1, amount, 1, unix_now()));
+        b.check_invoices().await;
+        let st = b.invoice_status(&h, peer(), &id).await.unwrap();
+        assert_eq!(st["status"], "paid");
+        assert_eq!(st["finalized"], false);
+        assert_eq!(st["confirmations"], 1, "live depth while settling");
+        let token = st["token"].as_str().unwrap().to_owned();
+        let hash = token_hash(&token);
+        assert!(
+            store.authenticate(&hash).is_ok(),
+            "active at one confirmation"
+        );
+        // Three deep: still settling, still open.
+        w.transfers.lock().clear();
+        w.transfers.lock().push((1, amount, 3, unix_now()));
+        b.check_invoices().await;
+        assert_eq!(store.open_invoices().len(), 1);
+        assert!(!store.invoice(&id).unwrap().finalized);
+        // The payment vanishes (reorg): taken back, token suspended, page
+        // shows the full amount due again.
+        w.transfers.lock().clear();
+        b.check_invoices().await;
+        let st = b.invoice_status(&h, peer(), &id).await.unwrap();
+        assert_eq!(st["status"], "pending");
+        assert_eq!(st["taken_back"], true);
+        assert_eq!(st["remaining_atomic"], amount);
+        assert!(matches!(store.authenticate(&hash), Err(AuthError::Expired)));
+        assert_eq!(b.takebacks(), 1);
+        // It returns: the same token comes back, no second one.
+        w.transfers.lock().push((1, amount, 2, unix_now()));
+        b.check_invoices().await;
+        let st = b.invoice_status(&h, peer(), &id).await.unwrap();
+        assert_eq!(st["status"], "paid");
+        assert_eq!(st["token"], token);
+        assert!(store.authenticate(&hash).is_ok());
+        assert_eq!(
+            store.list().iter().filter(|t| t.tier == Tier::Pro).count(),
+            1
+        );
+        // Ten deep: settled, no longer open.
+        w.transfers.lock().clear();
+        w.transfers.lock().push((1, amount, 10, unix_now()));
+        b.check_invoices().await;
+        let st = b.invoice_status(&h, peer(), &id).await.unwrap();
+        assert_eq!(st["finalized"], true);
+        assert!(store.open_invoices().is_empty());
+        // A hand-suspended token is not billing's to reactivate.
+        store.suspend(&hash).unwrap();
+        w.transfers.lock().clear();
+        b.check_invoices().await; // finalized: nothing happens
+        assert!(matches!(store.authenticate(&hash), Err(AuthError::Expired)));
+
+        // $50: five confirmations; a renewal take-back restores validity.
+        let pro = store.issue(Tier::Pro, Some(unix_now() + 100));
+        let ph = token_hash(&pro);
+        let v = b
+            .create_invoice(
+                &h,
+                peer(),
+                InvoiceRequest {
+                    months: Some(6),
+                    renew: Some(pro.clone()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(v["price_usd"], 54.0);
+        assert_eq!(v["required_confirmations"], 5);
+        let rid = v["invoice_id"].as_str().unwrap().to_owned();
+        let ramount = v["amount_atomic"].as_u64().unwrap();
+        let idx = store.invoice(&rid).unwrap().subaddr_index;
+        w.transfers
+            .lock()
+            .push((u64::from(idx), ramount, 4, unix_now()));
+        b.check_invoices().await;
+        assert_eq!(
+            store.invoice(&rid).unwrap().status,
+            InvoiceStatus::Pending,
+            "four is not five"
+        );
+        w.transfers.lock().retain(|t| t.0 != u64::from(idx));
+        w.transfers
+            .lock()
+            .push((u64::from(idx), ramount, 5, unix_now()));
+        b.check_invoices().await;
+        let inv = store.invoice(&rid).unwrap();
+        assert_eq!(inv.status, InvoiceStatus::Paid);
+        assert_eq!(inv.prev_valid_until, Some(unix_now() + 100));
+        assert!(store.valid_until(&ph).unwrap().unwrap() > unix_now() + 150 * 24 * 3600);
+        w.transfers.lock().retain(|t| t.0 != u64::from(idx));
+        b.check_invoices().await;
+        let inv = store.invoice(&rid).unwrap();
+        assert_eq!(inv.status, InvoiceStatus::Pending);
+        assert_eq!(
+            store.valid_until(&ph),
+            Some(Some(unix_now() + 100)),
+            "validity restored"
+        );
+        assert_eq!(b.takebacks(), 2);
+    }
+
+    #[tokio::test]
     async fn live_price_bills_nine_dollars_at_the_rate_and_refuses_without_one() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(SqliteStore::open(Some(&dir.path().join("b.db"))).unwrap());
@@ -1363,6 +1601,10 @@ mod tests {
             rate_usd_per_xmr: None,
             rate_at: None,
             rate_sources: None,
+            required_confirmations: 10,
+            finalized: false,
+            prev_valid_until: None,
+            suspended_by_billing: false,
         };
         store.create_invoice(&inv).unwrap();
         // The wallet is unreachable: nothing changes, nothing is paid.

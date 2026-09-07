@@ -216,6 +216,8 @@ pub struct Exporter {
     pub cache: Arc<Cache>,
     /// The live XMR/USD rate, when the Pro price is billed at one.
     pub price: Option<Arc<crate::price::Price>>,
+    /// The storefront, for its take-back counter.
+    pub billing: Option<Arc<crate::billing::Billing>>,
 }
 
 /// Serve `/metrics` on `listen` (a private address; never the public one).
@@ -241,6 +243,10 @@ async fn handler(State(x): State<Arc<Exporter>>) -> ([(&'static str, &'static st
             let mut out = x.metrics.render(&x.pool, &x.chain, &x.cache).await;
             if let Some(p) = &x.price {
                 render_price(&mut out, p);
+            }
+            if let Some(b) = &x.billing {
+                let _ = writeln!(out, "# TYPE mnr_invoice_takebacks_total counter");
+                line(&mut out, "mnr_invoice_takebacks_total", "", b.takebacks());
             }
             out
         },

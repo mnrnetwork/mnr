@@ -159,6 +159,7 @@ async fn main() {
             listen,
             Arc::new(metrics::Exporter {
                 price: price.clone(),
+                billing: billing.clone(),
                 metrics: Arc::clone(&metrics),
                 pool: Arc::clone(&pool),
                 chain: Arc::clone(&chain),

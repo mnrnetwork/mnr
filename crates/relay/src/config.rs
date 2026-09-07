@@ -116,9 +116,16 @@ pub struct BillingConfig {
     /// two must agree for a rate to exist.
     #[serde(default = "default_price_sources")]
     pub price_sources: Vec<String>,
-    /// Confirmations before a payment counts (plan §5: 10).
+    /// The final depth: past it a payment is settled and the watch ends
+    /// (plan §5: 10). Activation may come earlier, per `confirmation_tiers`.
     #[serde(default = "default_confirmations")]
     pub confirmations: u32,
+    /// Activation depth by the invoice's USD value: `[usd_below, confs]`,
+    /// ascending; the first tier whose bound exceeds the value applies, else
+    /// `confirmations`. Default `[[10, 1], [30, 2], [100, 5]]` (plan §5,
+    /// amended 2026-09-07). A fixed-price invoice uses `confirmations`.
+    #[serde(default = "default_confirmation_tiers")]
+    pub confirmation_tiers: Vec<(u32, u32)>,
     /// Ceiling on Free tokens issued per day, all clients together.
     #[serde(default = "default_free_per_day")]
     pub free_per_day: u64,
@@ -153,6 +160,22 @@ fn default_price_sources() -> Vec<String> {
 fn default_confirmations() -> u32 {
     10
 }
+fn default_confirmation_tiers() -> Vec<(u32, u32)> {
+    vec![(10, 1), (30, 2), (100, 5)]
+}
+
+impl BillingConfig {
+    /// Confirmations an invoice for `usd_cents` needs to activate.
+    pub fn required_confirmations(&self, usd_cents: Option<u64>) -> u32 {
+        let Some(cents) = usd_cents else {
+            return self.confirmations;
+        };
+        self.confirmation_tiers
+            .iter()
+            .find(|(below, _)| cents < u64::from(*below) * 100)
+            .map_or(self.confirmations, |(_, c)| *c)
+    }
+}
 fn default_free_per_day() -> u64 {
     2000
 }
@@ -177,6 +200,7 @@ impl Default for BillingConfig {
             pro_price_usd: None,
             price_sources: default_price_sources(),
             confirmations: default_confirmations(),
+            confirmation_tiers: default_confirmation_tiers(),
             free_per_day: default_free_per_day(),
             per_client_per_hour: default_per_client(),
             status_per_client_per_hour: default_status_per_client(),
@@ -400,6 +424,21 @@ impl Config {
             if !(v.is_finite() && v > 0.0) {
                 return Err(ConfigError::Invalid(
                     "[billing] pro_price_usd must be positive".into(),
+                ));
+            }
+        }
+        {
+            let t = &self.billing.confirmation_tiers;
+            if t.windows(2).any(|w| w[0].0 >= w[1].0) {
+                return Err(ConfigError::Invalid(
+                    "[billing] confirmation_tiers bounds must be strictly ascending".into(),
+                ));
+            }
+            if t.iter()
+                .any(|(_, c)| *c == 0 || *c > self.billing.confirmations)
+            {
+                return Err(ConfigError::Invalid(
+                    "[billing] each confirmation tier needs 1..=confirmations confirmations".into(),
                 ));
             }
         }
@@ -661,6 +700,41 @@ transport = "onion"
             .unwrap_err()
             .to_string();
         assert!(err.contains("positive"), "{err}");
+    }
+
+    #[test]
+    fn confirmation_tiers_pick_by_usd_and_are_validated() {
+        let c = Config::parse(&format!("{PROBE1}{MINIMAL}")).unwrap();
+        let b = &c.billing;
+        assert_eq!(b.required_confirmations(Some(900)), 1);
+        assert_eq!(b.required_confirmations(Some(999)), 1);
+        assert_eq!(b.required_confirmations(Some(1000)), 2);
+        assert_eq!(b.required_confirmations(Some(2999)), 2);
+        assert_eq!(b.required_confirmations(Some(3000)), 5);
+        assert_eq!(b.required_confirmations(Some(9999)), 5);
+        assert_eq!(b.required_confirmations(Some(10000)), 10);
+        assert_eq!(
+            b.required_confirmations(None),
+            10,
+            "fixed price: the final depth"
+        );
+        let err = Config::parse(&format!(
+            "[billing]\nconfirmation_tiers = [[30, 2], [10, 1]]\n{PROBE1}{MINIMAL}"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("ascending"), "{err}");
+        let err = Config::parse(&format!(
+            "[billing]\nconfirmations = 5\nconfirmation_tiers = [[10, 6]]\n{PROBE1}{MINIMAL}"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("1..=confirmations"), "{err}");
+        let c = Config::parse(&format!(
+            "[billing]\nconfirmation_tiers = []\n{PROBE1}{MINIMAL}"
+        ))
+        .unwrap();
+        assert_eq!(c.billing.required_confirmations(Some(100)), 10);
     }
 
     #[test]
