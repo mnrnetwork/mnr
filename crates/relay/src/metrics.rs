@@ -322,6 +322,8 @@ mod tests {
         has("mnr_upstream_verified_total{upstream=\"own\"} 2");
         has("mnr_upstream_stream_bytes_total{upstream=\"own\"} 0");
         has("mnr_upstream_wu_total{upstream=\"own\"} 0");
+        has("mnr_upstream_rate_millirps_15m{upstream=\"own\"} 0");
+        has("mnr_chain_disagreements_total 0");
         has("mnr_upstream_faults_total{upstream=\"own\"} 1");
         has("mnr_upstream_healthy{upstream=\"own\"} 1");
         has("mnr_upstream_on_tip{upstream=\"own\"} 1");
