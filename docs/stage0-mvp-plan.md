@@ -32,7 +32,7 @@ What it is **not**: not a gateway (no SLA, no owned mesh), not a network (no ope
 
 The disclosure paragraph for the front page, verbatim:
 
-> mnr is a verified proxy. Your wallet's requests are forwarded to public Monero nodes run by community members, and to our own public node. We check every block, transaction and header we return against its hash and against several nodes, so you get a better answer than any single node gives — but the nodes are not ours, and we make no uptime promise. We cap our traffic to each public node, identify ourselves to operators, honour opt-outs, and publish the full upstream list. If you need nodes we run ourselves, with an SLA, that is a separate paid service coming later.
+> mnr is a verified proxy. Your wallet's requests are forwarded to public Monero nodes run by community members, and to our own public node. We check every block, transaction and header we return against its hash and against several nodes, so you get a better answer than any single node gives — but the nodes are not ours, and we make no uptime promise. We cap our traffic to each public node, identify ourselves to operators, honour opt-outs, and publish the full upstream list live, with status, latency and our request rate to each node. If you need nodes we run ourselves, with an SLA, that is a separate paid service coming later.
 
 ---
 
@@ -40,10 +40,10 @@ The disclosure paragraph for the front page, verbatim:
 
 | Aspect | Rule |
 |---|---|
-| Sources | Seed list curated by B from the well-known public node lists (monero.fail and wallet-maintained lists), clearnet and `.onion`, mainnet only for now. Target: 8–12 clearnet + 3–5 onion at launch. Nodes run by wallet teams or known community members preferred; anonymous VPS nodes allowed but weighted lower. |
+| Sources | Seed list curated by B from the well-known public node lists (monero.fail and wallet-maintained lists), clearnet and `.onion`, mainnet only for now. Target: 8–12 clearnet + 3–5 onion at launch. Nodes run by wallet teams or known community members preferred; anonymous VPS nodes allowed (ranking is by health and latency only; there is no weight field). |
 | Consent | Not required by convention (these nodes are public), but B emails or messages every operator we can identify in week 1 to say we are doing it, with the opt-out link. Anyone who says no is never added. |
-| Our node | Full node, NVMe, `--restricted-rpc --public-node`, listed publicly, reached by the relayer over a private link (WireGuard) *and* used as a public node by everyone else. It is `tier: owned` in config and preferred for streams and tie-breaks. |
-| Probing | Every 15 s: `get_info` + `get_last_block_header`, 2 s timeout clearnet, 8 s onion (via the box's local Tor SOCKS). Records RTT (EMA), height, top hash, `synchronized`, restricted-RPC check. |
+| Our node | Full node, NVMe, `--restricted-rpc --public-node`, listed publicly, reached by the relayer over a private link (WireGuard) *and* used as a public node by everyone else. It is `kind = "owned"` in config and preferred for streams and tie-breaks. The WireGuard link is set up by hand on both boxes; the deploy role does not manage the peer yet. |
+| Probing | Every 15 s: `get_info` (its `top_block_hash` is the tip hash; a second `get_last_block_header` call was dropped, the header chain verifies headers better than a probe could), 2 s timeout clearnet, 8 s onion (via the box's local Tor SOCKS). Records RTT (EMA), height, top hash, `synchronized`, restricted-RPC check. |
 | Quorum tip | Highest height reported by ≥3 upstreams that agree on the hash at that height. If fewer than 3 agree, degraded mode (serve highest-height *owned* node; cache writes suspended). |
 | Ranking | Healthy, on quorum tip, sorted by EMA latency; owned node gets a small bonus; onion nodes serve light calls only. |
 | Ejection | Any upstream that fails verification (§4) three times in an hour is removed from rotation for 24 h and the event logged publicly on the upstreams page. |
@@ -57,9 +57,9 @@ Reused from the network doc §3.4, trimmed to what one box can do:
 | Data | Check | Cost |
 |---|---|---|
 | `get_block`, `get_block_header_*` | Recompute block hash from blob; match requested hash or our header chain | Cheap |
-| `/get_transactions` | Keccak(tx blob) = txid; height ≤ tip | Cheap |
+| `/get_transactions` | Keccak(tx blob) = txid; height ≤ tip + 3 (the quorum lags a probe round) | Cheap |
 | Header chain | Built once by majority from upstreams (≈ 280 MB on disk), extended at the tip by agreement; reorg detection → cache epoch bump | One-time sync ≈ hours |
-| `get_info`, `get_height`, fee estimate | Majority of ≥3 upstreams; node-specific fields normalised; SWR cache 1/5/15 s | Cheap |
+| `get_info`, `get_height`, fee estimate | Asked of 3 upstreams, majority of ≥2 agreeing (2/2 counts when only two have capacity); node-specific fields normalised; SWR cache 1/5/15 s | Cheap |
 | `/get_outs.bin` | Two-upstream agreement for **Pro** tokens; single upstream (owned node preferred) for Free | Moderate |
 | `/get_blocks.bin` | **Not verified** in Stage 0; routed to the owned node first, public nodes second; response header `Mnr-Verify: none` | — |
 | Mempool | Not verifiable; header `Mnr-Upstream: <n>` (an opaque number, not the node's URL, so we do not advertise which node saw what) | — |
@@ -74,13 +74,13 @@ Verified request counts and fault counts per upstream are the numbers on the pub
 - **Method policy:** the gateway plan §3.3 table as-is, compiled into `mnr-core::policy`.
 - **Cache:** in-memory (`moka`, 1 GB cap) for SWR and immutable-below-tip−10; on-disk store deferred to Stage 1.
 - **Auth:** 256-bit token, hashed at rest in SQLite; rotation endpoint with 24 h grace. Stock wallets use `--daemon-login <token>:x` (they speak Digest only and drop any path, found in the beta; the token is the Digest username, the password is ignored); the path form `/v1/<token>/…` and Basic auth serve curl, scripts and URL-taking clients. Free tokens are issued instantly from the site; no email.
-- **Limits:** in-process token bucket per token; daily WU quota in SQLite.
+- **Limits:** in-process token bucket per token (capacity twice the rate, so a burst from idle is 2× the figure below); the monthly allowance enforced as a rolling 30-day sum in SQLite, no per-day cap.
 
 | | Free | Pro |
 |---|---|---|
 | Price | $0 | **$9/month**, XMR invoice |
 | Allowance | 500k WU/month | 10M WU/month |
-| Burst | 5 rps | 25 rps |
+| Burst | 5 rps (10 from idle) | 25 rps (50 from idle) |
 | `get_outs` | single upstream | two-upstream agreement |
 | Streams | owned node when available, else public, 1 concurrent | owned node preferred, 3 concurrent |
 | Promise | none | none — "we will tell you what we verified" is the whole promise |
@@ -139,7 +139,7 @@ Exit criteria for "MVP shipped": a stock CLI wallet and Feather sync from scratc
 | Public nodes rate-limit or ban us | Caps keep us under typical limits; the owned node absorbs overflow; ejection is automatic. If it becomes common, that is the signal to move to Stage 1. |
 | Owned node becomes the real workhorse and public nodes decorative | Acceptable — it means demand exists and Stage 1 (two more nodes) is justified. Track the share of WU served by the owned node; above 60% for 4 weeks is a Stage 1 trigger. |
 | Nobody pays $9 | Then the verification layer is a public good and the business is Stage 1 with owned nodes and SLAs sold to backends — the code is unchanged. |
-| Header-chain sync from public nodes is poisoned | Built by majority of ≥5 upstreams including our own node; spot-checked against two block explorers as an advisory signal; any disagreement halts the build and alerts. |
+| Header-chain sync from public nodes is poisoned | Each range is asked of up to five upstreams (all of them when fewer are healthy, never fewer than `min_agree`), our own node first; a range is appended only when every copy agrees, a minority copy is a fault, and no majority at all is never appended: it is counted (`mnr_chain_disagreements_total`), logged at error with each copy's tip, and retried. The explorer spot-check was dropped as redundant with the fault log. |
 
 ---
 

@@ -24,7 +24,7 @@ Explicitly **out of scope** for Stage 0: operator agent, directory, settlement/p
 - `crates/relay` — `mnr-relay`: axum ingress (TLS + onion via local Tor), token auth (SQLite, hashed), in-process token bucket + daily WU quota, policy dispatch, `moka` cache, upstream prober (15 s), ranking, quorum tip, degraded mode, verification, broadcast, invoice watcher against a view-only `monero-wallet-rpc`, Prometheus `/metrics`.
 - `spec/` — protocol notes that will become the Stage 2 spec; keep the method table and verification rules here in prose as they land in code.
 - `deploy/` — Ansible for the relayer VPS and the owned node (WireGuard, Tor, systemd, monitoring).
-- `sim/` — docker-compose stagenet harness with a fault injector (wrong header, lagging height, dropped stream). Nightly in CI.
+- `sim/` — `drill.sh` against a synthetic node with fault injection (wrong header, lagging height, dropped stream); a stagenet compose harness and a nightly CI run are planned, not built.
 - Work unit (WU): 1 light request = 1 WU; 1 MB of `get_blocks.bin` = 20 WU. Quotas, invoices and (later) payouts all use WU.
 
 The method policy table is code: `mnr-core::policy` is canonical, checked in tests against monerod's endpoint registry (`crates/core/fixtures/monerod-core_rpc_server.h`), and `docs/method-policy.md` is regenerated from it with `cargo run -p mnr-core --example render_policy > docs/method-policy.md`. `docs/stage1-gateway-development-plan.md` §3.3 is the historical source.
@@ -32,8 +32,8 @@ The method policy table is code: `mnr-core::policy` is canonical, checked in tes
 ## Conventions
 
 - Licences: AGPL-3.0-only for the workspace, Apache-2.0 for `crates/core` (`mnr-core` must stay embeddable by wallets; keep it free of AGPL dependencies), CC-BY 4.0 for `spec/`, `brand/` all rights reserved. The name is defended by `TRADEMARK.md`, anchored on the domain and the release key, not on a legal entity; there is none.
-- Rust 2021, stable toolchain, `cargo fmt` + `cargo clippy -D warnings` clean before commit. tokio + axum + rustls; `moka` for cache; `rusqlite` for state; `governor` for rate limiting.
-- Monero serialization/hashing: prefer the `monero-serai` family of crates; wrap them behind `mnr-core::hash` so a crate swap never touches the relay. Every hashing function has fixture tests from real mainnet + stagenet blocks (include hard-fork boundary blocks, coinbase-only blocks, pruned and unpruned tx forms).
+- Rust 2021, stable toolchain, `cargo fmt` + `cargo clippy -D warnings` clean before commit. tokio + axum + rustls; `moka` for cache; `rusqlite` for state; an in-process token bucket for rate limiting (capacity twice the rate).
+- Monero serialization/hashing: the `monero-oxide` crates (the monero-serai fork); wrap them behind `mnr-core::hash` so a crate swap never touches the relay. Every hashing function has fixture tests from real mainnet blocks (every hard-fork boundary block, coinbase-only blocks, pruned and unpruned tx forms, a live mempool entry).
 - Tests: `cargo test` for units; `sim/` for integration; differential tests against a real `monerod` for `wire`/`hash`.
 - Config is one TOML file; upstreams are a list with `kind = "owned" | "public"`, `transport = "https" | "http" | "onion"`, and per-node caps.
 - Headers we emit are `Mnr-*`. Package/crate prefix is `mnr`. The name is written lowercase `mnr`; in prose, "mnr — an RPC network for Monero", never "the Monero network".
@@ -49,7 +49,7 @@ The method policy table is code: `mnr-core::policy` is canonical, checked in tes
 
 - Build: `cargo build --release`
 - Test: `cargo test --workspace`
-- Sim: `docker compose -f sim/compose.yml up`
+- Sim: `sim/drill.sh` (needs a release binary; see `sim/README.md`)
 - Run locally: `cargo run -p mnr-relay -- --config relay.toml`
 
 ## Where decisions came from
