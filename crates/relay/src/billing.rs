@@ -1463,7 +1463,8 @@ mod tests {
         assert!(matches!(store.authenticate(&hash), Err(AuthError::Expired)));
 
         // $50: five confirmations; a renewal take-back restores validity.
-        let pro = store.issue(Tier::Pro, Some(unix_now() + 100));
+        let pro_until = unix_now() + 100;
+        let pro = store.issue(Tier::Pro, Some(pro_until));
         let ph = token_hash(&pro);
         let v = b
             .create_invoice(
@@ -1497,7 +1498,7 @@ mod tests {
         b.check_invoices().await;
         let inv = store.invoice(&rid).unwrap();
         assert_eq!(inv.status, InvoiceStatus::Paid);
-        assert_eq!(inv.prev_valid_until, Some(unix_now() + 100));
+        assert_eq!(inv.prev_valid_until, Some(pro_until));
         assert!(store.valid_until(&ph).unwrap().unwrap() > unix_now() + 150 * 24 * 3600);
         w.transfers.lock().retain(|t| t.0 != u64::from(idx));
         b.check_invoices().await;
