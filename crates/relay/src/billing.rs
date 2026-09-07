@@ -303,7 +303,7 @@ impl Billing {
     /// Atomic units received on `subaddr_index` with enough confirmations,
     /// counting only transfers from around the invoice's creation on, and
     /// the highest confirmation count seen (for the status page).
-    async fn received(&self, subaddr_index: u32, since: u64) -> Result<Seen, String> {
+    async fn received(&self, subaddr_index: u32, since: u64, due: u64) -> Result<Seen, String> {
         let r = self
             .wallet_call(
                 "get_transfers",
@@ -312,7 +312,10 @@ impl Billing {
             .await?;
         let mut sum = 0u64;
         let mut seen = 0u64;
-        let mut best_conf = 0u64;
+        // The confirmations that matter are those of the payment that
+        // completes the amount: a single transfer covering it counts on
+        // its own, a split payment counts on its youngest part.
+        let mut transfers: Vec<(u64, u64)> = Vec::new();
         for list in ["in", "pool"] {
             let Some(items) = r.get(list).and_then(Value::as_array) else {
                 continue;
@@ -331,7 +334,7 @@ impl Billing {
                 }
                 let conf = t.get("confirmations").and_then(Value::as_u64).unwrap_or(0);
                 let amount = t.get("amount").and_then(Value::as_u64).unwrap_or(0);
-                best_conf = best_conf.max(conf);
+                transfers.push((amount, conf));
                 seen = seen.saturating_add(amount);
                 if conf >= u64::from(self.cfg.confirmations) {
                     sum = sum.saturating_add(amount);
@@ -341,7 +344,7 @@ impl Billing {
         Ok(Seen {
             confirmed: sum,
             seen,
-            best_conf,
+            best_conf: relevant_confirmations(&transfers, due),
         })
     }
 
@@ -362,7 +365,10 @@ impl Billing {
             tracing::info!(expired, "invoices expired unpaid");
         }
         for inv in self.store.pending_invoices() {
-            match self.received(inv.subaddr_index, inv.created_at).await {
+            match self
+                .received(inv.subaddr_index, inv.created_at, inv.amount)
+                .await
+            {
                 Ok(Seen {
                     confirmed: received,
                     ..
@@ -568,7 +574,7 @@ impl Billing {
         // who sent too little to wait for a token that will not come.
         let (confirmations, seen) = match inv.status {
             InvoiceStatus::Pending => self
-                .received(inv.subaddr_index, inv.created_at)
+                .received(inv.subaddr_index, inv.created_at, inv.amount)
                 .await
                 .map(|s| (s.best_conf, s.seen))
                 .unwrap_or((0, inv.received)),
@@ -592,6 +598,18 @@ impl Billing {
             Err(_) => Err(Refusal::NotFound),
         }
     }
+}
+
+/// The confirmation count to show for `due`: the deepest single transfer
+/// that covers it on its own, else the youngest of all transfers (a split
+/// payment is as confirmed as its newest part); zero without transfers.
+fn relevant_confirmations(transfers: &[(u64, u64)], due: u64) -> u64 {
+    let alone = transfers
+        .iter()
+        .filter(|(a, _)| *a >= due)
+        .map(|(_, c)| *c)
+        .max();
+    alone.unwrap_or_else(|| transfers.iter().map(|(_, c)| *c).min().unwrap_or(0))
 }
 
 /// What the wallet holds for one invoice's subaddress since it was created.
@@ -1180,6 +1198,23 @@ mod tests {
         assert!(store.pending_invoices().is_empty());
     }
 
+    #[test]
+    fn split_payments_are_as_confirmed_as_their_youngest_part() {
+        assert_eq!(relevant_confirmations(&[], 10), 0);
+        assert_eq!(relevant_confirmations(&[(10, 7)], 10), 7);
+        assert_eq!(relevant_confirmations(&[(6, 14), (4, 1)], 10), 1);
+        assert_eq!(
+            relevant_confirmations(&[(6, 14), (4, 1), (12, 3)], 10),
+            3,
+            "one covers it alone"
+        );
+        assert_eq!(
+            relevant_confirmations(&[(4, 14)], 10),
+            14,
+            "a short payment shows its own depth"
+        );
+    }
+
     #[tokio::test]
     async fn status_shows_what_was_seen_and_what_is_left_before_it_confirms() {
         let dir = tempfile::tempdir().unwrap();
@@ -1222,7 +1257,14 @@ mod tests {
         assert_eq!(st["status"], "pending");
         assert_eq!(st["received_atomic"], 30_000_000_000u64);
         assert_eq!(st["remaining_xmr"], "0.03");
-        // The rest arrives: paid.
+        // The rest arrives, young: the invoice is as confirmed as that part.
+        w.transfers.lock().push((1, 30_000_000_000, 2, unix_now()));
+        let st = b.invoice_status(&h, peer(), &id).await.unwrap();
+        assert_eq!(st["confirmations"], 2);
+        assert_eq!(st["remaining_atomic"], 0);
+        assert_eq!(st["status"], "pending");
+        w.transfers.lock().clear();
+        w.transfers.lock().push((1, 30_000_000_000, 12, unix_now()));
         w.transfers.lock().push((1, 30_000_000_000, 10, unix_now()));
         b.check_invoices().await;
         let st = b.invoice_status(&h, peer(), &id).await.unwrap();

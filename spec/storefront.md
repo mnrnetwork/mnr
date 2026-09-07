@@ -113,7 +113,8 @@ While an invoice is pending, its status carries `seen_atomic` (what the
 wallet has seen for that subaddress at any confirmation depth, pool included),
 `received_atomic` (what has the required confirmations) and
 `remaining_atomic` / `remaining_xmr` (what is still due), with `confirmations`
-being the deepest transfer's. A payer who sent too little sees the shortfall
+being those of the payment that completes the amount: a single transfer that
+covers it on its own, else the youngest part of a split payment. A payer who sent too little sees the shortfall
 rather than a count that never turns into a token.
 
 ## `POST /v1/{token}/rotate`

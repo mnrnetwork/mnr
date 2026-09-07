@@ -883,19 +883,19 @@ dependencies = [
 
 [[package]]
 name = "mnr"
-version = "0.1.14"
+version = "0.1.15"
 
 [[package]]
 name = "mnr-agent"
-version = "0.1.14"
+version = "0.1.15"
 
 [[package]]
 name = "mnr-client"
-version = "0.1.14"
+version = "0.1.15"
 
 [[package]]
 name = "mnr-core"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "hex",
  "monero-oxide",
@@ -905,7 +905,7 @@ dependencies = [
 
 [[package]]
 name = "mnr-relay"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "axum",
  "bytes",
