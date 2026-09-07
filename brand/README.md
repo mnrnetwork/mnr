@@ -28,3 +28,10 @@ rendered with
 Set it under repository Settings, Social preview. Do not upload a 1500x500
 banner there: both GitHub and X crop the sides off and cut the wordmark in half.
 The bottom ~100px is deliberately empty, because X draws its title pill there.
+
+## Profile logo (`mnr-logo-200.png`)
+
+200x200, the mark on the dark ground, matching the X avatar. Directories that ask
+for a square profile logo get this one; a transparent PNG is the wrong choice
+there, because the ink strokes vanish on a dark card. Source `mnr-logo-200.html`,
+rendered the same way as the social preview.
