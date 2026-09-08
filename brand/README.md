@@ -12,6 +12,9 @@ Drawn on a 24-unit grid; minimum size 16 px. Do not rotate it (horizontal-mirror
 | `mnr-mark-on-accent.svg` | White inputs, ink centre — for orange surfaces |
 | `mnr-lockup.svg`, `mnr-lockup-dark.svg` | Mark + wordmark; wordmark is Geist 700 with fallbacks, text kept live so it stays editable |
 | `favicon.svg`, `favicon-32.png`, `favicon-16.png`, `apple-touch-icon.png` | Browser tab / home screen |
+| `og-token.html`, `og-token.png` | OpenGraph card for `/get-token` (1200x630) |
+| `og-upstreams.html`, `og-upstreams.png` | OpenGraph card for `/upstreams` (1200x630) |
+| `og-docs.html`, `og-docs.png` | OpenGraph card for `/docs` (1200x630) |
 
 Colours: ink #1B1917 · paper #FBFAF8 · accent #F26822 (Monero-orange family; the site's `accent` token) · dark ground #141210.
 Clear space: keep at least the radius of the large node free around the mark. Wordmark is always lowercase `mnr`.
@@ -28,6 +31,12 @@ rendered with
 Set it under repository Settings, Social preview. Do not upload a 1500x500
 banner there: both GitHub and X crop the sides off and cut the wordmark in half.
 The bottom ~100px is deliberately empty, because X draws its title pill there.
+
+## Page OpenGraph cards (`og-*.png`)
+
+1200x630 (1.91:1), standard OpenGraph format for page-specific link cards.
+Sources: `og-token.html`, `og-upstreams.html`, `og-docs.html`.
+Rendered with `bun run build:og` in `mnr.network` or via headless Chrome + ImageMagick.
 
 ## Profile logo (`mnr-logo-200.png`)
 

@@ -1,0 +1,371 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { background: #0B0A09; width: 1200px; height: 630px; overflow: hidden; }
+.card {
+  width: 1200px;
+  height: 630px;
+  background: #141210;
+  position: relative;
+  overflow: hidden;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Helvetica Neue", Helvetica, Arial, sans-serif;
+  color: #ECE7E1;
+  background-image:
+    radial-gradient(750px 380px at 85% 44%, rgba(242, 104, 34, 0.12), transparent 65%),
+    radial-gradient(500px 300px at 15% 90%, rgba(242, 104, 34, 0.04), transparent 60%);
+}
+.card::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(180deg, rgba(255,255,255,0.02) 0%, transparent 100%);
+  pointer-events: none;
+}
+.wrap {
+  position: absolute;
+  inset: 0;
+  padding: 52px 64px;
+}
+.top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.lock {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+.name {
+  font-size: 32px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: #ECE7E1;
+}
+.slash {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 18px;
+  color: #8E877F;
+  letter-spacing: 0.01em;
+}
+.pill {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid #4A2A16;
+  background: rgba(242, 104, 34, 0.06);
+  border-radius: 999px;
+  padding: 10px 18px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 13px;
+  letter-spacing: 0.08em;
+  color: #F26822;
+  text-transform: uppercase;
+}
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #F26822;
+  box-shadow: 0 0 8px #F26822;
+}
+.content-left {
+  position: absolute;
+  left: 64px;
+  top: 156px;
+  max-width: 590px;
+}
+h1 {
+  font-size: 52px;
+  line-height: 1.08;
+  letter-spacing: -0.03em;
+  font-weight: 700;
+  color: #ECE7E1;
+  margin-bottom: 20px;
+}
+h1 .mute {
+  color: #8E877F;
+}
+p.sub {
+  font-size: 20px;
+  line-height: 1.5;
+  color: #B5ADA4;
+  letter-spacing: -0.01em;
+  max-width: 560px;
+}
+.foot {
+  position: absolute;
+  left: 64px;
+  right: 64px;
+  bottom: 52px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.chip {
+  border: 1px solid #2E2A26;
+  background: rgba(255,255,255,0.02);
+  border-radius: 8px;
+  padding: 8px 14px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 13.5px;
+  color: #B5ADA4;
+}
+.chip.on {
+  border-color: #4A2A16;
+  color: #F26822;
+  background: rgba(242, 104, 34, 0.05);
+}
+.ep {
+  margin-left: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 14.5px;
+  color: #8E877F;
+}
+.ep b {
+  color: #ECE7E1;
+  font-weight: 600;
+}
+
+/* Right Panel: Telemetry Radar Card */
+.panel {
+  position: absolute;
+  right: 64px;
+  top: 156px;
+  width: 456px;
+  background: #100E0C;
+  border: 1px solid #33261C;
+  border-radius: 12px;
+  padding: 22px;
+  box-shadow: 0 16px 44px rgba(0, 0, 0, 0.55), 0 0 32px rgba(242, 104, 34, 0.06);
+}
+.panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 14px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid #241D17;
+}
+.panel-tag {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  color: #8E877F;
+  text-transform: uppercase;
+  font-weight: 600;
+}
+.panel-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  color: #34D399;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #34D399;
+  box-shadow: 0 0 6px #34D399;
+}
+.stats-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.stat-box {
+  background: #161310;
+  border: 1px solid #28211B;
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+.stat-k {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  color: #8E877F;
+  text-transform: uppercase;
+  margin-bottom: 4px;
+}
+.stat-v {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 17px;
+  font-weight: 700;
+  color: #F26822;
+}
+.stat-v.num {
+  color: #ECE7E1;
+}
+
+/* Nodes Table */
+.node-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 14px;
+}
+.node-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: #141210;
+  border: 1px solid #231E19;
+  border-radius: 6px;
+  padding: 7px 11px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11.5px;
+}
+.node-id {
+  color: #ECE7E1;
+  font-weight: 600;
+  width: 80px;
+}
+.node-loc {
+  color: #8E877F;
+  font-size: 11px;
+  width: 90px;
+}
+.node-height {
+  color: #B5ADA4;
+  font-size: 11px;
+}
+.node-ping {
+  color: #F26822;
+  font-weight: 500;
+  width: 45px;
+  text-align: right;
+}
+.node-badge {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: #34D399;
+  font-size: 10.5px;
+  text-transform: uppercase;
+  font-weight: 600;
+  margin-left: 6px;
+}
+.node-badge-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: #34D399;
+}
+
+.summary-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 9px 12px;
+  background: rgba(242, 104, 34, 0.04);
+  border: 1px dashed #3A2314;
+  border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11.5px;
+  color: #B5ADA4;
+}
+.summary-bar span {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.summary-bar span b {
+  color: #F26822;
+}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="wrap">
+    <!-- Top Nav / Lockup -->
+    <div class="top">
+      <div class="lock">
+        <svg width="38" height="38" viewBox="0 0 24 24">
+          <circle cx="16.5" cy="12" r="5.2" fill="#F26822"/>
+          <path d="M5.2 6.6 L11.9 10.1 M5.2 17.4 L11.9 13.9" stroke="#ECE7E1" stroke-width="2.6" stroke-linecap="round"/>
+          <circle cx="5.2" cy="6.6" r="2.1" fill="#ECE7E1"/>
+          <circle cx="5.2" cy="17.4" r="2.1" fill="#ECE7E1"/>
+        </svg>
+        <span class="name">mnr</span><span class="slash">/ upstreams</span>
+      </div>
+      <div class="pill"><span class="dot"></span>Live Quorum Telemetry</div>
+    </div>
+
+    <!-- Left Content -->
+    <div class="content-left">
+      <h1>Monero Node Pool.<br><span class="mute">Live Quorum &amp; Health.</span></h1>
+      <p class="sub">Real-time metrics, tip height, latency, and fault logs across the upstream Monero node pool. Every block, tx, and header verified against multi-node consensus.</p>
+    </div>
+
+    <!-- Right Telemetry Panel -->
+    <div class="panel">
+      <div class="panel-head">
+        <span class="panel-tag">Upstream Telemetry</span>
+        <span class="panel-status"><span class="status-dot"></span>15 / 15 Healthy</span>
+      </div>
+      <div class="stats-row">
+        <div class="stat-box">
+          <div class="stat-k">Tip Height</div>
+          <div class="stat-v num">3,757,137</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-k">Quorum Consensus</div>
+          <div class="stat-v">100% Synced</div>
+        </div>
+      </div>
+      <div class="node-list">
+        <div class="node-row">
+          <span class="node-id">node.01</span>
+          <span class="node-loc">de-central</span>
+          <span class="node-height">3,757,137</span>
+          <span class="node-ping">19ms</span>
+          <span class="node-badge"><span class="node-badge-dot"></span>OK</span>
+        </div>
+        <div class="node-row">
+          <span class="node-id">node.02</span>
+          <span class="node-loc">us-east</span>
+          <span class="node-height">3,757,137</span>
+          <span class="node-ping">24ms</span>
+          <span class="node-badge"><span class="node-badge-dot"></span>OK</span>
+        </div>
+        <div class="node-row">
+          <span class="node-id">node.03</span>
+          <span class="node-loc">se-nordic</span>
+          <span class="node-height">3,757,137</span>
+          <span class="node-ping">31ms</span>
+          <span class="node-badge"><span class="node-badge-dot"></span>OK</span>
+        </div>
+        <div class="node-row">
+          <span class="node-id">node.04</span>
+          <span class="node-loc">fi-helsinki</span>
+          <span class="node-height">3,757,137</span>
+          <span class="node-ping">38ms</span>
+          <span class="node-badge"><span class="node-badge-dot"></span>OK</span>
+        </div>
+      </div>
+      <div class="summary-bar">
+        <span><b>Mnr-Verify:</b> quorum(3/3)</span>
+        <span><b>Faults:</b> 0</span>
+        <span><b>Rate:</b> 1.41 req/s</span>
+      </div>
+    </div>
+
+    <!-- Bottom Footer -->
+    <div class="foot">
+      <span class="chip on">Quorum: 15/15 Synced</span>
+      <span class="chip">Zero Request Logs</span>
+      <span class="chip">Ethical Proxy Caps</span>
+      <span class="ep">Telemetry: <b>rpc.mnr.network/upstreams.json</b></span>
+    </div>
+  </div>
+</div>
+</body>
+</html>

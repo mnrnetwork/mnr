@@ -1,0 +1,327 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { background: #0B0A09; width: 1200px; height: 630px; overflow: hidden; }
+.card {
+  width: 1200px;
+  height: 630px;
+  background: #141210;
+  position: relative;
+  overflow: hidden;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Helvetica Neue", Helvetica, Arial, sans-serif;
+  color: #ECE7E1;
+  background-image:
+    radial-gradient(750px 380px at 85% 44%, rgba(242, 104, 34, 0.12), transparent 65%),
+    radial-gradient(500px 300px at 15% 90%, rgba(242, 104, 34, 0.04), transparent 60%);
+}
+.card::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(180deg, rgba(255,255,255,0.02) 0%, transparent 100%);
+  pointer-events: none;
+}
+.wrap {
+  position: absolute;
+  inset: 0;
+  padding: 52px 64px;
+}
+.top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.lock {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+.name {
+  font-size: 32px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: #ECE7E1;
+}
+.slash {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 18px;
+  color: #8E877F;
+  letter-spacing: 0.01em;
+}
+.pill {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid #4A2A16;
+  background: rgba(242, 104, 34, 0.06);
+  border-radius: 999px;
+  padding: 10px 18px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 13px;
+  letter-spacing: 0.08em;
+  color: #F26822;
+  text-transform: uppercase;
+}
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #F26822;
+  box-shadow: 0 0 8px #F26822;
+}
+.content-left {
+  position: absolute;
+  left: 64px;
+  top: 156px;
+  max-width: 590px;
+}
+h1 {
+  font-size: 52px;
+  line-height: 1.08;
+  letter-spacing: -0.03em;
+  font-weight: 700;
+  color: #ECE7E1;
+  margin-bottom: 20px;
+}
+h1 .mute {
+  color: #8E877F;
+}
+p.sub {
+  font-size: 20px;
+  line-height: 1.5;
+  color: #B5ADA4;
+  letter-spacing: -0.01em;
+  max-width: 560px;
+}
+.foot {
+  position: absolute;
+  left: 64px;
+  right: 64px;
+  bottom: 52px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.chip {
+  border: 1px solid #2E2A26;
+  background: rgba(255,255,255,0.02);
+  border-radius: 8px;
+  padding: 8px 14px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 13.5px;
+  color: #B5ADA4;
+}
+.chip.on {
+  border-color: #4A2A16;
+  color: #F26822;
+  background: rgba(242, 104, 34, 0.05);
+}
+.ep {
+  margin-left: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 14.5px;
+  color: #8E877F;
+}
+.ep b {
+  color: #ECE7E1;
+  font-weight: 600;
+}
+
+/* Right Panel: Credential Voucher Card */
+.panel {
+  position: absolute;
+  right: 64px;
+  top: 156px;
+  width: 446px;
+  background: #100E0C;
+  border: 1px solid #33261C;
+  border-radius: 12px;
+  padding: 22px;
+  box-shadow: 0 16px 44px rgba(0, 0, 0, 0.55), 0 0 32px rgba(242, 104, 34, 0.06);
+}
+.panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid #241D17;
+}
+.panel-tag {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  color: #8E877F;
+  text-transform: uppercase;
+  font-weight: 600;
+}
+.panel-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  color: #34D399;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #34D399;
+  box-shadow: 0 0 6px #34D399;
+}
+.token-box {
+  background: #161310;
+  border: 1px solid #4A2A16;
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin-bottom: 16px;
+}
+.token-label {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+  color: #8E877F;
+  text-transform: uppercase;
+  margin-bottom: 6px;
+  display: flex;
+  justify-content: space-between;
+}
+.token-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 14.5px;
+  color: #F26822;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.spec-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+.spec-item {
+  background: #141210;
+  border: 1px solid #231E19;
+  border-radius: 6px;
+  padding: 9px 12px;
+}
+.spec-k {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 10px;
+  color: #8E877F;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-bottom: 4px;
+}
+.spec-v {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 13.5px;
+  color: #ECE7E1;
+  font-weight: 600;
+}
+.guarantee-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px;
+  background: rgba(242, 104, 34, 0.04);
+  border: 1px dashed #3A2314;
+  border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11.5px;
+  color: #B5ADA4;
+}
+.guarantee-bar span {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.guarantee-bar span b {
+  color: #F26822;
+}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="wrap">
+    <!-- Top Nav / Lockup -->
+    <div class="top">
+      <div class="lock">
+        <svg width="38" height="38" viewBox="0 0 24 24">
+          <circle cx="16.5" cy="12" r="5.2" fill="#F26822"/>
+          <path d="M5.2 6.6 L11.9 10.1 M5.2 17.4 L11.9 13.9" stroke="#ECE7E1" stroke-width="2.6" stroke-linecap="round"/>
+          <circle cx="5.2" cy="6.6" r="2.1" fill="#ECE7E1"/>
+          <circle cx="5.2" cy="17.4" r="2.1" fill="#ECE7E1"/>
+        </svg>
+        <span class="name">mnr</span><span class="slash">/ get-token</span>
+      </div>
+      <div class="pill"><span class="dot"></span>Zero-KYC Access</div>
+    </div>
+
+    <!-- Left Content -->
+    <div class="content-left">
+      <h1>Instant Bearer Token.<br><span class="mute">Zero KYC. No Logs.</span></h1>
+      <p class="sub">A single bearer token is your entire relationship with the network. Free tier in one click (500k WU/mo), or Pro billed via anonymous Monero on-chain invoice. Plugs straight into any wallet.</p>
+    </div>
+
+    <!-- Right Voucher Panel -->
+    <div class="panel">
+      <div class="panel-head">
+        <span class="panel-tag">Bearer Credential</span>
+        <span class="panel-status"><span class="status-dot"></span>Instant &amp; Ready</span>
+      </div>
+      <div class="token-box">
+        <div class="token-label">
+          <span>Auth Token</span>
+          <span style="color: #F26822;">SHA-256 Hashed</span>
+        </div>
+        <div class="token-code">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#F26822" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>
+          mnr_live_8f0a2e9b...
+        </div>
+      </div>
+      <div class="spec-grid">
+        <div class="spec-item">
+          <div class="spec-k">Free Monthly Quota</div>
+          <div class="spec-v">500,000 WU</div>
+        </div>
+        <div class="spec-item">
+          <div class="spec-k">Burst Allowance</div>
+          <div class="spec-v">5 req / sec</div>
+        </div>
+        <div class="spec-item">
+          <div class="spec-k">Pro Billing</div>
+          <div class="spec-v">XMR Subaddress</div>
+        </div>
+        <div class="spec-item">
+          <div class="spec-k">Transport</div>
+          <div class="spec-v">TLS · Tor · I2P</div>
+        </div>
+      </div>
+      <div class="guarantee-bar">
+        <span><b>✓</b> No Email</span>
+        <span><b>✓</b> No Account</span>
+        <span><b>✓</b> Zero Logs</span>
+      </div>
+    </div>
+
+    <!-- Bottom Footer -->
+    <div class="foot">
+      <span class="chip on">Auth: Bearer &lt;token&gt;</span>
+      <span class="chip">Free: 500k WU / Month</span>
+      <span class="chip">Pro: Monero On-Chain Invoice</span>
+      <span class="ep">Endpoint: <b>rpc.mnr.network:443</b></span>
+    </div>
+  </div>
+</div>
+</body>
+</html>
