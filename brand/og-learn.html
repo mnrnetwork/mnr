@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { background: #0B0A09; width: 1200px; height: 630px; overflow: hidden; }
+.card {
+  width: 1200px;
+  height: 630px;
+  background: #141210;
+  position: relative;
+  overflow: hidden;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Helvetica Neue", Helvetica, Arial, sans-serif;
+  color: #ECE7E1;
+  background-image:
+    radial-gradient(750px 380px at 85% 44%, rgba(242, 104, 34, 0.12), transparent 65%),
+    radial-gradient(500px 300px at 15% 90%, rgba(242, 104, 34, 0.04), transparent 60%);
+}
+.card::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(180deg, rgba(255,255,255,0.02) 0%, transparent 100%);
+  pointer-events: none;
+}
+.wrap {
+  position: absolute;
+  inset: 0;
+  padding: 52px 64px;
+}
+.top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.lock {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+.name {
+  font-size: 32px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: #ECE7E1;
+}
+.slash {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 18px;
+  color: #8E877F;
+  letter-spacing: 0.01em;
+}
+.pill {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid #4A2A16;
+  background: rgba(242, 104, 34, 0.06);
+  border-radius: 999px;
+  padding: 10px 18px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 13px;
+  letter-spacing: 0.08em;
+  color: #F26822;
+  text-transform: uppercase;
+}
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #F26822;
+  box-shadow: 0 0 8px #F26822;
+}
+.content-left {
+  position: absolute;
+  left: 64px;
+  top: 156px;
+  max-width: 590px;
+}
+h1 {
+  font-size: 50px;
+  line-height: 1.08;
+  letter-spacing: -0.03em;
+  font-weight: 700;
+  color: #ECE7E1;
+  margin-bottom: 20px;
+}
+h1 .mute {
+  color: #8E877F;
+}
+p.sub {
+  font-size: 20px;
+  line-height: 1.5;
+  color: #B5ADA4;
+  letter-spacing: -0.01em;
+  max-width: 560px;
+}
+.foot {
+  position: absolute;
+  left: 64px;
+  right: 64px;
+  bottom: 52px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.chip {
+  border: 1px solid #2E2A26;
+  background: rgba(255,255,255,0.02);
+  border-radius: 8px;
+  padding: 8px 14px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 13.5px;
+  color: #B5ADA4;
+}
+.chip.on {
+  border-color: #4A2A16;
+  color: #F26822;
+  background: rgba(242, 104, 34, 0.05);
+}
+.ep {
+  margin-left: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 14.5px;
+  color: #8E877F;
+}
+.ep b {
+  color: #ECE7E1;
+  font-weight: 600;
+}
+
+/* Right Panel: Developer Terminal Card */
+.panel {
+  position: absolute;
+  right: 64px;
+  top: 156px;
+  width: 456px;
+  background: #100E0C;
+  border: 1px solid #33261C;
+  border-radius: 12px;
+  padding: 22px;
+  box-shadow: 0 16px 44px rgba(0, 0, 0, 0.55), 0 0 32px rgba(242, 104, 34, 0.06);
+}
+.panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 14px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid #241D17;
+}
+.terminal-dots {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.term-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #2E2A26;
+}
+.term-dot:nth-child(1) { background: #E05252; opacity: 0.8; }
+.term-dot:nth-child(2) { background: #E5A93C; opacity: 0.8; }
+.term-dot:nth-child(3) { background: #48B870; opacity: 0.8; }
+.panel-tag {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  color: #8E877F;
+}
+.panel-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  color: #34D399;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #34D399;
+  box-shadow: 0 0 6px #34D399;
+}
+
+/* Code Snippet */
+.code-box {
+  background: #151210;
+  border: 1px solid #28211B;
+  border-radius: 8px;
+  padding: 13px 15px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11.5px;
+  line-height: 1.6;
+  margin-bottom: 14px;
+}
+.code-box .req { color: #ECE7E1; }
+.code-box .req-m { color: #F26822; font-weight: 600; }
+.code-box .hdr { color: #8E877F; }
+.code-box .resp { color: #34D399; font-weight: 600; margin-top: 6px; }
+.code-box .verify { color: #F26822; }
+
+/* Sub Badges */
+.wallets-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 9px 12px;
+  background: rgba(242, 104, 34, 0.04);
+  border: 1px dashed #3A2314;
+  border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  color: #B5ADA4;
+}
+.wallets-bar span b {
+  color: #ECE7E1;
+}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="wrap">
+    <!-- Top Nav / Lockup -->
+    <div class="top">
+      <div class="lock">
+        <svg width="38" height="38" viewBox="0 0 24 24">
+          <circle cx="16.5" cy="12" r="5.2" fill="#F26822"/>
+          <path d="M5.2 6.6 L11.9 10.1 M5.2 17.4 L11.9 13.9" stroke="#ECE7E1" stroke-width="2.6" stroke-linecap="round"/>
+          <circle cx="5.2" cy="6.6" r="2.1" fill="#ECE7E1"/>
+          <circle cx="5.2" cy="17.4" r="2.1" fill="#ECE7E1"/>
+        </svg>
+        <span class="name">mnr</span><span class="slash">/ learn</span>
+      </div>
+      <div class="pill"><span class="dot"></span>Architecture &amp; Consensus</div>
+    </div>
+
+    <!-- Left Content -->
+    <div class="content-left">
+      <h1>Monero RPC Architecture.<br><span class="mute">Explainers, Consensus &amp; Truth.</span></h1>
+      <p class="sub">Ten conceptual explainers on Monero daemon RPC, public node failure modes, multi-node quorum verification, and trust-minimized architecture.</p>
+    </div>
+
+    <!-- Right Terminal Panel -->
+    <div class="panel">
+      <div class="panel-head">
+        <div class="terminal-dots">
+          <span class="term-dot"></span>
+          <span class="term-dot"></span>
+          <span class="term-dot"></span>
+        </div>
+        <span class="panel-tag">mnr-relay · quorum-verification</span>
+        <span class="panel-status"><span class="status-dot"></span>200 OK</span>
+      </div>
+      <div class="code-box">
+        <div class="req"><span class="req-m">POST</span> /json_rpc HTTP/2</div>
+        <div class="hdr">{ "method": "get_info" }</div>
+        <div class="resp">&lt; HTTP/2 200 OK</div>
+        <div class="verify">&lt; Mnr-Verify: quorum_verified (3/3)</div>
+        <div class="hdr">&lt; Mnr-Quorum-Tip: 3300142</div>
+      </div>
+      <div class="wallets-bar">
+        <span><b>10 Explainers:</b> Quorum · Hashes · Nodes · LWS · Tor</span>
+      </div>
+    </div>
+
+    <!-- Bottom Footer -->
+    <div class="foot">
+      <span class="chip on">Quorum Consensus</span>
+      <span class="chip">Daemon Trust Models</span>
+      <span class="chip">Hash Recomputation</span>
+      <span class="ep">Learn Hub: <b>mnr.network/learn</b></span>
+    </div>
+  </div>
+</div>
+</body>
+</html>
