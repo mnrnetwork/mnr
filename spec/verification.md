@@ -30,18 +30,32 @@ fabricates a PoW-valid alternate chain is a 51% attacker, outside this model.
 | Method | Check | Label |
 |---|---|---|
 | `get_block` by `hash` | Block hash recomputed from `blob`; must equal the requested hash. `block_header` (hash, height, prev_hash, timestamp, versions), `miner_tx_hash`, `tx_hashes` and `num_txes` must describe the blob. | `chain` if the chain holds that hash at that height, else `hash` |
-| `get_block` by `height` | As above, and the recomputed hash must equal the chain's at that height; the blob must carry that height. | `chain`; `none` if the chain is shorter |
-| `get_block_header_by_height` | Height, hash, prev_hash and timestamp must equal the chain's record. | `chain`; `none` if the chain is shorter |
-| `get_block_header_by_hash` | The reported hash must be the requested one; then as by height. A header at a height where the chain holds another block is an orphan: honest only if `orphan_status` is not `false`. | `chain`; `none` if the chain is shorter or the header is a declared orphan |
-| `get_block_headers_range` | Exactly `end − start + 1` headers, heights contiguous from `start`, each linking to the previous, each equal to the chain's record. No partial trust: one header beyond the chain makes the whole answer `none`. | `chain` / `none` |
-| `on_get_block_hash` | The returned hash must equal the chain's at the requested height. | `chain`; `none` if the chain is shorter |
+| `get_block` by `height` | As above, and the recomputed hash must equal the chain's at that height; the blob must carry that height. | `chain`; `none` if the chain is shorter or the block is another one near the tip |
+| `get_block_header_by_height` | Height, hash, prev_hash and timestamp must equal the chain's record. | `chain`; `none` if the chain is shorter or the header is another block's near the tip |
+| `get_block_header_by_hash` | The reported hash must be the requested one; then as by height. A header at a height where the chain holds another block is an orphan: honest only if `orphan_status` is not `false`. | `chain`; `none` if the chain is shorter, the header is a declared orphan, or it is another block near the tip |
+| `get_block_headers_range` | Exactly `end − start + 1` headers, heights contiguous from `start`, each linking to the previous, each equal to the chain's record. No partial trust: one header beyond the chain, or another block near the tip, makes the whole answer `none`. | `chain` / `none` |
+| `on_get_block_hash` | The returned hash must equal the chain's at the requested height. | `chain`; `none` if the chain is shorter or the hash is another block's near the tip |
 
 A request the relay cannot interpret (a malformed `hash` param, for instance)
 is passed through with the daemon's own answer as `none`; the fault log counts
-wrong *answers* only. A mismatch anywhere is a **fault**: the answer is never
+wrong *answers* only. A mismatch is a **fault**: the answer is never
 returned, the fault is recorded against the upstream, and the next ranked
 upstream is asked, up to three. If every attempt faults the client receives
 HTTP 502 with `Mnr-Verify: failed`.
+
+**Near the tip.** The chain re-syncs once per probe round, so after a reorg
+it can hold the losing block for about half a minute. An answer naming
+*another block* than the chain within the top `TIP_SAFETY_DEPTH` (10)
+records is therefore not a fault: the node may be on the new side. It is
+served as `none` (never cached, not counted as verified) and logged. Near the
+tip only self-inconsistency is a fault: a blob that does not match its
+header, a wrong height, headers that do not link, a field that differs under
+the chain's own hash. Deeper, another block is a lie and a fault as above.
+The cost is that a node lying about a block in the top ten is served as
+`none` rather than faulted, as one lying about a height above the chain
+already is. Found in production on 2026-09-11: a one-block reorg at 3760020
+faulted three honest nodes twice each and answered two requests with 502
+(fixed in 0.1.18).
 
 **Ejection.** Three faults within an hour eject an upstream for 24 hours. The
 fault log entry that caused it and the upstreams feed both carry

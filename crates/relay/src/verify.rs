@@ -9,16 +9,31 @@
 //!   `chain` when the header chain confirmed it, `hash` when only the
 //!   recomputed hash matched the request, `partial` when some entries of a
 //!   batch could not be checked;
-//! - **not verifiable** (`none`): our chain does not reach the height, or
-//!   the data has no self-authenticating form. Served annotated, never cached;
+//! - **not verifiable** (`none`): our chain does not reach the height, the
+//!   data has no self-authenticating form, or the node names another block
+//!   within [`TIP_SAFETY_DEPTH`] of our chain's tip (a reorg our chain has
+//!   not caught up with yet: it re-syncs once per probe round, so it can be
+//!   the stale side for about half a minute). Served annotated, never cached;
 //! - a **fault**: the node's answer is wrong. It is never returned to the
 //!   client; the caller records it against the upstream and asks another.
 //!
 //! A daemon-level error in the answer (unknown hash, height too high) is
 //! not a fault: it is passed through as `none`.
+//!
+//! Near the tip only self-inconsistency is a fault (a blob that does not
+//! match its header, a wrong height, headers that do not link, a field that
+//! differs under the same block hash); disagreeing with our chain there is
+//! not, for the reason `consensus.rs` gives for `get_last_block_header`.
+//! Found in production (2026-09-11, a one-block reorg at 3760020): three
+//! nodes serving the new block were faulted twice each and two requests got
+//! a 502 while our chain still held the orphan. The cost: a node lying about
+//! a block in the top ten is served as `none` instead of being faulted, as a
+//! node lying about a height above our tip already is. Deeper, another
+//! block is a lie and a fault.
 
 use mnr_core::hash::Hash;
 use mnr_core::headerchain::HeaderChain;
+use mnr_core::policy::TIP_SAFETY_DEPTH;
 use mnr_core::verify::{
     self as rules, Expected, ReportedHeader, TxForm, TxLocation, TxVerdict, VerifyError,
 };
@@ -164,6 +179,26 @@ fn hex(h: &Hash) -> String {
     h.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Whether `height` is within the top [`TIP_SAFETY_DEPTH`] records of our
+/// chain, where a node naming another block may be on the new side of a
+/// reorg our chain has not seen yet.
+fn near_tip(chain: &HeaderChain, height: u64) -> bool {
+    chain
+        .tip()
+        .is_some_and(|t| height.saturating_add(TIP_SAFETY_DEPTH) > t.height)
+}
+
+/// An answer that names another block than our chain near its tip: served
+/// as `none`, not faulted (see the module doc).
+fn reorg_in_flight(method: &str, height: u64) -> Verified {
+    tracing::info!(
+        method,
+        height,
+        "answer names another block near our chain tip; served as none (reorg in flight?)"
+    );
+    Verified::at(Verify::None, height)
+}
+
 fn verify_get_block(
     params: Option<&Value>,
     body: &[u8],
@@ -211,6 +246,15 @@ fn verify_get_block(
                         )));
                     }
                     (parsed, Verify::None)
+                }
+                // Another block at the requested height (`HeightMismatch`
+                // is checked first), near our tip: the blob still has to
+                // match its header below; only canonicity is unknown.
+                Err(VerifyError::HashMismatch { .. }) if near_tip(chain, height) => {
+                    let parsed =
+                        mnr_core::hash::parse_block(&blob).map_err(|e| Fault(e.to_string()))?;
+                    let Verified { verify, .. } = reorg_in_flight("get_block", height);
+                    (parsed, verify)
                 }
                 Err(e) => return Err(Fault(e.to_string())),
             }
@@ -274,6 +318,12 @@ fn verify_header_by_height(
     match rules::verify_header_by_height(height, &reported, chain) {
         Ok(()) => Ok(Verified::at(Verify::Chain, height)),
         Err(VerifyError::UnknownHeight(_)) => Ok(Verified::at(Verify::None, height)),
+        // Another block (a timestamp lie keeps our hash and stays a fault).
+        Err(VerifyError::HashMismatch { expected, got })
+            if expected != got && near_tip(chain, height) =>
+        {
+            Ok(reorg_in_flight("get_block_header_by_height", height))
+        }
         Err(e) => Err(Fault(e.to_string())),
     }
 }
@@ -305,10 +355,17 @@ fn verify_header_by_hash(
         Err(VerifyError::UnknownHeight(_)) => Ok(Verified::at(Verify::None, reported.height)),
         // Our chain has another block at that height: an orphan answered by
         // hash is honest only if the node says so.
-        Err(VerifyError::HashMismatch { .. })
-            if result.block_header.orphan_status != Some(false) =>
+        Err(VerifyError::HashMismatch { expected, got })
+            if expected != got && result.block_header.orphan_status != Some(false) =>
         {
             Ok(Verified::at(Verify::None, reported.height))
+        }
+        // Near our tip the node may be right and our block the orphan: it
+        // then reports the new block as `orphan_status: false`, honestly.
+        Err(VerifyError::HashMismatch { expected, got })
+            if expected != got && near_tip(chain, reported.height) =>
+        {
+            Ok(reorg_in_flight("get_block_header_by_hash", reported.height))
         }
         Err(e) => Err(Fault(e.to_string())),
     }
@@ -357,6 +414,14 @@ fn verify_headers_range(
         match rules::verify_header_by_height(want, &reported, chain) {
             Ok(()) => {}
             Err(VerifyError::UnknownHeight(_)) => on_chain = false,
+            Err(VerifyError::HashMismatch { expected, got })
+                if expected != got && near_tip(chain, want) =>
+            {
+                if on_chain {
+                    reorg_in_flight("get_block_headers_range", want);
+                }
+                on_chain = false;
+            }
             Err(e) => return Err(Fault(e.to_string())),
         }
         prev = Some(reported);
@@ -392,6 +457,9 @@ fn verify_block_hash(
         return Ok(Verified::at(Verify::None, height));
     };
     let got = decode_hex32(&result).map_err(|_| Fault("block hash is not hex".into()))?;
+    if got != ours && near_tip(chain, height) {
+        return Ok(reorg_in_flight("on_get_block_hash", height));
+    }
     if got != ours {
         return Err(Fault(format!(
             "hash mismatch at height {height}: expected {} got {}",
@@ -546,6 +614,26 @@ pub fn batch_label(checks: &[TxCheck]) -> (Verify, Option<(usize, usize)>) {
     } else {
         (Verify::Partial, Some((k, n)))
     }
+}
+
+/// `chain` with `n` made-up records on top, so the heights it held sit
+/// `n` deeper. Linkage is all `append` checks; nothing here hashes them.
+#[cfg(test)]
+pub(crate) fn deepen_for_test(mut chain: HeaderChain, n: u64) -> HeaderChain {
+    for _ in 0..n {
+        let t = chain.tip().expect("a chain to deepen");
+        let mut hash = [0xee; 32];
+        hash[..8].copy_from_slice(&(t.height + 1).to_le_bytes());
+        chain
+            .append(mnr_core::headerchain::Entry {
+                height: t.height + 1,
+                hash,
+                prev_hash: t.hash,
+                timestamp: t.timestamp + 120,
+            })
+            .unwrap();
+    }
+    chain
 }
 
 #[cfg(test)]
@@ -802,12 +890,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(v.verify, Verify::None);
+        // Undeclared: at our tip it may be the new block of a reorg, so
+        // `none`; ten records down it is a lie.
         o["result"]["block_header"]["orphan_status"] = json!(false);
+        let v = verify_jsonrpc(
+            "get_block_header_by_hash",
+            Some(&json!({"hash": "ab".repeat(32)})),
+            o.to_string().as_bytes(),
+            &chain,
+        )
+        .unwrap();
+        assert_eq!(v, Verified::at(Verify::None, 1));
         assert!(verify_jsonrpc(
             "get_block_header_by_hash",
             Some(&json!({"hash": "ab".repeat(32)})),
             o.to_string().as_bytes(),
-            &chain
+            &deepen_for_test(chain_0_1(), TIP_SAFETY_DEPTH)
         )
         .is_err());
     }
@@ -857,11 +955,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(v, Verified::at(Verify::Chain, 1));
-        let f = verify_jsonrpc(
+        // Another block's hash near our tip: `none`; deeper: a fault.
+        let v = verify_jsonrpc(
             "on_get_block_hash",
             Some(&json!([0])),
             ok.as_bytes(),
             &chain,
+        )
+        .unwrap();
+        assert_eq!(v, Verified::at(Verify::None, 0));
+        let f = verify_jsonrpc(
+            "on_get_block_hash",
+            Some(&json!([0])),
+            ok.as_bytes(),
+            &deepen_for_test(chain_0_1(), TIP_SAFETY_DEPTH),
         )
         .unwrap_err();
         assert!(f.0.contains("hash mismatch"), "{}", f.0);
@@ -873,6 +980,114 @@ mod tests {
         )
         .unwrap();
         assert_eq!(v, Verified::at(Verify::None, 500));
+    }
+
+    /// Our chain on the losing side of a one-block reorg at height 1:
+    /// genesis, then a block that is not the real block 1.
+    fn chain_with_orphan_at_1() -> HeaderChain {
+        let real = chain_0_1();
+        let mut c = HeaderChain::new();
+        c.append(real.get(0).unwrap()).unwrap();
+        c.append(Entry {
+            hash: [0xbb; 32],
+            ..real.get(1).unwrap()
+        })
+        .unwrap();
+        c
+    }
+
+    /// The 2026-09-11 incident: nodes serving the new block while our chain
+    /// still holds the orphan are not lying. Near the tip that is `none`;
+    /// at `TIP_SAFETY_DEPTH` records down it is a fault again.
+    #[test]
+    fn another_block_near_our_tip_is_none_and_deeper_is_a_fault() {
+        let at_tip = chain_with_orphan_at_1();
+        let nine_down = deepen_for_test(chain_with_orphan_at_1(), TIP_SAFETY_DEPTH - 1);
+        let ten_down = deepen_for_test(chain_with_orphan_at_1(), TIP_SAFETY_DEPTH);
+        let block = |chain: &HeaderChain| {
+            verify_jsonrpc(
+                "get_block",
+                Some(&json!({"height": 1})),
+                BLOCK1.as_bytes(),
+                chain,
+            )
+        };
+        assert_eq!(block(&at_tip).unwrap(), Verified::at(Verify::None, 1));
+        assert_eq!(block(&nine_down).unwrap(), Verified::at(Verify::None, 1));
+        let f = block(&ten_down).unwrap_err();
+        assert!(f.0.contains("hash mismatch"), "{}", f.0);
+
+        // Near the tip the blob must still match its header.
+        let f = verify_jsonrpc(
+            "get_block",
+            Some(&json!({"height": 1})),
+            tampered(BLOCK1).as_bytes(),
+            &at_tip,
+        )
+        .unwrap_err();
+        assert!(f.0.contains("block_header disagrees"), "{}", f.0);
+        // And carry the height asked for.
+        let f = verify_jsonrpc(
+            "get_block",
+            Some(&json!({"height": 0})),
+            BLOCK1.as_bytes(),
+            &at_tip,
+        )
+        .unwrap_err();
+        assert!(f.0.contains("height"), "{}", f.0);
+
+        // Header by height: another block near the tip is `none`, deeper a
+        // fault; a wrong height or a wrong field under our own hash is a
+        // fault anywhere.
+        let b1 = header_body(BLOCK1);
+        let by_height = |chain: &HeaderChain, h: u64, body: &str| {
+            verify_jsonrpc(
+                "get_block_header_by_height",
+                Some(&json!({"height": h})),
+                body.as_bytes(),
+                chain,
+            )
+        };
+        assert_eq!(
+            by_height(&at_tip, 1, &b1).unwrap(),
+            Verified::at(Verify::None, 1)
+        );
+        assert!(by_height(&ten_down, 1, &b1).is_err());
+        assert!(by_height(&at_tip, 0, &b1).is_err());
+        let mut lie: Value = serde_json::from_str(&b1).unwrap();
+        lie["result"]["block_header"]["timestamp"] = json!(1);
+        assert!(by_height(&chain_0_1(), 1, &lie.to_string()).is_err());
+
+        // A range reaching the contradicted block is `none` as a whole.
+        let h = |fx: &str| -> Value {
+            let v: Value = serde_json::from_str(fx).unwrap();
+            v["result"]["block_header"].clone()
+        };
+        let body = json!({"jsonrpc":"2.0","id":0,"result":{"headers":[h(BLOCK0), h(BLOCK1)],"status":"OK","untrusted":true}}).to_string();
+        let p = json!({"start_height": 0, "end_height": 1});
+        let range = |chain: &HeaderChain| {
+            verify_jsonrpc("get_block_headers_range", Some(&p), body.as_bytes(), chain)
+        };
+        assert_eq!(range(&at_tip).unwrap(), Verified::at(Verify::None, 1));
+        assert!(range(&ten_down).is_err());
+
+        // By hash, the new block reported as main chain (`orphan_status:
+        // false`), as a node that has switched reports it.
+        let v = verify_jsonrpc(
+            "get_block_header_by_hash",
+            Some(&json!({"hash": fixture_hash(BLOCK1)})),
+            b1.as_bytes(),
+            &at_tip,
+        )
+        .unwrap();
+        assert_eq!(v, Verified::at(Verify::None, 1));
+        assert!(verify_jsonrpc(
+            "get_block_header_by_hash",
+            Some(&json!({"hash": fixture_hash(BLOCK1)})),
+            b1.as_bytes(),
+            &ten_down,
+        )
+        .is_err());
     }
 
     #[test]

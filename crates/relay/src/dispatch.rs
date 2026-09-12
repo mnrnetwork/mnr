@@ -1049,6 +1049,10 @@ mod tests {
         let bad = mock_with(block_server(true), Arc::clone(&hits)).await;
         let good = mock_with(block_server(false), Arc::clone(&hits)).await;
         let env = Env::new(pool_over(&[bad, good]));
+        // Deep enough that a wrong block is a lie, not a reorg in flight.
+        let held = env.chain.read().clone();
+        env.chain
+            .set_for_test(verify::deepen_for_test(held, TIP_SAFETY_DEPTH));
         let o = env.jsonrpc("get_block", json!({"height": 1})).await;
         assert_eq!(o.status, 200);
         assert_eq!(header(&o, "Mnr-Verify"), Some("chain"));
@@ -1073,6 +1077,48 @@ mod tests {
             )
             .await;
         assert_eq!(header(&o, "Mnr-Verify"), Some("chain"));
+    }
+
+    /// The 2026-09-11 incident replayed: our chain still holds the orphan
+    /// at the tip and three nodes serve the new block. Before the fix each
+    /// was faulted and the client got a 502; now the answer is served as
+    /// `none`, nobody is faulted, nothing is cached or credited.
+    #[tokio::test]
+    async fn reorg_in_flight_is_served_as_none_not_faulted() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut addrs = Vec::new();
+        for _ in 0..3 {
+            addrs.push(mock_with(block_server(false), Arc::clone(&hits)).await);
+        }
+        let env = Env::new(pool_over(&addrs));
+        let real = env.chain.read().clone();
+        let mut orphaned = HeaderChain::new();
+        orphaned.append(real.get(0).unwrap()).unwrap();
+        orphaned
+            .append(Entry {
+                hash: [0xbb; 32],
+                ..real.get(1).unwrap()
+            })
+            .unwrap();
+        env.chain.set_for_test(orphaned.clone());
+        for _ in 0..2 {
+            let o = env.jsonrpc("get_block", json!({"height": 1})).await;
+            assert_eq!(o.status, 200);
+            assert_eq!(header(&o, "Mnr-Verify"), Some("none"));
+            assert_eq!(header(&o, "Mnr-Cache"), Some("miss"));
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "one upstream per request");
+        let s = env.pool.status();
+        assert!(s.faults.is_empty(), "{:?}", s.faults);
+        assert!(s.upstreams.iter().all(|u| u.verified == 0 && u.faults == 0));
+        // The same disagreement ten records down is a lie: every node
+        // tried is faulted and the client gets the failed-verification 502.
+        env.chain
+            .set_for_test(verify::deepen_for_test(orphaned, TIP_SAFETY_DEPTH));
+        let o = env.jsonrpc("get_block", json!({"height": 1})).await;
+        assert_eq!(o.status, 502);
+        assert_eq!(header(&o, "Mnr-Verify"), Some("failed"));
+        assert_eq!(env.pool.status().faults.len(), 3);
     }
 
     #[tokio::test]

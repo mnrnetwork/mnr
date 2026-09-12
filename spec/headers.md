@@ -20,7 +20,7 @@ strongest to the weakest:
 | `majority` | Consensus state agreed by at least two of the upstreams asked (see `Mnr-Agreeing`). |
 | `agreement` | Identical answers from the number of upstreams the client's tier requires (see `Mnr-Agreeing`). |
 | `partial` | A batch (`/get_transactions`) in which some entries verified and some could not be (see `Mnr-Verified`). No entry failed. |
-| `none` | Not verifiable, or not verified: streams, mempool, degraded mode, a height the chain does not reach yet, a form that cannot be hashed. Served as the upstream sent it and never cached. |
+| `none` | Not verifiable, or not verified: streams, mempool, degraded mode, a height the chain does not reach yet, another block than the chain's within 10 of its tip (a reorg the chain has not caught up with), a form that cannot be hashed. Served as the upstream sent it and never cached. |
 | `failed` | Every upstream asked returned an answer that failed verification, or the upstreams could not agree. The body is an error, never one of the rejected answers. |
 
 Precedence when an answer satisfies more than one rule: `chain` over `hash` for
