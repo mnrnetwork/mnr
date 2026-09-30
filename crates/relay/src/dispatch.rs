@@ -462,7 +462,6 @@ pub(crate) async fn transactions(ctx: Ctx, req: Request, timeout: Duration) -> O
 
     let mut upstream_req = request.clone();
     upstream_req["txs_hashes"] = json!(misses);
-    let tip = ctx.pool.quorum().map(|q| q.height);
     let line = safety_line(&ctx.pool);
     let fetched = fetch_verified(
         &ctx.pool,
@@ -487,6 +486,10 @@ pub(crate) async fn transactions(ctx: Ctx, req: Request, timeout: Duration) -> O
             }
             let result: GetTransactionsResult = serde_json::from_value(raw)
                 .map_err(|_| Fault("answer is not a get_transactions result".into()))?;
+            // Read the tip here, not before the fetch: the answer is judged
+            // against the freshest quorum we hold rather than one that may
+            // have moved while the request was in flight.
+            let tip = ctx.pool.quorum().map(|q| q.height);
             let checks = verify::verify_transactions(&misses, &result, tip)?;
             Ok((result, checks))
         },

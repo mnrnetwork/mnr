@@ -479,18 +479,41 @@ pub enum TxCheck {
     Unverifiable,
 }
 
-/// How far above the quorum tip a confirmed height may be before it is a
-/// lie. The quorum tip lags a probe round (15 s) behind the network, and a
-/// node on the real tip answers honestly with the newest block's height;
-/// two blocks in one round happens, three is rare, more is a claim no honest
-/// node makes. Found in the beta: without slack, every node was faulted and
-/// ejected for telling the truth about the newest block.
-pub const TIP_SLACK: u64 = 3;
+/// Fault text for a failed transaction check.
+///
+/// [`VerifyError::AboveTip`] carries the bound it was handed, not the tip, so
+/// printing it verbatim overstates the tip by the whole allowance: the
+/// 2026-09-24 log read "above quorum tip 3769682" when the quorum tip was
+/// 3769679. Report the tip we actually hold and say what the allowance was.
+fn fault_detail(e: VerifyError, tip: Option<u64>) -> String {
+    match (&e, tip) {
+        (VerifyError::AboveTip { height, .. }, Some(t)) => {
+            format!("claimed height {height} is more than {TIP_SAFETY_DEPTH} above quorum tip {t}")
+        }
+        _ => e.to_string(),
+    }
+}
 
 /// Verify every entry of a `/get_transactions` answer against the request.
-/// `tip` is the quorum tip height; a confirmed height more than
-/// [`TIP_SLACK`] above it is a lie. Returns one verdict per entry, in answer
-/// order.
+///
+/// `tip` is the quorum tip height. Our view of it lags: the probe round is
+/// 15 s, and the quorum is the highest height `min_agree` nodes agree on, so
+/// it also trails however long they take to converge. A node picked because
+/// it was on the tip therefore answers honestly with heights above it.
+///
+/// So height alone is never a lie inside [`TIP_SAFETY_DEPTH`] — the same
+/// window the block, header and headers paths use since 0.1.18. What is
+/// checked regardless is the blob: every entry must still hash to the txid it
+/// claims. An entry that hashes correctly but sits above the tip is served
+/// unverified rather than faulted (our view is behind, nothing more); an entry
+/// that does not hash is a fault wherever it claims to be. Only beyond the
+/// window is the claimed height itself a lie.
+///
+/// Found on 2026-09-24, when a slack of 3 blocks faulted own-1, xmr-support and
+/// stackwallet in 506 ms for one transaction 4 above the tip, and answered the
+/// client 502 — the 2026-09-11 incident again, through the path 0.1.18 missed.
+///
+/// Returns one verdict per entry, in answer order.
 pub fn verify_transactions(
     requested: &[String],
     result: &GetTransactionsResult,
@@ -563,7 +586,7 @@ pub fn verify_transactions(
             out.push(TxCheck::Unverifiable);
             continue;
         };
-        let bound = tip.map_or(u64::MAX, |t| t.saturating_add(TIP_SLACK));
+        let bound = tip.map_or(u64::MAX, |t| t.saturating_add(TIP_SAFETY_DEPTH));
         let mut verdict = rules::verify_tx(form, txid, location, bound);
         // A coinbase (RingCT type Null) hashes with an all-zero prunable
         // hash, but monerod reports `prunable_hash` as the hash of nothing.
@@ -581,13 +604,19 @@ pub fn verify_transactions(
                 bound,
             );
         }
+        // The blob hashed correctly either way; the height decides whether we
+        // can claim it. Above our tip means our view is behind the node's, so
+        // the entry is served without a verified label rather than counted
+        // against the node. Nothing above the tip is cached or credited.
+        let above = matches!(location, TxLocation::Block(h) if tip.is_some_and(|t| h > t));
         match verdict {
+            Ok(TxVerdict::Verified) if above => out.push(TxCheck::Unverifiable),
             Ok(TxVerdict::Verified) => out.push(TxCheck::Verified {
                 // A confirmed entry always has a height here (see `location`).
                 height: e.block_height,
             }),
             Ok(TxVerdict::NotVerifiable) => out.push(TxCheck::Unverifiable),
-            Err(e) => return Err(Fault(e.to_string())),
+            Err(err) => return Err(Fault(fault_detail(err, tip))),
         }
     }
     if let Some(missed) = &result.missed_tx {
@@ -1104,15 +1133,25 @@ mod tests {
                 }
             )));
             assert_eq!(batch_label(&checks), (Verify::Hash, None));
-            // Within the slack the quorum lag allows: honest.
-            for lag in 1..=TIP_SLACK {
+            // Our view of the tip lags the network, so a height above it is
+            // our problem and not the node's: the entries are served without a
+            // verified label and nobody is faulted.
+            for lag in 1..=TIP_SAFETY_DEPTH {
+                let checks = verify_transactions(&requested, &r, Some(3_754_000 - lag))
+                    .unwrap_or_else(|e| panic!("tip {lag} behind: {}", e.0));
                 assert!(
-                    verify_transactions(&requested, &r, Some(3_754_000 - lag)).is_ok(),
+                    checks.iter().all(|c| matches!(c, TxCheck::Unverifiable)),
                     "tip {lag} behind"
                 );
+                assert_eq!(batch_label(&checks), (Verify::None, None));
             }
-            // Beyond it: a lie.
-            assert!(verify_transactions(&requested, &r, Some(3_754_000 - TIP_SLACK - 1)).is_err());
+            // Beyond the window the claimed height itself is a lie.
+            let f = verify_transactions(&requested, &r, Some(3_754_000 - TIP_SAFETY_DEPTH - 1))
+                .unwrap_err();
+            assert!(f.0.contains("above quorum tip"), "{}", f.0);
+            // ...and the tip it names is the one we hold, not the allowance.
+            let held = 3_754_000 - TIP_SAFETY_DEPTH - 1;
+            assert!(f.0.contains(&held.to_string()), "{}", f.0);
             // Not what was asked for.
             let other = vec!["00".repeat(32)];
             assert!(verify_transactions(&other, &r, Some(3_754_000)).is_err());
@@ -1177,6 +1216,48 @@ mod tests {
         hex_blob.replace_range(last.., if &hex_blob[last..] == "0" { "1" } else { "0" });
         bad.txs[0].pruned_as_hex = Some(hex_blob);
         assert!(verify_transactions(&requested, &bad, Some(3_756_163)).is_err());
+    }
+
+    /// The 2026-09-24 incident, and the lie the fix must still catch.
+    ///
+    /// A confirmed transaction a few blocks above the quorum tip is our view
+    /// lagging the node's, so it is served unverified and nobody is faulted.
+    /// The same distance with a blob that does not hash is still a fault:
+    /// relaxing the height check must not stop the blob being checked.
+    #[test]
+    fn tx_above_the_tip_is_unverified_but_a_bad_blob_is_still_a_fault() {
+        let r: GetTransactionsResult = serde_json::from_str(TXS_FULL).unwrap();
+        let requested: Vec<String> = r.txs.iter().map(|t| t.tx_hash.clone()).collect();
+        // Four above the tip: exactly the gap seen on 2026-09-24.
+        let tip = 3_754_000 - 4;
+        let checks = verify_transactions(&requested, &r, Some(tip)).unwrap();
+        assert!(checks.iter().all(|c| matches!(c, TxCheck::Unverifiable)));
+        assert_eq!(batch_label(&checks), (Verify::None, None));
+
+        // Same height, one tampered signature: the blob is hashed either way,
+        // so this is a fault and not a free pass.
+        let mut bad: GetTransactionsResult = serde_json::from_str(TXS_FULL).unwrap();
+        let mut hex_blob = bad.txs[1].as_hex.clone();
+        let last = hex_blob.len() - 1;
+        hex_blob.replace_range(last.., if &hex_blob[last..] == "0" { "1" } else { "0" });
+        bad.txs[1].as_hex = hex_blob.clone();
+        bad.txs_as_hex[1] = hex_blob;
+        let f = verify_transactions(&requested, &bad, Some(tip)).unwrap_err();
+        assert!(f.0.contains("hash mismatch"), "{}", f.0);
+    }
+
+    /// One young entry among settled ones: the batch is partial, not none,
+    /// and not a fault.
+    #[test]
+    fn a_young_entry_makes_the_batch_partial() {
+        let mut r: GetTransactionsResult = serde_json::from_str(TXS_FULL).unwrap();
+        let requested: Vec<String> = r.txs.iter().map(|t| t.tx_hash.clone()).collect();
+        let n = r.txs.len();
+        assert!(n > 1, "fixture needs more than one entry");
+        r.txs[0].block_height = Some(3_754_004);
+        let checks = verify_transactions(&requested, &r, Some(3_754_000)).unwrap();
+        assert!(matches!(checks[0], TxCheck::Unverifiable));
+        assert_eq!(batch_label(&checks), (Verify::Partial, Some((n - 1, n))));
     }
 
     #[test]

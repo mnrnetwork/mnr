@@ -75,10 +75,18 @@ parallel arrays a wallet may read instead of the entries (`txs_as_hex`,
 `txs_as_json`) must have one element per entry carrying the same bytes as
 `txs[i].as_hex` / `txs[i].as_json`. For each entry the blob is hashed and must
 equal `tx_hash`: the full form from `as_hex`,
-or the pruned form from `pruned_as_hex` plus `prunable_hash`. A confirmed entry
-must not claim a height more than three blocks above the quorum tip (the
-quorum lags a probe round, so a node on the real tip is honestly one or two
-blocks ahead of it). An entry with no hashable form
+or the pruned form from `pruned_as_hex` plus `prunable_hash`. The height is
+then read the same way as near the tip above: our quorum tip lags the network
+by a probe round plus however long `min_agree` nodes take to agree, so a node
+picked because it was on the tip answers honestly with heights above it. A
+confirmed entry whose blob hashes correctly but whose height is above the
+quorum tip is served as `none` (never cached, not counted as verified, not a
+fault) while it is within `TIP_SAFETY_DEPTH` (10); beyond that the height is a
+lie and a fault. The blob is hashed either way, so a bad blob is a fault at any
+height. Found in production on 2026-09-24: a transaction four blocks above the
+quorum tip faulted three honest nodes in 506 ms and answered the client 502,
+the 2026-09-11 incident again through the transaction path. An entry with no
+hashable form
 (a pruned v1 transaction) is *unverifiable*, not a fault. A mempool entry
 (`in_pool: true`) carries no `block_height`, `confirmations` or
 `output_indices` at all (monerod serialises those only for confirmed
