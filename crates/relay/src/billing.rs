@@ -304,6 +304,26 @@ impl Billing {
         Ok((address, index))
     }
 
+    /// Whether `address` is still subaddress `index` of account 0 in the
+    /// wallet we run now. After a wallet replacement an old invoice's
+    /// subaddress belongs to the retired wallet: a renewal sent there would
+    /// be paid where this wallet cannot see it.
+    async fn owns_subaddress(&self, address: &str, index: u32) -> bool {
+        match self
+            .wallet_call("get_address_index", json!({"address": address}))
+            .await
+        {
+            Ok(r) => {
+                r["index"]["major"].as_u64() == Some(0)
+                    && r["index"]["minor"].as_u64() == Some(u64::from(index))
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "previous subaddress not reusable; issuing a new one");
+                false
+            }
+        }
+    }
+
     /// Atomic units received on `subaddr_index` with enough confirmations,
     /// counting only transfers from around the invoice's creation on, and
     /// the highest confirmation count seen (for the status page).
@@ -570,6 +590,10 @@ impl Billing {
                     .purchase_invoice_for(&h, |id| token_hash(&self.derived_token(id)))
             })
         });
+        let previous = match previous {
+            Some(p) if self.owns_subaddress(&p.address, p.subaddr_index).await => Some(p),
+            _ => None,
+        };
         let (address, subaddr_index) = match previous {
             Some(p) => (p.address, p.subaddr_index),
             None => self.new_subaddress(&id).await.map_err(|e| {
@@ -942,6 +966,9 @@ mod tests {
         /// `(minor index, amount, confirmations, timestamp)` transfers.
         transfers: Mutex<Vec<(u64, u64, u64, u64)>>,
         calls: AtomicU64,
+        /// Subaddresses below this index are not this wallet's: a wallet
+        /// replaced since they were handed out.
+        retired_below: AtomicU64,
     }
 
     async fn wallet(w: Arc<Wallet>) -> String {
@@ -952,6 +979,21 @@ mod tests {
                 async move {
                     w.calls.fetch_add(1, Ordering::SeqCst);
                     let result = match req["method"].as_str().unwrap() {
+                        "get_address_index" => {
+                            let a = req["params"]["address"].as_str().unwrap();
+                            let i = a.strip_prefix("8sub").and_then(|n| n.parse::<u64>().ok());
+                            match i {
+                                Some(i)
+                                    if i < w.next_index.load(Ordering::SeqCst)
+                                        && i >= w.retired_below.load(Ordering::SeqCst) =>
+                                {
+                                    json!({"index": {"major": 0, "minor": i}})
+                                }
+                                _ => {
+                                    return Json(json!({"id": "0", "jsonrpc": "2.0", "error": {"code": -2, "message": "Address doesn't belong to the wallet"}}));
+                                }
+                            }
+                        }
                         "create_address" => {
                             let i = w.next_index.fetch_add(1, Ordering::SeqCst);
                             json!({"address": format!("8sub{i}"), "address_index": i})
@@ -1061,6 +1103,7 @@ mod tests {
             next_index: AtomicU64::new(1),
             transfers: Mutex::new(Vec::new()),
             calls: AtomicU64::new(0),
+            retired_below: AtomicU64::new(0),
         });
         let url = wallet(Arc::clone(&w)).await;
         let b = Billing::new(cfg(Some(url), dir.path()), Arc::clone(&store), None).unwrap();
@@ -1162,18 +1205,24 @@ mod tests {
         assert!(s.get("token").is_none(), "a renewal reveals nothing");
         let extended = store.valid_until(&token_hash(&token)).unwrap().unwrap();
         assert!(extended >= until + MONTH_SECS - 5, "{extended} vs {until}");
-        // Once paid, another renewal is allowed again.
-        assert!(b
+        // The wallet is replaced (2026-10-17): the old subaddress is not
+        // this wallet's any more, so the next renewal gets a fresh one rather
+        // than an address only the retired wallet can see.
+        w.retired_below
+            .store(w.next_index.load(Ordering::SeqCst), Ordering::SeqCst);
+        let v = b
             .create_invoice(
                 &h,
                 peer(),
                 InvoiceRequest {
                     months: Some(1),
-                    renew: Some(token.clone())
-                }
+                    renew: Some(token.clone()),
+                },
             )
             .await
-            .is_ok());
+            .unwrap();
+        assert_eq!(v["address"], "8sub2", "a subaddress of the current wallet");
+        assert_eq!(v["renewal"], true);
     }
 
     #[tokio::test]
@@ -1184,6 +1233,7 @@ mod tests {
             next_index: AtomicU64::new(1),
             transfers: Mutex::new(Vec::new()),
             calls: AtomicU64::new(0),
+            retired_below: AtomicU64::new(0),
         });
         let url = wallet(Arc::clone(&w)).await;
         let mut c = cfg(Some(url), dir.path());
@@ -1265,6 +1315,7 @@ mod tests {
             next_index: AtomicU64::new(1),
             transfers: Mutex::new(Vec::new()),
             calls: AtomicU64::new(0),
+            retired_below: AtomicU64::new(0),
         });
         let url = wallet(Arc::clone(&w)).await;
         let b = Billing::new(cfg(Some(url), dir.path()), Arc::clone(&store), None).unwrap();
@@ -1325,6 +1376,7 @@ mod tests {
             next_index: AtomicU64::new(1),
             transfers: Mutex::new(Vec::new()),
             calls: AtomicU64::new(0),
+            retired_below: AtomicU64::new(0),
         });
         let url = wallet(Arc::clone(&w)).await;
         let b = Billing::new(cfg(Some(url), dir.path()), Arc::clone(&store), None).unwrap();
@@ -1383,6 +1435,7 @@ mod tests {
             next_index: AtomicU64::new(1),
             transfers: Mutex::new(Vec::new()),
             calls: AtomicU64::new(0),
+            retired_below: AtomicU64::new(0),
         });
         let url = wallet(Arc::clone(&w)).await;
         let mut c = cfg(Some(url), dir.path());
@@ -1520,6 +1573,7 @@ mod tests {
             next_index: AtomicU64::new(1),
             transfers: Mutex::new(Vec::new()),
             calls: AtomicU64::new(0),
+            retired_below: AtomicU64::new(0),
         });
         let url = wallet(Arc::clone(&w)).await;
         let mut c = cfg(Some(url), dir.path());
