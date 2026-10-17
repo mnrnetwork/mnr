@@ -150,7 +150,12 @@ async fn main() {
     pool.probe_all().await;
     tokio::spawn(Arc::clone(&pool).run_prober());
     tokio::spawn(Arc::clone(&pool).run_opt_out_checker());
-    tokio::spawn(Arc::clone(&chain).run_sync(Arc::clone(&pool), cfg.chain.batch));
+    // The header-chain sync is our own load, owned node first: counted as
+    // internal so it cannot push the external owned share over the gate.
+    tokio::spawn(mnr_relay::attribution::scope(
+        true,
+        Arc::clone(&chain).run_sync(Arc::clone(&pool), cfg.chain.batch),
+    ));
 
     let cache = Arc::new(Cache::new(cfg.cache.max_bytes));
     let metrics = Arc::new(Metrics::new());

@@ -13,7 +13,8 @@
 //! - `mnr_wu_charged_total{tier}` — work units charged
 //! - `mnr_upstream_requests_total{upstream}`, `mnr_upstream_stream_bytes_total{upstream}`,
 //!   `mnr_upstream_wu_total{upstream}` (the load figure: RPC calls less probes plus 20 per
-//!   MB streamed; its owned/public split is a Stage 1 gate), `mnr_upstream_verified_total{upstream}`,
+//!   MB streamed; its owned/public split is a Stage 1 gate), `mnr_upstream_wu_internal_total{upstream}`
+//!   (the part of it that was ours, [`crate::attribution`]), `mnr_upstream_verified_total{upstream}`,
 //!   `mnr_upstream_faults_total{upstream}`, `mnr_upstream_rtt_ms{upstream}`,
 //!   `mnr_upstream_healthy{upstream}`, `mnr_upstream_on_tip{upstream}`
 //! - `mnr_quorum_height`, `mnr_degraded`, `mnr_chain_height`,
@@ -122,6 +123,7 @@ impl Metrics {
             ("mnr_upstream_requests_total", "counter"),
             ("mnr_upstream_stream_bytes_total", "counter"),
             ("mnr_upstream_wu_total", "counter"),
+            ("mnr_upstream_wu_internal_total", "counter"),
             ("mnr_upstream_rate_millirps_15m", "gauge"),
             ("mnr_upstream_verified_total", "counter"),
             ("mnr_upstream_faults_total", "counter"),
@@ -139,6 +141,7 @@ impl Metrics {
                     "mnr_upstream_requests_total" => u.requests,
                     "mnr_upstream_stream_bytes_total" => u.stream_bytes,
                     "mnr_upstream_wu_total" => u.wu,
+                    "mnr_upstream_wu_internal_total" => u.wu_internal,
                     "mnr_upstream_rate_millirps_15m" => {
                         u.rate_15m.map_or(0, |r| (r * 1000.0).round() as u64)
                     }
@@ -322,6 +325,7 @@ mod tests {
         has("mnr_upstream_verified_total{upstream=\"own\"} 2");
         has("mnr_upstream_stream_bytes_total{upstream=\"own\"} 0");
         has("mnr_upstream_wu_total{upstream=\"own\"} 0");
+        has("mnr_upstream_wu_internal_total{upstream=\"own\"} 0");
         has("mnr_upstream_rate_millirps_15m{upstream=\"own\"} 0");
         has("mnr_chain_disagreements_total 0");
         has("mnr_upstream_faults_total{upstream=\"own\"} 1");

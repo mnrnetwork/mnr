@@ -3,6 +3,7 @@ listen = "127.0.0.1:18089"            # Caddy terminates TLS in front
 # tor_socks = "127.0.0.1:9050"        # enable when onion upstreams are added (plan §10 item 5)
 
 opt_out = {{ mnr_opt_out | default([]) | to_json }}
+internal_tokens = {{ mnr_internal_tokens | default([]) | to_json }}
 
 [probe]
 interval_secs = 15

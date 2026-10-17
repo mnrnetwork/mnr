@@ -87,3 +87,11 @@ and prints the version the relay reports on its own feed. Copy the script
 to the box once (`scp deploy/update.sh <box>:/usr/local/sbin/`); it needs
 `curl` and `jq`, both installed by the `common` role. `mnr-relay faults clear`
 still needs its own restart afterwards, as before.
+
+**Config keys and rollback.** The config refuses unknown keys, so a key
+added in a release must go into `/etc/mnr/relay.toml` only after that
+release is running, and must come out before `--rollback` to an older one,
+or the relay will not start. Current case: `internal_tokens` (0.1.20) —
+upgrade, then add the key and restart; to roll back past 0.1.20, delete
+the line first. The template writes it always, so the playbook needs a
+binary of 0.1.20 or later.

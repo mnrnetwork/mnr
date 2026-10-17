@@ -256,7 +256,10 @@ async fn rpc(
         body,
         tier: principal.tier,
     };
-    let outcome = dispatch::dispatch(ctx, policy, request).await;
+    // Whose load this request's upstream calls are (the Stage 1 gate).
+    let internal = app.pool.is_internal(&principal.handle);
+    let outcome =
+        crate::attribution::scope(internal, dispatch::dispatch(ctx, policy, request)).await;
     if outcome.extra_wu > 0 {
         app.limiter.charge(&principal, outcome.extra_wu);
     }

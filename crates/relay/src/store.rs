@@ -34,7 +34,7 @@ use crate::upstream::{FaultEvent, OptOutEvent};
 /// Seconds the previous token stays valid after a rotation (gateway plan §3.1).
 const GRACE_SECS: u64 = 24 * 3600;
 /// Schema version, stored in `PRAGMA user_version`.
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 /// How often the relay re-reads the token table to pick up CLI changes.
 const TOKEN_RELOAD_EVERY: Duration = Duration::from_secs(30);
 
@@ -63,7 +63,9 @@ CREATE TABLE IF NOT EXISTS upstream_stats(
   ejected_until INTEGER,
   probes INTEGER NOT NULL DEFAULT 0,
   up INTEGER NOT NULL DEFAULT 0,
-  stream_bytes INTEGER NOT NULL DEFAULT 0
+  stream_bytes INTEGER NOT NULL DEFAULT 0,
+  requests_internal INTEGER NOT NULL DEFAULT 0,
+  stream_bytes_internal INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS fault_log(
   id INTEGER PRIMARY KEY,
@@ -160,6 +162,10 @@ pub struct UpstreamStats {
     pub requests: u64,
     /// Bytes pulled by block streams (lifetime), for the load figure.
     pub stream_bytes: u64,
+    /// The internal part of `requests` and `stream_bytes`
+    /// ([`crate::attribution`]).
+    pub requests_internal: u64,
+    pub stream_bytes_internal: u64,
     pub verified: u64,
     pub faults: u64,
     /// Probe rounds seen and rounds found answering on the tip (lifetime).
@@ -634,10 +640,15 @@ impl SqliteStore {
     pub fn load_upstream_stats(&self) -> HashMap<String, UpstreamStats> {
         let conn = self.conn.lock();
         let mut stmt = match conn
-            .prepare("SELECT name, requests, verified, faults, ejected_until, probes, up, stream_bytes FROM upstream_stats")
+            .prepare("SELECT name, requests, verified, faults, ejected_until, probes, up, stream_bytes, requests_internal, stream_bytes_internal FROM upstream_stats")
         {
             Ok(s) => s,
-            Err(_) => return HashMap::new(),
+            // Loud: an empty map silently restarts every public counter
+            // from zero (a missed migration would look exactly like this).
+            Err(e) => {
+                tracing::error!("cannot load upstream stats, counters restart from zero: {e}");
+                return HashMap::new();
+            }
         };
         stmt.query_map([], |r| {
             Ok((
@@ -650,6 +661,8 @@ impl SqliteStore {
                     probes: r.get::<_, i64>(5)? as u64,
                     up: r.get::<_, i64>(6)? as u64,
                     stream_bytes: r.get::<_, i64>(7)? as u64,
+                    requests_internal: r.get::<_, i64>(8)? as u64,
+                    stream_bytes_internal: r.get::<_, i64>(9)? as u64,
                 },
             ))
         })
@@ -661,11 +674,14 @@ impl SqliteStore {
         let conn = self.conn.lock();
         for (name, st) in stats {
             conn.execute(
-                "INSERT INTO upstream_stats (name, requests, verified, faults, ejected_until, probes, up, stream_bytes)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "INSERT INTO upstream_stats (name, requests, verified, faults, ejected_until, probes, up, stream_bytes,
+                   requests_internal, stream_bytes_internal)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                  ON CONFLICT(name) DO UPDATE SET requests = excluded.requests, verified = excluded.verified,
                    faults = excluded.faults, ejected_until = excluded.ejected_until,
-                   probes = excluded.probes, up = excluded.up, stream_bytes = excluded.stream_bytes",
+                   probes = excluded.probes, up = excluded.up, stream_bytes = excluded.stream_bytes,
+                   requests_internal = excluded.requests_internal,
+                   stream_bytes_internal = excluded.stream_bytes_internal",
                 params![
                     name,
                     st.requests as i64,
@@ -674,7 +690,9 @@ impl SqliteStore {
                     st.ejected_until.map(|v| v as i64),
                     st.probes as i64,
                     st.up as i64,
-                    st.stream_bytes as i64
+                    st.stream_bytes as i64,
+                    st.requests_internal as i64,
+                    st.stream_bytes_internal as i64
                 ],
             )
             .map_err(|e| e.to_string())?;
@@ -1296,7 +1314,11 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
             4 => &["stream_bytes"],
             _ => &[],
         };
-        for col in added {
+        // v8: the internal share of the load, on every older table (a v1/v2
+        // database got the full table from SCHEMA, and the ALTER is a no-op
+        // error there).
+        let internal: &[&str] = &["requests_internal", "stream_bytes_internal"];
+        for col in added.iter().chain(internal) {
             let _ = conn.execute(
                 &format!("ALTER TABLE upstream_stats ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0"),
                 [],
@@ -1492,7 +1514,7 @@ mod tests {
                     probes: 100,
                     up: 97,
                     ejected_until: Some(u64::MAX),
-                    stream_bytes: 0,
+                    ..UpstreamStats::default()
                 },
             )])
             .unwrap();
@@ -1532,12 +1554,11 @@ mod tests {
             got["own-1"],
             UpstreamStats {
                 requests: 500,
-                stream_bytes: 0,
                 verified: 200,
                 faults: 1,
                 probes: 400,
                 up: 399,
-                ejected_until: None,
+                ..UpstreamStats::default()
             }
         );
         store
@@ -1550,6 +1571,48 @@ mod tests {
             )])
             .unwrap();
         assert_eq!(store.load_upstream_stats()["own-1"].stream_bytes, 3_000_000);
+    }
+
+    #[test]
+    fn schema_v7_database_gains_the_internal_load_columns_and_keeps_its_stats() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v7.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE upstream_stats(name TEXT PRIMARY KEY, requests INTEGER NOT NULL, verified INTEGER NOT NULL, faults INTEGER NOT NULL, ejected_until INTEGER, probes INTEGER NOT NULL DEFAULT 0, up INTEGER NOT NULL DEFAULT 0, stream_bytes INTEGER NOT NULL DEFAULT 0);
+                 INSERT INTO upstream_stats VALUES ('own-1', 500, 200, 1, NULL, 400, 399, 7000000);
+                 PRAGMA user_version = 7;",
+            )
+            .unwrap();
+        }
+        let store = SqliteStore::open(Some(&path)).unwrap();
+        let got = store.load_upstream_stats()["own-1"];
+        assert_eq!(
+            (
+                got.requests,
+                got.stream_bytes,
+                got.requests_internal,
+                got.stream_bytes_internal
+            ),
+            (500, 7_000_000, 0, 0)
+        );
+        store
+            .save_upstream_stats(&[(
+                "own-1".into(),
+                UpstreamStats {
+                    requests_internal: 120,
+                    stream_bytes_internal: 2_000_000,
+                    ..got
+                },
+            )])
+            .unwrap();
+        let back = store.load_upstream_stats()["own-1"];
+        assert_eq!(
+            (back.requests_internal, back.stream_bytes_internal),
+            (120, 2_000_000)
+        );
+        assert_eq!(back.requests, 500);
     }
 
     #[test]

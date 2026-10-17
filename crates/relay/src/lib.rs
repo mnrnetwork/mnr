@@ -18,6 +18,7 @@
 #![forbid(unsafe_code)]
 
 pub mod agreement;
+pub mod attribution;
 pub mod auth;
 pub mod billing;
 pub mod cache;

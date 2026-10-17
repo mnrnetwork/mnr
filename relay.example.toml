@@ -15,6 +15,13 @@ listen = "127.0.0.1:18089"          # TLS is terminated in front of this
 # and logs an error asking for it to be added here.
 opt_out = []
 
+# 8-hex handles (never tokens) of our own tokens: sync tests, tokens we run
+# for partners. Their upstream load is counted as `wu_internal` in the feed,
+# along with the header-chain sync, so the Stage 1 gate (plan §9) can read
+# external load only. A rotated token changes handle; keep both listed
+# through the 24 h grace. Needs relay >= 0.1.20: older relays refuse the key.
+internal_tokens = []
+
 # Not configurable, stated for the record (rule 3): a read queues up to
 # 250 ms for a light-call token on the best-ranked public upstream (1 s on
 # the owned node) before trying the next one; streams are paced to `mbps`

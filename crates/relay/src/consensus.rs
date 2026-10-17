@@ -82,12 +82,15 @@ pub async fn swr(ctx: Ctx, req: Request, timeout: Duration) -> Outcome {
                     key.clone(),
                     plan.clone(),
                 );
-                tokio::spawn(async move {
+                // The refresh is this request's load: carry its attribution
+                // across the spawn, which does not inherit task-locals.
+                let internal = crate::attribution::internal();
+                tokio::spawn(crate::attribution::scope(internal, async move {
                     if let Ok(e) = fetch(&pool, &chain, &plan).await {
                         cache.swr_put(key.clone(), e).await;
                     }
                     cache.end_refresh(&key);
-                });
+                }));
             }
             (existing.expect("checked"), Status::Stale)
         }

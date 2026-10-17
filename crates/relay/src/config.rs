@@ -69,6 +69,12 @@ pub struct Config {
     /// listed here is refused at load.
     #[serde(default)]
     pub opt_out: Vec<String>,
+    /// 8-hex handles of our own tokens (sync tests, partner tokens we run),
+    /// never tokens. Their upstream load is counted apart so the Stage 1
+    /// gate (plan §9) reads external load only. A rotated token changes
+    /// handle: keep the old and the new one listed through the 24 h grace.
+    #[serde(default)]
+    pub internal_tokens: Vec<String>,
     pub upstreams: Vec<UpstreamConfig>,
 }
 
@@ -489,6 +495,17 @@ impl Config {
             if !ua.starts_with("mnr-relay/") || !ua.contains(UA_LINK) {
                 return invalid(format!(
                     "user_agent must start with `mnr-relay/` and contain `{UA_LINK}` (rule 4)"
+                ));
+            }
+        }
+        for h in &self.internal_tokens {
+            if h.len() != 8
+                || !h
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            {
+                return invalid(format!(
+                    "internal_tokens: `{h}` is not an 8-character lowercase hex handle"
                 ));
             }
         }

@@ -186,6 +186,11 @@ pub struct Upstream {
     /// not the client received them: the heavy half of the load figure.
     /// Shared with the stream wrapper that counts the chunks as they pass.
     pub stream_bytes: Arc<AtomicU64>,
+    /// The part of `requests` and `stream_bytes` that was ours: sent while
+    /// serving an internal token or the relay's own housekeeping
+    /// ([`crate::attribution`]). The Stage 1 gate reads the rest.
+    pub requests_internal: AtomicU64,
+    pub stream_bytes_internal: Arc<AtomicU64>,
     /// `(unix, requests − probes)` sampled every probe round, kept for
     /// `RATE_WINDOW`: the public request-rate figure (rule 1).
     rate_samples: Mutex<VecDeque<(u64, u64)>>,
@@ -287,6 +292,8 @@ pub struct Pool {
     /// Hosts the operator listed under `opt_out` (refused at load); shown
     /// in the public list alongside the runtime ones.
     config_opt_outs: Vec<String>,
+    /// Handles whose load is ours (`internal_tokens`).
+    internal_tokens: std::collections::HashSet<String>,
     started_unix: u64,
     min_agree: usize,
     interval: Duration,
@@ -327,6 +334,9 @@ pub struct UpstreamStatus {
     /// relay's own work-unit rule. The owned/public split of this figure is
     /// a Stage 1 gate (plan §9).
     pub wu: u64,
+    /// The part of `wu` that was ours (internal tokens and the header-chain
+    /// sync, [`crate::attribution`]); `wu - wu_internal` is external load.
+    pub wu_internal: u64,
     pub verified: u64,
     pub faults: u64,
     /// Share of probe rounds in the last 24 h that found the node answering
@@ -350,6 +360,10 @@ pub struct PoolStatus {
     pub faults: Vec<FaultEvent>,
     /// Hosts that published the opt-out signal since this process started.
     pub opt_outs: Vec<OptOutEvent>,
+    /// True when `internal_tokens` is configured, i.e. `wu_internal` means
+    /// something. Without it every `wu_internal` is housekeeping only and a
+    /// reader must not call the remainder external.
+    pub wu_attribution: bool,
 }
 
 /// The load one upstream carried, in the relay's work units: one per RPC
@@ -396,6 +410,8 @@ impl Pool {
                     timeout,
                     requests: AtomicU64::new(0),
                     stream_bytes: Arc::new(AtomicU64::new(0)),
+                    requests_internal: AtomicU64::new(0),
+                    stream_bytes_internal: Arc::new(AtomicU64::new(0)),
                     rate_samples: Mutex::new(VecDeque::new()),
                     verified: AtomicU64::new(0),
                     faults: AtomicU64::new(0),
@@ -422,6 +438,7 @@ impl Pool {
                     .collect(),
             ),
             config_opt_outs: cfg.opt_out.clone(),
+            internal_tokens: cfg.internal_tokens.iter().cloned().collect(),
             started_unix: unix_now(),
             min_agree: cfg.probe.min_agree,
             interval: Duration::from_secs(cfg.probe.interval_secs),
@@ -443,6 +460,10 @@ impl Pool {
                 if let Some(st) = saved.get(&u.cfg.name) {
                     u.requests.store(st.requests, Ordering::Relaxed);
                     u.stream_bytes.store(st.stream_bytes, Ordering::Relaxed);
+                    u.requests_internal
+                        .store(st.requests_internal, Ordering::Relaxed);
+                    u.stream_bytes_internal
+                        .store(st.stream_bytes_internal, Ordering::Relaxed);
                     u.verified.store(st.verified, Ordering::Relaxed);
                     u.faults.store(st.faults, Ordering::Relaxed);
                     u.probes.store(st.probes, Ordering::Relaxed);
@@ -486,6 +507,8 @@ impl Pool {
                     UpstreamStats {
                         requests: u.requests.load(Ordering::Relaxed),
                         stream_bytes: u.stream_bytes.load(Ordering::Relaxed),
+                        requests_internal: u.requests_internal.load(Ordering::Relaxed),
+                        stream_bytes_internal: u.stream_bytes_internal.load(Ordering::Relaxed),
                         verified: u.verified.load(Ordering::Relaxed),
                         faults: u.faults.load(Ordering::Relaxed),
                         probes: u.probes.load(Ordering::Relaxed),
@@ -793,6 +816,11 @@ impl Pool {
                         u.probes.load(Ordering::Relaxed),
                         u.stream_bytes.load(Ordering::Relaxed),
                     ),
+                    wu_internal: work_units(
+                        u.requests_internal.load(Ordering::Relaxed),
+                        0,
+                        u.stream_bytes_internal.load(Ordering::Relaxed),
+                    ),
                     verified: u.verified.load(Ordering::Relaxed),
                     faults: u.faults.load(Ordering::Relaxed),
                     up_24h: {
@@ -818,7 +846,13 @@ impl Pool {
             upstreams,
             faults: self.faults.read().iter().cloned().collect(),
             opt_outs: self.opt_outs.read().clone(),
+            wu_attribution: !self.internal_tokens.is_empty(),
         }
+    }
+
+    /// Whether a token's upstream load is ours (`internal_tokens`).
+    pub fn is_internal(&self, handle: &str) -> bool {
+        self.internal_tokens.contains(handle)
     }
 
     /// Rule 5, forever: read every host's opt-out signal now, then daily.
@@ -949,6 +983,16 @@ impl Upstream {
         Some(c1.saturating_sub(c0) as f64 / (t1 - t0) as f64)
     }
 
+    /// Count one RPC call sent, and say whether it was ours.
+    fn count_request(&self) -> bool {
+        self.requests.fetch_add(1, Ordering::Relaxed);
+        let internal = crate::attribution::internal();
+        if internal {
+            self.requests_internal.fetch_add(1, Ordering::Relaxed);
+        }
+        internal
+    }
+
     /// Forward a client body to `path` on this upstream.
     ///
     /// Rule 6: the request is rebuilt from scratch. Only the body, its
@@ -962,7 +1006,7 @@ impl Upstream {
         body: Bytes,
         timeout: Duration,
     ) -> Result<Forwarded, ForwardError> {
-        self.requests.fetch_add(1, Ordering::Relaxed);
+        self.count_request();
         let url = format!("{}{}", self.cfg.url.trim_end_matches('/'), path);
         let resp = self
             .client
@@ -1015,7 +1059,9 @@ impl Upstream {
         timeout: Duration,
         slot: OwnedSemaphorePermit,
     ) -> Result<Streamed, ForwardError> {
-        self.requests.fetch_add(1, Ordering::Relaxed);
+        // Captured here: the body is polled by hyper after the request's
+        // attribution scope has ended.
+        let internal = self.count_request();
         let url = format!("{}{}", self.cfg.url.trim_end_matches('/'), path);
         let send = self
             .client
@@ -1046,6 +1092,7 @@ impl Upstream {
                 Arc::clone(&self.bandwidth),
                 slot,
                 Arc::clone(&self.stream_bytes),
+                internal.then(|| Arc::clone(&self.stream_bytes_internal)),
             ),
         })
     }
@@ -1629,6 +1676,88 @@ transport = "onion"
         assert!(u.try_take_stream().is_some());
     }
 
+    #[tokio::test]
+    async fn load_sent_inside_an_internal_scope_is_counted_as_ours() {
+        use futures_util::StreamExt;
+        let app = axum::Router::new()
+            .route("/json_rpc", axum::routing::post(|| async { "{}" }))
+            .route(
+                "/get_blocks.bin",
+                axum::routing::post(|| async { vec![7u8; 2_000_000] }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let cfg = Config::parse(&format!(
+            r#"
+internal_tokens = ["0a1b2c3d"]
+[probe]
+min_agree = 1
+[[upstreams]]
+name = "own"
+url = "http://{addr}"
+kind = "owned"
+transport = "http"
+"#
+        ))
+        .unwrap();
+        let p = Pool::from_config(&cfg).unwrap();
+        assert!(p.is_internal("0a1b2c3d") && !p.is_internal("ffffffff"));
+        assert!(p.status().wu_attribution);
+        let u = p.upstream(0);
+        let t = Duration::from_secs(5);
+        let call = || u.forward("/json_rpc", "application/json", Bytes::new(), t);
+        call().await.unwrap();
+        crate::attribution::scope(true, call()).await.unwrap();
+        crate::attribution::scope(false, call()).await.unwrap();
+        // A stream opened inside the scope and drained after it has ended,
+        // as hyper does: its bytes are still ours.
+        let slot = Arc::clone(&u.streams).acquire_owned().await.unwrap();
+        let s = crate::attribution::scope(
+            true,
+            u.forward_stream(
+                "/get_blocks.bin",
+                "application/octet-stream",
+                Bytes::new(),
+                t,
+                slot,
+            ),
+        )
+        .await
+        .unwrap();
+        let mut body = s.body;
+        while let Some(chunk) = body.next().await {
+            chunk.unwrap();
+        }
+        let st = &p.status().upstreams[0];
+        assert_eq!(st.requests, 4);
+        // Two calls ours (one light, one stream) plus 2 MB at 20 WU/MB.
+        assert_eq!(st.wu_internal, 2 + 40);
+        assert_eq!(st.wu, 4 + 40);
+    }
+
+    #[test]
+    fn attribution_is_off_without_internal_tokens_and_handles_are_checked() {
+        assert!(!pool().status().wu_attribution);
+        let bad = Config::parse(
+            r#"
+internal_tokens = ["0A1B2C3D"]
+[probe]
+min_agree = 1
+[[upstreams]]
+name = "own"
+url = "http://10.0.0.2:18081"
+kind = "owned"
+transport = "http"
+"#,
+        );
+        let err = format!("{:?}", bad.unwrap_err());
+        assert!(
+            err.contains("internal_tokens"),
+            "uppercase is not a handle: {err}"
+        );
+    }
+
     #[test]
     fn public_numbers_survive_a_restart() {
         let dir = tempfile::tempdir().unwrap();
@@ -1646,6 +1775,9 @@ transport = "onion"
         );
         p.attach_store(Arc::clone(&store));
         p.upstream(1).requests.fetch_add(40, Ordering::Relaxed);
+        p.upstream(1)
+            .requests_internal
+            .fetch_add(7, Ordering::Relaxed);
         p.record_verified(1);
         p.record_verified(1);
         for _ in 0..3 {
@@ -1674,6 +1806,7 @@ transport = "onion"
         again.attach_store(store);
         let s = again.status();
         assert_eq!(s.upstreams[1].requests, 40);
+        assert_eq!(s.upstreams[1].wu_internal, 7);
         assert_eq!(s.upstreams[1].verified, 2);
         assert_eq!(s.upstreams[2].faults, 3);
         assert!(s.upstreams[2].ejected, "the ejection is still in force");
