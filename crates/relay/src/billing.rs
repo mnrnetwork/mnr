@@ -36,7 +36,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -106,6 +106,9 @@ pub struct Billing {
     /// Held across the whole issuance decision, so two requests from one
     /// client cannot both see an unspent window and mint a token.
     free_gate: Mutex<()>,
+    /// Ceiling on remembered clients. Filled only at issuance; refusing (never
+    /// evicting) is deliberate, since eviction forgets usage.
+    free_client_cap: AtomicUsize,
     /// Activations taken back because the payment vanished before settling.
     takebacks: AtomicU64,
 }
@@ -189,6 +192,7 @@ impl Billing {
             free_today: Mutex::new((0, 0)),
             free_issued: Mutex::new(HashMap::new()),
             free_gate: Mutex::new(()),
+            free_client_cap: AtomicUsize::new(MAX_FREE_CLIENTS),
             takebacks: AtomicU64::new(0),
         })
     }
@@ -257,42 +261,48 @@ impl Billing {
         Ok(())
     }
 
-    /// Whether this client still has an issuance slot, without taking one.
-    fn room(
-        buckets: &Mutex<HashMap<[u8; 32], Vec<Instant>>>,
-        key: [u8; 32],
-        now: Instant,
-        limit: u32,
-    ) -> bool {
-        let mut buckets = buckets.lock();
+    /// Take one Free issuance: the client's hourly bucket and the relay-wide
+    /// daily ceiling, checked and taken under both locks, so a refusal on
+    /// either leaves both untouched.
+    fn admit_free(&self, key: [u8; 32], now: Instant) -> Result<(), Refusal> {
+        let mut buckets = self.buckets.lock();
+        let mut t = self.free_today.lock();
         buckets.retain(|_, v| {
-            v.retain(|t| now.duration_since(*t) < BUCKET_WINDOW);
+            v.retain(|x| now.duration_since(*x) < BUCKET_WINDOW);
             !v.is_empty()
         });
-        buckets.get(&key).is_none_or(|v| v.len() < limit as usize)
-    }
-
-    /// Whether the relay-wide daily ceiling still has room, without taking it.
-    fn free_today_room(&self) -> bool {
         let day = unix_now() / 86_400;
-        let mut t = self.free_today.lock();
         if t.0 != day {
             *t = (day, 0);
         }
-        t.1 < self.cfg.free_per_day
-    }
-
-    fn admit_free_today(&self) -> Result<(), Refusal> {
-        let day = unix_now() / 86_400;
-        let mut t = self.free_today.lock();
-        if t.0 != day {
-            *t = (day, 0);
+        if buckets.get(&key).map_or(0, |v| v.len()) >= self.cfg.per_client_per_hour as usize {
+            return Err(Refusal::Throttled);
         }
         if t.1 >= self.cfg.free_per_day {
             return Err(Refusal::Throttled);
         }
+        buckets.entry(key).or_default().push(now);
         t.1 += 1;
         Ok(())
+    }
+
+    /// Give back the slots [`Billing::admit_free`] took, when the issuance
+    /// they admitted could not be completed.
+    fn release_free(&self, key: [u8; 32], now: Instant) {
+        let mut buckets = self.buckets.lock();
+        if let Some(v) = buckets.get_mut(&key) {
+            if let Some(pos) = v.iter().rposition(|t| *t == now) {
+                v.remove(pos);
+            }
+        }
+        let mut t = self.free_today.lock();
+        t.1 = t.1.saturating_sub(1);
+    }
+
+    /// Test-only: lower the client ceiling to exercise the refusal path.
+    #[cfg(test)]
+    pub fn set_free_client_cap(&self, n: usize) {
+        self.free_client_cap.store(n, Ordering::Relaxed);
     }
 
     fn cors(&self, r: &mut Response) {
@@ -634,7 +644,8 @@ impl Billing {
         {
             // One guard for both reads: the lock is not reentrant.
             let map = self.free_issued.lock();
-            if map.len() >= MAX_FREE_CLIENTS && !map.contains_key(&key) {
+            if map.len() >= self.free_client_cap.load(Ordering::Relaxed) && !map.contains_key(&key)
+            {
                 // Never evict to make room: dropping an entry would forget a
                 // client's usage and hand it a second allowance. The map fills
                 // only at issuance, at most `free_per_day` a day, so this is a
@@ -644,26 +655,18 @@ impl Billing {
                 ));
             }
         }
-        // Refusals above consumed neither this client's 3/hour nor the
-        // relay-wide daily ceiling: both are checked unwritten and taken only
-        // now, so neither can be spent by a request that is then refused.
+        // Both slots are taken together, so a refusal on one never spends the
+        // other. A later failure gives them back.
         let now = Instant::now();
-        if !Self::room(&self.buckets, key, now, self.cfg.per_client_per_hour) {
-            return Err(Refusal::Throttled);
-        }
-        if !self.free_today_room() {
-            return Err(Refusal::Throttled);
-        }
-        self.admit_free_today()?;
-        self.admit(key, now)?;
+        self.admit_free(key, now)?;
         // Replace: the previous tokens stop working (their usage still counts,
         // above), so an issued token is never an extra allowance.
         for id in &known {
             if let Err(e) = self.store.suspend_id(*id) {
                 // Abort before issuing: two live Free tokens would be two
-                // allowances. Nothing is lost; the client retries and the
-                // suspensions it did get are idempotent.
+                // allowances. The client retries, and the slots go back.
                 tracing::error!(token = *id, "cannot suspend a previous free token: {e}");
+                self.release_free(key, now);
                 return Err(Refusal::Unavailable(
                     "cannot replace the current token; try again later",
                 ));
@@ -2028,6 +2031,27 @@ mod tests {
             store.list().iter().filter(|t| t.status == "active").count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn a_full_client_map_refuses_new_clients_without_evicting() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteStore::open(Some(&dir.path().join("b.db"))).unwrap());
+        let b = Billing::new(cfg(None, dir.path()), Arc::clone(&store), None).unwrap();
+        b.set_free_client_cap(1);
+        assert!(b
+            .free_token(&free_client("192.0.2.60"), peer())
+            .await
+            .is_ok());
+        assert!(matches!(
+            b.free_token(&free_client("192.0.2.61"), peer()).await,
+            Err(Refusal::Unavailable(_))
+        ));
+        // The client already remembered is still served.
+        assert!(b
+            .free_token(&free_client("192.0.2.60"), peer())
+            .await
+            .is_ok());
     }
 
     #[tokio::test]

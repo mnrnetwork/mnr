@@ -314,6 +314,7 @@ pub struct SqliteStore {
 pub struct Faults {
     pub free_usage: std::sync::atomic::AtomicBool,
     pub suspend_id: std::sync::atomic::AtomicBool,
+    pub sum_usage: std::sync::atomic::AtomicBool,
 }
 
 impl SqliteStore {
@@ -456,6 +457,20 @@ impl SqliteStore {
     }
 
     fn sum_usage(&self, token_id: i64) -> u64 {
+        self.sum_usage_res(token_id).unwrap_or_else(|e| {
+            // The limiter keeps serving: a read failure must not take the
+            // relay down. The Free issuance path does not rely on this fallback
+            // (it floors the total with the database copy).
+            tracing::error!(token = token_id, "cannot sum usage, treating as zero: {e}");
+            0
+        })
+    }
+
+    fn sum_usage_res(&self, token_id: i64) -> Result<u64, String> {
+        #[cfg(test)]
+        if self.fail.sum_usage.load(Ordering::Relaxed) {
+            return Err("test fault: cannot sum usage".to_owned());
+        }
         let today = today_unix();
         let conn = self.conn.lock();
         conn.query_row(
@@ -464,10 +479,7 @@ impl SqliteStore {
             |r| r.get::<_, i64>(0),
         )
         .map(|v| v.max(0) as u64)
-        .unwrap_or_else(|e| {
-            tracing::error!(token = token_id, "cannot sum usage, treating as zero: {e}");
-            0
-        })
+        .map_err(|e| e.to_string())
     }
 
     /// `(token_id, day, WU)` rows for `token_ids`, older than `from_day`.
@@ -536,7 +548,15 @@ impl SqliteStore {
             // quietly (the limiter logs and treats it as zero) cannot
             // undercount a client into a new allowance.
             let mem = e.persisted.saturating_add(e.delta);
-            let t = mem.max(from_db.get(id).copied().unwrap_or(0));
+            // The floor is the database copy plus the unflushed delta: a reload
+            // that failed and left `persisted` at zero must not hide work that
+            // is still only in `delta`.
+            let floor = from_db
+                .get(id)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(e.delta);
+            let t = mem.max(floor);
             total = total.saturating_add(t);
             per_token.push((*id, t));
         }
@@ -1893,6 +1913,15 @@ mod tests {
     }
 
     impl SqliteStore {
+        /// Force the next usage read to reload from the database, as a day
+        /// rollover does.
+        fn test_force_reload(&self, token_id: i64) {
+            let mut usage = self.usage.lock();
+            if let Some(e) = usage.map.get_mut(&token_id) {
+                e.persisted = RELOAD;
+            }
+        }
+
         /// A persisted usage row, for window tests.
         fn test_add_usage(&self, token_id: i64, day: i64, wu: u64) {
             let conn = self.conn.lock();
@@ -1925,6 +1954,28 @@ mod tests {
         assert_eq!(u.per_token, vec![(id, 350_000)]);
         assert_eq!(u.days, vec![(today - 1, 300_000), (today, 50_000)]);
         assert_eq!(s.free_usage(&[]).unwrap().total, 0);
+    }
+
+    #[test]
+    fn a_failed_reload_cannot_hide_flushed_work() {
+        use crate::limits::Limiter;
+        let dir = tempfile::tempdir().unwrap();
+        let s = SqliteStore::open(Some(&dir.path().join("b.db"))).unwrap();
+        let (_, id) = s.issue_with_id(Tier::Free, None);
+        let today = today_unix();
+        s.test_add_usage(id, today, 100_000);
+        let p = Principal {
+            id,
+            tier: Tier::Free,
+            handle: "test0002".into(),
+        };
+        s.charge(&p, 50_000); // 100k flushed + 50k unflushed
+                              // A reload that fails must not leave the client looking like 50k.
+        s.test_force_reload(id);
+        s.fail.sum_usage.store(true, Ordering::Relaxed);
+        assert_eq!(s.free_usage(&[id]).unwrap().total, 150_000);
+        s.fail.sum_usage.store(false, Ordering::Relaxed);
+        assert_eq!(s.free_usage(&[id]).unwrap().total, 150_000);
     }
 
     #[test]
