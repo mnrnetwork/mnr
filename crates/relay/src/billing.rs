@@ -67,8 +67,6 @@ const MONTH_SECS: u64 = 30 * 24 * 3600;
 /// reset a client's rule.
 const MAX_FREE_CLIENTS: usize = 50_000;
 const MAX_FREE_TOKENS_PER_CLIENT: usize = 64;
-/// The quota window in seconds, for deciding when a client entry is stale.
-const FREE_WINDOW_SECS: u64 = 30 * 86_400;
 
 /// Window of the per-client issuance bucket.
 const BUCKET_WINDOW: Duration = Duration::from_secs(3600);
@@ -84,8 +82,6 @@ const TOKEN_DOMAIN: &[u8] = b"mnr-invoice-token-v1";
 struct FreeIssue {
     /// Free token ids this client holds or has used inside the window.
     ids: Vec<i64>,
-    /// Unix time of the last issuance, for dropping stale entries.
-    at: u64,
 }
 
 pub struct Billing {
@@ -102,8 +98,6 @@ pub struct Billing {
     status_buckets: Mutex<HashMap<[u8; 32], Vec<Instant>>>,
     /// `(day, count)` of free tokens issued today.
     free_today: Mutex<(u64, u64)>,
-    /// `(ids in the window, when last issued)` for a client.
-    ///
     /// Free token ids per client key, for the one-allowance-per-client rule.
     /// In memory only, keyed like `buckets`; never logged, dumped or
     /// persisted, and it dies with the process (mnr invariant 6): a stored
@@ -261,6 +255,31 @@ impl Billing {
         }
         v.push(now);
         Ok(())
+    }
+
+    /// Whether this client still has an issuance slot, without taking one.
+    fn room(
+        buckets: &Mutex<HashMap<[u8; 32], Vec<Instant>>>,
+        key: [u8; 32],
+        now: Instant,
+        limit: u32,
+    ) -> bool {
+        let mut buckets = buckets.lock();
+        buckets.retain(|_, v| {
+            v.retain(|t| now.duration_since(*t) < BUCKET_WINDOW);
+            !v.is_empty()
+        });
+        buckets.get(&key).is_none_or(|v| v.len() < limit as usize)
+    }
+
+    /// Whether the relay-wide daily ceiling still has room, without taking it.
+    fn free_today_room(&self) -> bool {
+        let day = unix_now() / 86_400;
+        let mut t = self.free_today.lock();
+        if t.0 != day {
+            *t = (day, 0);
+        }
+        t.1 < self.cfg.free_per_day
     }
 
     fn admit_free_today(&self) -> Result<(), Refusal> {
@@ -613,24 +632,30 @@ impl Billing {
             ));
         }
         {
-            let mut map = self.free_issued.lock();
-            // Entries older than the window are dropped before the cap is
-            // applied, so a full map cannot deny new clients forever. Only
-            // done when it matters, to keep the common path cheap.
-            if map.len() >= MAX_FREE_CLIENTS / 2 {
-                let cutoff = unix_now().saturating_sub(FREE_WINDOW_SECS);
-                map.retain(|_, e| e.at >= cutoff);
-            }
+            // One guard for both reads: the lock is not reentrant.
+            let map = self.free_issued.lock();
             if map.len() >= MAX_FREE_CLIENTS && !map.contains_key(&key) {
+                // Never evict to make room: dropping an entry would forget a
+                // client's usage and hand it a second allowance. The map fills
+                // only at issuance, at most `free_per_day` a day, so this is a
+                // memory bound, not a limit anyone reaches in practice.
                 return Err(Refusal::Unavailable(
                     "token issuance is busy; try again later",
                 ));
             }
         }
         // Refusals above consumed neither this client's 3/hour nor the
-        // relay-wide daily ceiling: both are taken only now.
+        // relay-wide daily ceiling: both are checked unwritten and taken only
+        // now, so neither can be spent by a request that is then refused.
+        let now = Instant::now();
+        if !Self::room(&self.buckets, key, now, self.cfg.per_client_per_hour) {
+            return Err(Refusal::Throttled);
+        }
+        if !self.free_today_room() {
+            return Err(Refusal::Throttled);
+        }
         self.admit_free_today()?;
-        self.admit(key, Instant::now())?;
+        self.admit(key, now)?;
         // Replace: the previous tokens stop working (their usage still counts,
         // above), so an issued token is never an extra allowance.
         for id in &known {
@@ -651,13 +676,7 @@ impl Billing {
             // aged out can no longer matter.
             let mut keep = carried;
             keep.push(id);
-            self.free_issued.lock().insert(
-                key,
-                FreeIssue {
-                    ids: keep,
-                    at: unix_now(),
-                },
-            );
+            self.free_issued.lock().insert(key, FreeIssue { ids: keep });
         }
         Ok(json!({
             "token": token,
@@ -2009,6 +2028,33 @@ mod tests {
             store.list().iter().filter(|t| t.status == "active").count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn a_per_client_throttle_does_not_spend_the_daily_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteStore::open(Some(&dir.path().join("b.db"))).unwrap());
+        let mut c = cfg(None, dir.path());
+        c.free_per_day = 2;
+        c.per_client_per_hour = 1;
+        let b = Billing::new(c, Arc::clone(&store), None).unwrap();
+
+        let a = free_client("192.0.2.50");
+        assert!(b.free_token(&a, peer()).await.is_ok()); // day count 1
+        assert!(matches!(
+            b.free_token(&a, peer()).await,
+            Err(Refusal::Throttled)
+        ));
+        // The refused second request took no daily slot: another client still
+        // fits, and only the one after that meets the ceiling.
+        assert!(b
+            .free_token(&free_client("192.0.2.51"), peer())
+            .await
+            .is_ok());
+        assert!(matches!(
+            b.free_token(&free_client("192.0.2.52"), peer()).await,
+            Err(Refusal::Throttled)
+        ));
     }
 
     /// The four routes through the real router: routing beside the RPC

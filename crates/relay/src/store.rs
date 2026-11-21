@@ -470,12 +470,12 @@ impl SqliteStore {
         })
     }
 
-    /// `(day, WU)` for `token_ids`, older than `from_day`, summed across them.
-    fn usage_days(&self, token_ids: &[i64], from_day: i64) -> Result<Vec<(i64, u64)>, String> {
+    /// `(token_id, day, WU)` rows for `token_ids`, older than `from_day`.
+    fn usage_rows(&self, token_ids: &[i64], from_day: i64) -> Result<Vec<(i64, i64, u64)>, String> {
         let marks = vec!["?"; token_ids.len()].join(",");
         let sql = format!(
-            "SELECT day, COALESCE(SUM(wu), 0) FROM usage
-             WHERE token_id IN ({marks}) AND day > ? GROUP BY day ORDER BY day"
+            "SELECT token_id, day, COALESCE(SUM(wu), 0) FROM usage
+             WHERE token_id IN ({marks}) AND day > ? GROUP BY token_id, day ORDER BY day"
         );
         let mut v: Vec<i64> = token_ids.to_vec();
         v.push(from_day);
@@ -485,13 +485,17 @@ impl SqliteStore {
             .map_err(|e| format!("cannot read usage days: {e}"))?;
         let rows = stmt
             .query_map(params_from_iter(v.iter()), |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
             })
             .map_err(|e| format!("cannot read usage days: {e}"))?;
         let mut out = Vec::new();
         for row in rows {
-            let (d, w) = row.map_err(|e| format!("cannot read usage days: {e}"))?;
-            out.push((d, w.max(0) as u64));
+            let (id, d, w) = row.map_err(|e| format!("cannot read usage days: {e}"))?;
+            out.push((id, d, w.max(0) as u64));
         }
         Ok(out)
     }
@@ -510,18 +514,29 @@ impl SqliteStore {
         }
         let today = today_unix();
         let mut days: Vec<(i64, u64)> = Vec::new();
-        let mut flushed = 0u64;
+        let mut from_db: HashMap<i64, u64> = HashMap::new();
         if !token_ids.is_empty() {
-            days = self.usage_days(token_ids, today - FREE_WINDOW_DAYS)?;
-            flushed = days.iter().map(|(_, wu)| *wu).sum();
+            for (id, d, wu) in self.usage_rows(token_ids, today - FREE_WINDOW_DAYS)? {
+                *from_db.entry(id).or_insert(0) += wu;
+                match days.last_mut() {
+                    Some((ld, lw)) if *ld == d => *lw = lw.saturating_add(wu),
+                    _ => days.push((d, wu)),
+                }
+            }
         }
+        let flushed: u64 = days.iter().map(|(_, wu)| *wu).sum();
         let mut usage = self.usage.lock();
         Self::ensure_day(&mut usage);
         let mut total = 0u64;
         let mut per_token = Vec::with_capacity(token_ids.len());
         for id in token_ids {
             let e = self.usage_entry(&mut usage, *id);
-            let t = e.persisted.saturating_add(e.delta);
+            // The memory total is what the limiter enforces; the database copy
+            // is the floor. Taking the larger means a reload that failed
+            // quietly (the limiter logs and treats it as zero) cannot
+            // undercount a client into a new allowance.
+            let mem = e.persisted.saturating_add(e.delta);
+            let t = mem.max(from_db.get(id).copied().unwrap_or(0));
             total = total.saturating_add(t);
             per_token.push((*id, t));
         }
@@ -1251,7 +1266,8 @@ impl SqliteStore {
             .map_err(|e| e.to_string())?;
         drop(conn);
         if n == 0 {
-            return Err("unknown token".to_owned());
+            // Already gone: nothing is live under it, which is the goal.
+            return Ok(());
         }
         self.update_cached(id, |r| r.status = TokenStatus::Suspended);
         Ok(())
