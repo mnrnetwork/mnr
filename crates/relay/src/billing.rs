@@ -41,7 +41,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{ConnectInfo, Path as AxPath, State};
-use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use parking_lot::Mutex;
@@ -60,6 +60,16 @@ const WATCH_EVERY: Duration = Duration::from_secs(30);
 const INVOICE_TTL: Duration = Duration::from_secs(24 * 3600);
 /// Seconds in the month a Pro payment buys.
 const MONTH_SECS: u64 = 30 * 24 * 3600;
+/// How far a Free issuance decision reaches: at most this many client keys
+/// are remembered (the relay-wide daily ceiling bounds how fast that fills),
+/// and at most this many token ids per client (one live, the rest still
+/// inside the usage window). Both are refusals, not evictions: evicting would
+/// reset a client's rule.
+const MAX_FREE_CLIENTS: usize = 50_000;
+const MAX_FREE_TOKENS_PER_CLIENT: usize = 64;
+/// The quota window in seconds, for deciding when a client entry is stale.
+const FREE_WINDOW_SECS: u64 = 30 * 86_400;
+
 /// Window of the per-client issuance bucket.
 const BUCKET_WINDOW: Duration = Duration::from_secs(3600);
 /// Transfers older than this before the invoice was created are not
@@ -68,6 +78,15 @@ const CREATED_SLACK: u64 = 60;
 /// How long after payment the status call still shows a purchase's token.
 const TOKEN_WINDOW: u64 = 7 * 24 * 3600;
 const TOKEN_DOMAIN: &[u8] = b"mnr-invoice-token-v1";
+
+/// What is remembered about one client between issuances.
+#[derive(Debug)]
+struct FreeIssue {
+    /// Free token ids this client holds or has used inside the window.
+    ids: Vec<i64>,
+    /// Unix time of the last issuance, for dropping stale entries.
+    at: u64,
+}
 
 pub struct Billing {
     cfg: BillingConfig,
@@ -83,6 +102,16 @@ pub struct Billing {
     status_buckets: Mutex<HashMap<[u8; 32], Vec<Instant>>>,
     /// `(day, count)` of free tokens issued today.
     free_today: Mutex<(u64, u64)>,
+    /// `(ids in the window, when last issued)` for a client.
+    ///
+    /// Free token ids per client key, for the one-allowance-per-client rule.
+    /// In memory only, keyed like `buckets`; never logged, dumped or
+    /// persisted, and it dies with the process (mnr invariant 6): a stored
+    /// client-key-to-token link would let an operator recover a client.
+    free_issued: Mutex<HashMap<[u8; 32], FreeIssue>>,
+    /// Held across the whole issuance decision, so two requests from one
+    /// client cannot both see an unspent window and mint a token.
+    free_gate: Mutex<()>,
     /// Activations taken back because the payment vanished before settling.
     takebacks: AtomicU64,
 }
@@ -94,6 +123,10 @@ enum Refusal {
     Unavailable(&'static str),
     BadRequest(&'static str),
     NotFound,
+    /// The client's Free allowance is spent for the window.
+    AllowanceSpent {
+        retry_after: u64,
+    },
 }
 
 impl Refusal {
@@ -106,6 +139,19 @@ impl Refusal {
             Self::Unavailable(m) => (StatusCode::SERVICE_UNAVAILABLE, m),
             Self::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
             Self::NotFound => (StatusCode::NOT_FOUND, "unknown invoice"),
+            Self::AllowanceSpent { retry_after } => {
+                let body = json!({
+                    "error": "free allowance spent for this month; wait, or buy a paid token",
+                    "retry_after": retry_after,
+                    "docs": "https://mnr.network/docs/tokens/",
+                });
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [(header::RETRY_AFTER, retry_after.to_string())],
+                    Json(body),
+                )
+                    .into_response();
+            }
         };
         (status, Json(json!({ "error": msg }))).into_response()
     }
@@ -147,6 +193,8 @@ impl Billing {
             buckets: Mutex::new(HashMap::new()),
             status_buckets: Mutex::new(HashMap::new()),
             free_today: Mutex::new((0, 0)),
+            free_issued: Mutex::new(HashMap::new()),
+            free_gate: Mutex::new(()),
             takebacks: AtomicU64::new(0),
         })
     }
@@ -520,11 +568,97 @@ impl Billing {
     // ── handlers ────────────────────────────────────────────────────────
 
     async fn free_token(&self, headers: &HeaderMap, peer: IpAddr) -> Result<Value, Refusal> {
-        // The relay-wide ceiling first, so a day that is already spent does
-        // not also burn the client's own allowance.
+        let key = self.client_key(headers, peer);
+        // One decision at a time: two concurrent requests from one client must
+        // not both find an unspent window. Nothing here awaits.
+        let _gate = self.free_gate.lock();
+        let known: Vec<i64> = self
+            .free_issued
+            .lock()
+            .get(&key)
+            .map(|e| e.ids.clone())
+            .unwrap_or_default();
+        // A client holds one live Free token and one allowance. The allowance
+        // is the sum over every token it has held in the window, so minting a
+        // replacement cannot hand out a second one. A request already admitted
+        // to the old token can still charge while this runs; the overshoot is
+        // one in-flight request, and the next issuance sums the updated total.
+        // Fails closed: an unreadable store must not be read as "nothing spent".
+        let usage = match self.store.free_usage(&known) {
+            Ok(u) => u,
+            Err(e) => {
+                tracing::error!("cannot read free usage, refusing issuance: {e}");
+                return Err(Refusal::Unavailable(
+                    "token issuance is unavailable; try again later",
+                ));
+            }
+        };
+        let allowance = Tier::Free.monthly_wu();
+        if usage.total >= allowance {
+            return Err(Refusal::AllowanceSpent {
+                retry_after: usage.retry_after_secs(allowance, unix_now()),
+            });
+        }
+        // Only ids that still carry usage have to be remembered; a cap on
+        // those cannot lock a client out permanently, because usage ages out.
+        let carried: Vec<i64> = usage
+            .per_token
+            .iter()
+            .filter(|(_, wu)| *wu > 0)
+            .map(|(id, _)| *id)
+            .collect();
+        if carried.len() >= MAX_FREE_TOKENS_PER_CLIENT {
+            return Err(Refusal::Unavailable(
+                "token issuance is busy; try again later",
+            ));
+        }
+        {
+            let mut map = self.free_issued.lock();
+            // Entries older than the window are dropped before the cap is
+            // applied, so a full map cannot deny new clients forever. Only
+            // done when it matters, to keep the common path cheap.
+            if map.len() >= MAX_FREE_CLIENTS / 2 {
+                let cutoff = unix_now().saturating_sub(FREE_WINDOW_SECS);
+                map.retain(|_, e| e.at >= cutoff);
+            }
+            if map.len() >= MAX_FREE_CLIENTS && !map.contains_key(&key) {
+                return Err(Refusal::Unavailable(
+                    "token issuance is busy; try again later",
+                ));
+            }
+        }
+        // Refusals above consumed neither this client's 3/hour nor the
+        // relay-wide daily ceiling: both are taken only now.
         self.admit_free_today()?;
-        self.admit(self.client_key(headers, peer), Instant::now())?;
-        let token = self.store.issue(Tier::Free, None);
+        self.admit(key, Instant::now())?;
+        // Replace: the previous tokens stop working (their usage still counts,
+        // above), so an issued token is never an extra allowance.
+        for id in &known {
+            if let Err(e) = self.store.suspend_id(*id) {
+                // Abort before issuing: two live Free tokens would be two
+                // allowances. Nothing is lost; the client retries and the
+                // suspensions it did get are idempotent.
+                tracing::error!(token = *id, "cannot suspend a previous free token: {e}");
+                return Err(Refusal::Unavailable(
+                    "cannot replace the current token; try again later",
+                ));
+            }
+        }
+        let (token, id) = self.store.issue_with_id(Tier::Free, None);
+        {
+            // Remember only the ids that still have usage in the window (now
+            // suspended but counted) plus the new one; an id whose usage has
+            // aged out can no longer matter.
+            let mut keep = carried;
+            keep.push(id);
+            self.free_issued.lock().insert(
+                key,
+                FreeIssue {
+                    ids: keep,
+                    at: unix_now(),
+                },
+            );
+        }
         Ok(json!({
             "token": token,
             "tier": "free",
@@ -1715,6 +1849,166 @@ mod tests {
         assert!(store.authenticate(&token_hash(&t)).is_ok(), "grace");
         assert!(store.authenticate(&token_hash(&t2)).is_ok());
         assert!(matches!(b.rotate("sub_notatoken"), Err(Refusal::NotFound)));
+    }
+
+    fn free_client(ip: &'static str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("CF-Connecting-IP", HeaderValue::from_static(ip));
+        h
+    }
+
+    #[tokio::test]
+    async fn free_allowance_is_per_client_across_tokens_and_replaces_them() {
+        use crate::limits::Limiter;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteStore::open(Some(&dir.path().join("b.db"))).unwrap());
+        let b = Billing::new(cfg(None, dir.path()), Arc::clone(&store), None).unwrap();
+        let h = free_client("192.0.2.10");
+        let allowance = Tier::Free.monthly_wu();
+
+        let t1 = b.free_token(&h, peer()).await.unwrap()["token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let p1 = store.authenticate(&token_hash(&t1)).unwrap();
+        store.charge(&p1, allowance - 100_000);
+
+        // Below the allowance: a replacement is issued, and the old token stops
+        // working at once (not at the next reload).
+        let t2 = b.free_token(&h, peer()).await.unwrap()["token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_ne!(t1, t2);
+        assert!(store.authenticate(&token_hash(&t1)).is_err());
+        let p2 = store.authenticate(&token_hash(&t2)).unwrap();
+
+        // Both tokens' usage sums for this client: the second cannot spend a
+        // fresh allowance on top of the first.
+        store.charge(&p2, 100_000);
+        match b.free_token(&h, peer()).await {
+            Err(Refusal::AllowanceSpent { retry_after }) => assert!(retry_after >= 60),
+            other => panic!("expected AllowanceSpent, got {other:?}"),
+        }
+        // No third token was created by the refusal.
+        assert_eq!(store.list().len(), 2);
+
+        // Another client is unaffected.
+        assert!(b
+            .free_token(&free_client("192.0.2.11"), peer())
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn refused_issuance_consumes_neither_the_daily_cap_nor_the_client_bucket() {
+        use crate::limits::Limiter;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteStore::open(Some(&dir.path().join("b.db"))).unwrap());
+        let mut c = cfg(None, dir.path());
+        c.free_per_day = 4; // one for t1, three left
+        c.per_client_per_hour = 3;
+        let b = Billing::new(c, Arc::clone(&store), None).unwrap();
+        let h = free_client("192.0.2.20");
+
+        let t1 = b.free_token(&h, peer()).await.unwrap()["token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let p1 = store.authenticate(&token_hash(&t1)).unwrap();
+        store.charge(&p1, Tier::Free.monthly_wu());
+        for _ in 0..5 {
+            assert!(matches!(
+                b.free_token(&h, peer()).await,
+                Err(Refusal::AllowanceSpent { .. })
+            ));
+        }
+        // Three issuances are still available to other clients: the refusals
+        // above took neither the relay-wide ceiling nor this client's bucket.
+        for i in 0..3 {
+            let ip: &'static str = ["192.0.2.21", "192.0.2.22", "192.0.2.23"][i];
+            assert!(b.free_token(&free_client(ip), peer()).await.is_ok());
+        }
+        assert!(matches!(
+            b.free_token(&free_client("192.0.2.24"), peer()).await,
+            Err(Refusal::Throttled)
+        ));
+    }
+
+    #[tokio::test]
+    async fn concurrent_requests_leave_one_live_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteStore::open(Some(&dir.path().join("b.db"))).unwrap());
+        let b = Arc::new(Billing::new(cfg(None, dir.path()), Arc::clone(&store), None).unwrap());
+        let mut set = Vec::new();
+        for _ in 0..3 {
+            let b = Arc::clone(&b);
+            set.push(tokio::spawn(async move {
+                b.free_token(&free_client("192.0.2.30"), peer()).await
+            }));
+        }
+        for t in set {
+            let v: Value = t.await.unwrap().unwrap();
+            assert!(!v["token"].as_str().unwrap().is_empty());
+        }
+        let live = store
+            .list()
+            .into_iter()
+            .filter(|t| t.status == "active")
+            .count();
+        assert_eq!(live, 1);
+    }
+
+    #[tokio::test]
+    async fn failures_fail_closed_and_a_failed_suspension_issues_nothing() {
+        use crate::limits::Limiter;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteStore::open(Some(&dir.path().join("b.db"))).unwrap());
+        let b = Billing::new(cfg(None, dir.path()), Arc::clone(&store), None).unwrap();
+        let h = free_client("192.0.2.40");
+
+        // A store that cannot be read must not look like "nothing spent".
+        store
+            .fail
+            .free_usage
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(matches!(
+            b.free_token(&h, peer()).await,
+            Err(Refusal::Unavailable(_))
+        ));
+        assert_eq!(store.list().len(), 0);
+        store
+            .fail
+            .free_usage
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+
+        // A replacement that cannot suspend the old token issues no second one.
+        let t1 = b.free_token(&h, peer()).await.unwrap()["token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let p1 = store.authenticate(&token_hash(&t1)).unwrap();
+        store.charge(&p1, 1_000);
+        store
+            .fail
+            .suspend_id
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(matches!(
+            b.free_token(&h, peer()).await,
+            Err(Refusal::Unavailable(_))
+        ));
+        assert_eq!(store.list().len(), 1);
+        assert!(store.authenticate(&token_hash(&t1)).is_ok());
+        store
+            .fail
+            .suspend_id
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        // Once the fault clears the replacement goes through, still one live.
+        assert!(b.free_token(&h, peer()).await.is_ok());
+        assert_eq!(
+            store.list().iter().filter(|t| t.status == "active").count(),
+            1
+        );
     }
 
     /// The four routes through the real router: routing beside the RPC

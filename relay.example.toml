@@ -73,7 +73,9 @@ price_sources = ["kraken", "coingecko", "kucoin", "xmrclub", "monerospace"]
 # pro_price_atomic = 16700000000     # fixed alternative: 0.0167 XMR per month, no lookups
 confirmations = 10                   # the final depth: settled past it
 confirmation_tiers = [[10, 1], [30, 2], [100, 5]]   # activate at 1/2/5 confirmations under $10/$30/$100, else at `confirmations`
-free_per_day = 2000
+# Free tokens issued per day, all clients together. Observed demand is 1-12 a
+# day; a low ceiling bounds how fast one actor can bank tokens by rotating IPs.
+free_per_day = 200
 per_client_per_hour = 3
 months_max = 12
 # client_ip_header = "CF-Connecting-IP"

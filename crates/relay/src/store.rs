@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::{Mutex, RwLock};
-use rusqlite::{params, Connection};
+use rusqlite::{params, params_from_iter, Connection};
 
 use crate::auth::{handle, token_hash, AuthError, Principal, Tier, TokenStore};
 use crate::limits::{Limiter, MemoryLimiter, StreamPermit, Verdict};
@@ -136,8 +136,44 @@ struct UsageEntry {
     delta: u64,
 }
 
+/// A client's Free usage over the quota window.
+#[derive(Debug, Default)]
+pub struct FreeUsage {
+    /// Total WU across `token_ids` in the window, the number the limiter
+    /// enforces (persisted plus unflushed).
+    pub total: u64,
+    /// `(token_id, WU in the window)` for each id given.
+    pub per_token: Vec<(i64, u64)>,
+    /// `(day, WU)` oldest first, for the Retry-After estimate.
+    pub days: Vec<(i64, u64)>,
+}
+
+impl FreeUsage {
+    /// Seconds until the total falls below `allowance`. Walks the days oldest
+    /// first: the first day whose removal brings the remainder under the
+    /// allowance is the day that has to leave the window, which happens when
+    /// the day counter reaches `day + FREE_WINDOW_DAYS`.
+    pub fn retry_after_secs(&self, allowance: u64, now: u64) -> u64 {
+        let mut remaining = self.total;
+        for (day, wu) in &self.days {
+            remaining = remaining.saturating_sub(*wu);
+            if remaining < allowance {
+                let frees_at = (*day + FREE_WINDOW_DAYS) as u64 * 86_400;
+                return frees_at.saturating_sub(now).max(60);
+            }
+        }
+        86_400
+    }
+}
+
 /// Sentinel for "reload this token's persisted total from the database".
 const RELOAD: u64 = u64::MAX;
+
+/// The rolling window of the monthly quota, in days: the same window the
+/// limiter enforces and the Free issuance rule sums over. Fixed on purpose
+/// (a "month" is what the tier sells); an operator wanting different terms
+/// sets `free_per_day`, not this.
+pub const FREE_WINDOW_DAYS: i64 = 30;
 
 #[derive(Debug)]
 struct UsageState {
@@ -266,6 +302,18 @@ pub struct SqliteStore {
     pending: AtomicU64,
     flush_notify: tokio::sync::Notify,
     flush_interval: Duration,
+    /// Test-only fault injection for the fail-closed paths of the Free rule.
+    #[cfg(test)]
+    pub fail: Faults,
+}
+
+/// Test-only switches: make a store read or write fail, to prove the caller
+/// refuses rather than failing open.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub struct Faults {
+    pub free_usage: std::sync::atomic::AtomicBool,
+    pub suspend_id: std::sync::atomic::AtomicBool,
 }
 
 impl SqliteStore {
@@ -302,6 +350,8 @@ impl SqliteStore {
             pending: AtomicU64::new(0),
             flush_notify: tokio::sync::Notify::new(),
             flush_interval,
+            #[cfg(test)]
+            fail: Faults::default(),
         };
         store.load_tokens()?;
         Ok(store)
@@ -410,13 +460,83 @@ impl SqliteStore {
         let conn = self.conn.lock();
         conn.query_row(
             "SELECT COALESCE(SUM(wu), 0) FROM usage WHERE token_id = ?1 AND day > ?2",
-            params![token_id, today - 30],
+            params![token_id, today - FREE_WINDOW_DAYS],
             |r| r.get::<_, i64>(0),
         )
         .map(|v| v.max(0) as u64)
         .unwrap_or_else(|e| {
             tracing::error!(token = token_id, "cannot sum usage, treating as zero: {e}");
             0
+        })
+    }
+
+    /// `(day, WU)` for `token_ids`, older than `from_day`, summed across them.
+    fn usage_days(&self, token_ids: &[i64], from_day: i64) -> Result<Vec<(i64, u64)>, String> {
+        let marks = vec!["?"; token_ids.len()].join(",");
+        let sql = format!(
+            "SELECT day, COALESCE(SUM(wu), 0) FROM usage
+             WHERE token_id IN ({marks}) AND day > ? GROUP BY day ORDER BY day"
+        );
+        let mut v: Vec<i64> = token_ids.to_vec();
+        v.push(from_day);
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| format!("cannot read usage days: {e}"))?;
+        let rows = stmt
+            .query_map(params_from_iter(v.iter()), |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            })
+            .map_err(|e| format!("cannot read usage days: {e}"))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (d, w) = row.map_err(|e| format!("cannot read usage days: {e}"))?;
+            out.push((d, w.max(0) as u64));
+        }
+        Ok(out)
+    }
+
+    /// A client's usage over the quota window, summed across the token ids it
+    /// holds: the same `persisted` + `delta` total the limiter enforces, so an
+    /// increment that has not been flushed yet still counts. The per-day series
+    /// is the flushed part; whatever is not in it belongs to today (where the
+    /// flusher writes), and is added as today's row.
+    /// Fails rather than reporting zero on a store error: the caller must not
+    /// hand out an allowance it could not measure.
+    pub fn free_usage(&self, token_ids: &[i64]) -> Result<FreeUsage, String> {
+        #[cfg(test)]
+        if self.fail.free_usage.load(Ordering::Relaxed) {
+            return Err("test fault: usage unreadable".to_owned());
+        }
+        let today = today_unix();
+        let mut days: Vec<(i64, u64)> = Vec::new();
+        let mut flushed = 0u64;
+        if !token_ids.is_empty() {
+            days = self.usage_days(token_ids, today - FREE_WINDOW_DAYS)?;
+            flushed = days.iter().map(|(_, wu)| *wu).sum();
+        }
+        let mut usage = self.usage.lock();
+        Self::ensure_day(&mut usage);
+        let mut total = 0u64;
+        let mut per_token = Vec::with_capacity(token_ids.len());
+        for id in token_ids {
+            let e = self.usage_entry(&mut usage, *id);
+            let t = e.persisted.saturating_add(e.delta);
+            total = total.saturating_add(t);
+            per_token.push((*id, t));
+        }
+        drop(usage);
+        let unflushed = total.saturating_sub(flushed);
+        if unflushed > 0 {
+            match days.last_mut() {
+                Some((d, w)) if *d == today => *w = w.saturating_add(unflushed),
+                _ => days.push((today, unflushed)),
+            }
+        }
+        Ok(FreeUsage {
+            total,
+            per_token,
+            days,
         })
     }
 
@@ -524,9 +644,19 @@ impl SqliteStore {
     /// Issue a new token. The raw token is returned exactly once; only its
     /// SHA-256 is stored. `valid_until` is a unix timestamp, `None` = never.
     pub fn issue(&self, tier: Tier, valid_until: Option<u64>) -> String {
-        let token = generate_token();
-        self.issue_token(&token, tier, valid_until);
-        token
+        self.issue_with_id(tier, valid_until).0
+    }
+
+    /// As [`SqliteStore::issue`], also returning the row id: the Free
+    /// issuance rule keeps ids in memory (never persisted, never linked to a
+    /// client on disk) to sum a client's usage across the tokens it holds.
+    pub fn issue_with_id(&self, tier: Tier, valid_until: Option<u64>) -> (String, i64) {
+        loop {
+            let token = generate_token();
+            if let Some(id) = self.insert_token(&token_hash(&token), tier, valid_until) {
+                return (token, id);
+            }
+        }
     }
 
     /// Register a raw token the caller derived (the storefront derives a
@@ -534,9 +664,13 @@ impl SqliteStore {
     /// at rest). Only the hash is stored, as with [`SqliteStore::issue`].
     /// A hash already present is left as it is.
     pub fn issue_token(&self, token: &str, tier: Tier, valid_until: Option<u64>) {
-        let hash = token_hash(token);
-        if self.tokens.read().contains_key(&hash) {
-            return;
+        self.insert_token(&token_hash(token), tier, valid_until);
+    }
+
+    /// Insert a token row for `hash`; `None` when the hash is already known.
+    fn insert_token(&self, hash: &[u8; 32], tier: Tier, valid_until: Option<u64>) -> Option<i64> {
+        if self.tokens.read().contains_key(hash) {
+            return None;
         }
         let now = unix_now();
         let row = TokenRow {
@@ -561,9 +695,8 @@ impl SqliteStore {
         .expect("local token database");
         let id = conn.last_insert_rowid();
         drop(conn);
-        let mut row = row;
-        row.id = id;
-        self.tokens.write().insert(hash, row);
+        self.tokens.write().insert(*hash, TokenRow { id, ..row });
+        Some(id)
     }
 
     /// The `valid_until` of a current token, `Some(None)` for "never",
@@ -1099,6 +1232,29 @@ impl SqliteStore {
     /// customer rotated it.
     pub fn suspend(&self, hash: &[u8; 32]) -> Result<(), String> {
         self.set_status(hash, TokenStatus::Suspended)
+    }
+
+    /// Suspend by row id, for callers that hold only the id (the Free issuance
+    /// rule does). Writes the database and the in-memory row together, so the
+    /// token stops authenticating at once rather than at the next reload.
+    pub fn suspend_id(&self, id: i64) -> Result<(), String> {
+        #[cfg(test)]
+        if self.fail.suspend_id.load(Ordering::Relaxed) {
+            return Err("test fault: cannot suspend".to_owned());
+        }
+        let conn = self.conn.lock();
+        let n = conn
+            .execute(
+                "UPDATE tokens SET status = 'suspended' WHERE id = ?1",
+                params![id],
+            )
+            .map_err(|e| e.to_string())?;
+        drop(conn);
+        if n == 0 {
+            return Err("unknown token".to_owned());
+        }
+        self.update_cached(id, |r| r.status = TokenStatus::Suspended);
+        Ok(())
     }
 
     /// Undo a billing suspension when the payment is back.
@@ -1717,6 +1873,63 @@ mod tests {
         assert_eq!(
             store.invoice("open1").unwrap().prev_valid_until,
             Some(4_000)
+        );
+    }
+
+    impl SqliteStore {
+        /// A persisted usage row, for window tests.
+        fn test_add_usage(&self, token_id: i64, day: i64, wu: u64) {
+            let conn = self.conn.lock();
+            conn.execute(
+                "INSERT INTO usage (token_id, day, wu) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(token_id, day) DO UPDATE SET wu = wu + ?3",
+                params![token_id, day, wu as i64],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn free_usage_sums_the_window_and_counts_unflushed_work() {
+        use crate::limits::Limiter;
+        let dir = tempfile::tempdir().unwrap();
+        let s = SqliteStore::open(Some(&dir.path().join("b.db"))).unwrap();
+        let (_, id) = s.issue_with_id(Tier::Free, None);
+        let today = today_unix();
+        s.test_add_usage(id, today - 40, 200_000); // outside the window
+        s.test_add_usage(id, today - 1, 300_000);
+        let p = Principal {
+            id,
+            tier: Tier::Free,
+            handle: "test0001".into(),
+        };
+        s.charge(&p, 50_000); // not flushed yet
+        let u = s.free_usage(&[id]).unwrap();
+        assert_eq!(u.total, 350_000);
+        assert_eq!(u.per_token, vec![(id, 350_000)]);
+        assert_eq!(u.days, vec![(today - 1, 300_000), (today, 50_000)]);
+        assert_eq!(s.free_usage(&[]).unwrap().total, 0);
+    }
+
+    #[test]
+    fn retry_after_walks_the_days_until_the_sum_is_under_the_allowance() {
+        let today = today_unix();
+        let u = FreeUsage {
+            total: 500_000,
+            per_token: Vec::new(),
+            days: vec![(today - 20, 200_000), (today - 2, 300_000)],
+        };
+        let now = today as u64 * 86_400;
+        // The oldest day leaves the window at today+10, not when the newest does.
+        assert_eq!(u.retry_after_secs(500_000, now), 10 * 86_400);
+        let one = FreeUsage {
+            total: 500_000,
+            per_token: Vec::new(),
+            days: vec![(today, 500_000)],
+        };
+        assert_eq!(
+            one.retry_after_secs(500_000, now),
+            FREE_WINDOW_DAYS as u64 * 86_400
         );
     }
 

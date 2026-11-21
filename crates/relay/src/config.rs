@@ -183,7 +183,7 @@ impl BillingConfig {
     }
 }
 fn default_free_per_day() -> u64 {
-    2000
+    200
 }
 fn default_per_client() -> u32 {
     3
